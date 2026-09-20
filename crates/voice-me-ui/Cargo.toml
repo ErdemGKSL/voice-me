@@ -8,7 +8,8 @@ voice-me-core = { path = "../voice-me-core" }
 gpui-kit = "0.6.4"
 cpal = "0.18"
 hound = "3.5"
-rodio = { version = "0.22", default-features = false, features = ["playback", "wav"] }
+rodio = { version = "0.22", default-features = false, features = ["playback", "wav", "mp3"] }
 
 [dev-dependencies]
 gpui-kit = { version = "0.6.4", features = ["test-support"] }
+tempfile = "3.14"
