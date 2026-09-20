@@ -1,0 +1,10 @@
+[package]
+name = "voice-me-app"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "voice-me"
+path = "src/main.rs"
+
+[dependencies]

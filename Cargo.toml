@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/voice-me-app",
+  "crates/voice-me-core",
+  "crates/voice-me-ui",
+  "crates/voice-me-i18n",
+  "crates/voice-me-hotkey-linux",
+  "crates/voice-me-hotkey-windows",
+  "crates/voice-me-audio-linux",
+  "crates/voice-me-audio-windows",
+  "crates/voice-me-tray-linux",
+  "crates/voice-me-tray-windows",
+  "crates/voice-me-tts",
+  "crates/voice-me-deps",
+  "crates/voice-me-tests",
+]
+
+[workspace.package]
+edition = "2024"

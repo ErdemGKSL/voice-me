@@ -1,0 +1,3 @@
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-1-set-up-the-project-workspace.md`
+  summary: Per-OS adapter crates (voice-me-hotkey-linux/windows, voice-me-audio-linux/windows, voice-me-tray-linux/windows) have no target-specific gating, so a later story adding a real OS-only dependency to one of them would break `cargo build --workspace` on the opposite-OS CI runner.
+  evidence: Verified `cargo build --workspace` currently succeeds on this toolchain because every adapter crate is still an OS-agnostic `todo!()` stub; the risk is latent, triggered only once a future story adds a genuinely OS-specific dependency (e.g. a Windows-only crate) without adding `[target.'cfg(...)']` gating or excluding it from the opposite-OS CI job.
