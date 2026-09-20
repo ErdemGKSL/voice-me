@@ -1,0 +1,68 @@
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created, ready for development
+#   - in-progress: Developer actively working on implementation
+#   - review: Implementation complete, ready for review
+#   - done: Story completed
+
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+
+# Action Item Status:
+#   - open: Committed during a retrospective, not yet addressed
+#   - in-progress: Actively being worked on
+#   - done: Completed
+
+# WORKFLOW NOTES:
+# ===============
+# - Epic transitions to 'in-progress' automatically when its first story starts (via build's sprint sync)
+# - Stories can be worked in parallel if team capacity allows
+# - Developer typically creates the next story after the previous one is 'done' to incorporate learnings
+# - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
+# - Retrospective appends its action items to action_items; the status view surfaces open ones
+generated: 09-20-2026 19:26
+last_updated: 09-20-2026 19:26
+project: voice-me
+project_key: NOKEY
+tracking_system: file-system
+story_location: _bmad-output/implementation-artifacts
+development_status:
+  epic-1: backlog
+  1-1-set-up-the-project-workspace: backlog
+  1-2-record-a-reference-voice-sample: backlog
+  1-3-import-an-existing-audio-file-as-the-reference-voice-sample: backlog
+  1-4-replace-my-reference-voice-sample: backlog
+  1-5-first-run-voice-setup-prompt: backlog
+  epic-1-retrospective: optional
+
+  epic-2: backlog
+  2-1-spike-background-tray-presence-feasibility-on-gpui-gpui-kit: backlog
+  2-2-run-as-a-background-tray-resident-process: backlog
+  2-3-configure-a-global-hotkey: backlog
+  2-4-summon-type-and-dismiss-the-prompt-overlay: backlog
+  2-5-spike-chatterbox-sidecar-packaging-and-ipc: backlog
+  2-6-generate-speech-from-the-prompt-overlay-text: backlog
+  2-7-spike-linux-virtual-microphone-via-pipewire: backlog
+  2-8-spike-windows-virtual-microphone-control-surface: backlog
+  2-9-play-generated-audio-through-the-virtual-microphone: backlog
+  epic-2-retrospective: optional
+
+  epic-3: backlog
+  3-1-detect-missing-dependencies: backlog
+  3-2-one-click-provision-a-missing-dependency: backlog
+  3-3-degrade-to-cpu-only-mode-without-a-gpu: backlog
+  3-4-block-the-overlay-gracefully-on-a-missing-dependency: backlog
+  epic-3-retrospective: optional
+
+  epic-4: backlog
+  4-1-turkish-and-english-ui-toggle: backlog
+  4-2-persist-and-apply-ui-language-on-launch: backlog
+  epic-4-retrospective: optional
