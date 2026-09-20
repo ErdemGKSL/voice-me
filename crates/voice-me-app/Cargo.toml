@@ -8,3 +8,6 @@ name = "voice-me"
 path = "src/main.rs"
 
 [dependencies]
+gpui-kit = "0.6.4"
+voice-me-core = { path = "../voice-me-core" }
+voice-me-ui = { path = "../voice-me-ui" }

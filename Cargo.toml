@@ -15,6 +15,7 @@ members = [
   "crates/voice-me-deps",
   "crates/voice-me-tests",
 ]
+default-members = ["crates/voice-me-app"]
 
 [workspace.package]
 edition = "2024"

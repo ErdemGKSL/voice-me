@@ -36,4 +36,11 @@ pub trait DependencyProvisioningPort {
 pub trait SettingsStore {
     /// Load settings into an `AppState`.
     fn load(&self) -> Result<AppState, VoiceMeError>;
+
+    /// Persist `wav_bytes` as the active Reference Voice Sample (AD-6):
+    /// writes the audio file to the OS data directory and updates the
+    /// settings, replacing whichever clip was previously active. Returns the
+    /// resulting `AppState`. Adapters (e.g. `voice-me-ui`'s recorder) call
+    /// this instead of writing to the data directory themselves.
+    fn save_reference_voice_sample(&self, wav_bytes: &[u8]) -> Result<AppState, VoiceMeError>;
 }
