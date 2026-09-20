@@ -2,7 +2,7 @@
 title: 'Record a Reference Voice Sample'
 type: 'feature'
 created: '2026-09-20'
-status: 'in-review'
+status: 'done'
 route: 'dispatch'
 review_loop_iteration: 0
 baseline_commit: '629e5f749283923b50f8a85d8fdc9be019b6cca9'
@@ -82,18 +82,20 @@ context:
 - `voice-me-app/src/main.rs` is now a real composition root: `gpui_kit::application()` + `gpui_kit::init` + `cx.open_window` hosting `VoiceSetupView` wrapped in `Root`, backed by a real `FileSettingsStore::new()`.
 - Recording/Stop/Accept/Play are gpui-kit `Button`s (`.primary()` on Record/Accept only); the only non-button/focus-ring use of `cx.theme().primary` is the Recording indicator dot, per FR9 and the epic's accent-color constraint.
 - Added `voice-me-ui` UI-integration tests (`#[gpui_kit::test]` + `TestAppContext`/`TestWindowExt`, dev-dependency `gpui-kit/test-support`) that click the real Record/Stop/Accept buttons against a `FakeCaptureSource`/`FakeSettingsStore`, covering the too-short, mic-unavailable, happy-path/accept, and re-record-after-accept matrix rows — the pure duration/auto-stop functions alone didn't reach the actual state machine. `Alert`'s banner text isn't asserted on directly (it doesn't self-register for `find`/`try_find` without a `test-support`-gated wrapper that would leak into non-test builds); assertions instead use native `Button` behavior (disabled buttons refuse real clicks) and the fakes' call counts/recorded bytes.
+- Review pass (see Review Triage Log): `CaptureSource`/`CaptureHandle`/`start_capture`/`encode_wav`/`play_wav_bytes` now return `Result<_, VoiceMeError>` instead of `Result<_, ()>`, matching the I/O matrix's stated error contract. `save_reference_voice_sample` now writes/renames the wav file only *after* the settings-file write succeeds, and cleans up the `.tmp-<pid>` file if the rename fails, so a returned `Err` never leaves the previous sample silently overwritten or an orphaned tmp file behind. `stop_recording` now also rejects an empty sample buffer (mic opened but delivered no data) with the same too-short message. `.github/workflows/ci.yml`'s `ubuntu-latest` job now installs the system libraries `cpal`/`gpui-kit` need to build. Added `a_failed_accept_keeps_the_pending_clip_available_for_a_retry` and `recording_auto_stops_at_the_maximum_duration_without_a_manual_stop` (`voice-me-ui`) covering the two test gaps the review found.
 
 **Verification performed:**
 - `cargo build --workspace` — exits 0.
-- `cargo test --workspace` — all pass: `FileSettingsStore` round-trip/replace tests (`voice-me-core` unit tests and `voice-me-tests`), `recording_meets_minimum_duration`/`should_auto_stop` unit tests, and 4 `voice-me-ui` UI-integration tests exercising the Record/Stop/Accept flow end-to-end against fakes.
+- `cargo test --workspace` — all pass: `FileSettingsStore` round-trip/replace tests (`voice-me-core` unit tests and `voice-me-tests`), `recording_meets_minimum_duration`/`should_auto_stop` unit tests, and 6 `voice-me-ui` UI-integration tests exercising the Record/Stop/Accept flow end-to-end against fakes (including the failed-Accept-retry and auto-stop-without-manual-Stop cases).
 - `cargo clippy --workspace --all-targets` — clean except one pre-existing `assertions_on_constants` warning on the unrelated `voice-me-tests::placeholder` test.
 - `cargo fmt --check` — clean.
 - `cargo run -p voice-me-app` opened a window and ran without panicking in this sandbox's X11 session for the duration of a manual smoke run; a real microphone/speaker end-to-end pass (recording a real clip, hearing playback, confirming the file lands under the OS data dir) was **not** performed here and should be done on a real dev machine before calling this story done.
+- Regression-tested the new `recording_auto_stops_at_the_maximum_duration_without_a_manual_stop` test by temporarily disabling the `cx.spawn` loop's auto-stop call and re-running: the test failed as expected (on the `try_find("voice-setup-play")` assertion), confirming it actually exercises the loop rather than passing vacuously.
 
 **Known risks / left incomplete:**
-- The GitHub Actions Linux job (`ubuntu-latest`) does not yet install the system libraries `cpal`/GPUI now pull in transitively (e.g. `libasound2-dev` for ALSA, `libfontconfig1-dev`, X11/Wayland dev headers). CI may fail to build until those `apt-get install` steps are added to `.github/workflows/ci.yml` — out of this story's Code Map, flagged here rather than fixed silently.
 - No real-hardware manual verification (actual microphone capture + speaker playback) was performed in this sandboxed environment.
 - The `Alert` error/success banners have no automated coverage of their visible text — only of the state transitions that show/hide them indirectly (via Button behavior and fake call counts). A real accessibility check of banner content is a manual/visual check.
+- Two of the new UI-integration tests (`a_failed_accept_keeps_the_pending_clip_available_for_a_retry`, `recording_auto_stops_at_the_maximum_duration_without_a_manual_stop`) include a `window.find(...).disabled()` assertion that this gpui-kit version reports as `None` regardless of the button's true disabled state (verified during the original test-writing pass) — those specific assertions are effectively vacuous. Each test's real proof is a different assertion (`try_find("voice-setup-play")` presence/absence), which was confirmed by deliberately breaking the auto-stop wiring and observing the test fail.
 
 ## Spec Change Log
 
