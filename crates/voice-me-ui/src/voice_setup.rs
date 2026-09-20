@@ -1080,6 +1080,62 @@ mod tests {
     }
 
     #[gpui_kit::test]
+    fn re_importing_after_accept_replaces_the_previously_saved_clip(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (_wav_guard, wav_path) = write_temp_file(&wav_bytes_for_duration(12.0), ".wav");
+        let capture_source = Arc::new(FakeCaptureSource::new(FakeOutcome::Succeed(
+            valid_clip_config(12.0),
+        )));
+        let import_source = Arc::new(FakeImportSource::new(Some(wav_path)));
+        let settings_store = Arc::new(FakeSettingsStore::default());
+        let settings_store_dyn: Arc<dyn SettingsStore> = settings_store.clone();
+        let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+            let view = cx.new(|_| {
+                VoiceSetupView::new_with_capture_and_import_sources(
+                    settings_store_dyn.clone(),
+                    capture_source.clone(),
+                    import_source.clone(),
+                )
+            });
+            Root::new(view, window, cx)
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("voice-setup-record", cx);
+            window.click("voice-setup-stop", cx);
+            window.click("voice-setup-accept", cx);
+            window.click("voice-setup-import", cx);
+        })
+        .unwrap();
+
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+
+            // Re-importing (as opposed to re-recording) after an Accept must
+            // also be possible, and Accept must become available once more —
+            // the prior (recorded) clip is only replaced once this *new*
+            // (imported) Accept fires.
+            assert_eq!(window.find("voice-setup-accept").disabled(), None);
+            window.click("voice-setup-accept", cx);
+        })
+        .unwrap();
+
+        let saved_clips = settings_store.saved_clips.lock().unwrap();
+        assert_eq!(
+            saved_clips.len(),
+            2,
+            "both the original recording and the re-imported clip must have been accepted"
+        );
+        assert_ne!(
+            saved_clips[0], saved_clips[1],
+            "the second Accept must have saved the newly imported clip, not a stale copy of the first (recorded) clip"
+        );
+    }
+
+    #[gpui_kit::test]
     fn a_failed_accept_keeps_the_pending_clip_available_for_a_retry(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
         let capture_source = Arc::new(FakeCaptureSource::new(FakeOutcome::Succeed(
