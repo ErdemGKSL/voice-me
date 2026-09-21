@@ -14,6 +14,11 @@ gpui-kit = { version = "0.6.4", default-features = false }
 # For the `AppEventSender` alias (AD-3) — already resolved to 0.3.34 in
 # Cargo.lock via gpui's own dependency graph.
 futures = "0.3"
+# AD-5: the runtime that owns every blocking job (ONNX Runtime inference
+# above all) so GPUI's main-thread executor never blocks. `rt-multi-thread`
+# is what `Runtime::new()` builds; the bridge itself only ever uses the
+# blocking pool, so no I/O or timer drivers are enabled.
+tokio = { version = "1.53", default-features = false, features = ["rt", "rt-multi-thread"] }
 
 [dev-dependencies]
 tempfile = "3.14"

@@ -1,4 +1,7 @@
+use std::path::Path;
+
 use crate::AppEventSender;
+use crate::audio::AudioBuffer;
 use crate::error::VoiceMeError;
 use crate::state::AppState;
 
@@ -31,7 +34,11 @@ pub trait HotkeyPort {
 /// Driven adapter port: plays generated audio through the OS virtual microphone.
 pub trait VirtualMicPort {
     /// Play a buffer of generated speech through the virtual microphone device.
-    fn play(&self, audio: &[u8]) -> Result<(), VoiceMeError>;
+    ///
+    /// Takes the core-owned [`AudioBuffer`] (AD-11), not bytes: the format
+    /// is fixed at 24 kHz mono f32 by what Chatterbox's decoder emits, so
+    /// there is nothing for this side to detect, negotiate, or guess wrong.
+    fn play(&self, audio: &AudioBuffer) -> Result<(), VoiceMeError>;
 }
 
 /// Driven adapter port: manages the OS system tray presence.
@@ -52,10 +59,30 @@ pub trait TrayPort {
     fn show(&self, cx: &mut gpui_kit::App, events: AppEventSender) -> Result<(), VoiceMeError>;
 }
 
-/// Driven adapter port: generates speech via the Chatterbox sidecar.
+/// Driven adapter port: generates speech with Chatterbox-Multilingual,
+/// in-process, on ONNX Runtime (AD-12 — there is no sidecar process and no
+/// Python anywhere in the pipeline; spec-2-5 verified this).
 pub trait TtsPort {
-    /// Generate speech audio for the given text.
-    fn generate(&self, text: &str) -> Result<Vec<u8>, VoiceMeError>;
+    /// Generate speech for `text` in `language`, cloning the voice in the
+    /// Reference Voice Sample at `reference_clip`.
+    ///
+    /// `language` is a lowercase ISO code (`"tr"`, `"en"`) — the model
+    /// takes it as a literal bracketed tag prepended to the text, so it is
+    /// part of the prompt rather than a separate knob. `reference_clip` is
+    /// a path, not decoded audio: whichever container the user's clip is in
+    /// has to be decoded and resampled to exactly 24 kHz before the speech
+    /// encoder sees it, and that belongs to the adapter that knows the
+    /// model's requirements.
+    ///
+    /// This call blocks for as long as generation takes (seconds), so it is
+    /// always driven through [`crate::tokio_bridge::spawn_blocking`] (AD-5)
+    /// and never on GPUI's main thread.
+    fn generate(
+        &self,
+        text: &str,
+        reference_clip: &Path,
+        language: &str,
+    ) -> Result<AudioBuffer, VoiceMeError>;
 }
 
 /// Driven adapter port: detects and provisions runtime dependencies.

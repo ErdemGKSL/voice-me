@@ -52,3 +52,15 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-4-summon-type-and-dismiss-the-prompt-overlay.md`
   summary: With `QuitMode::Explicit` set, a tray-registration failure now leaves the process running with neither tray nor window once the fallback Settings window is closed.
   evidence: `crates/voice-me-app/src/main.rs` falls back to `open_settings` when `TrayPort::show` fails; under the old quit-on-empty default, closing that window ended the process, and it no longer does. Rare path, but the right behavior (quit, retry the tray, or warn) is a product decision rather than a mechanical fix.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-5-spike-in-process-chatterbox-inference-on-onnx-runtime.md`
+  summary: The CPU language-model variant is undecided. The user judged FP32 audibly better than Q4, but `language_model.onnx_data` is 2.08 GB — over GitHub Releases' 2 GB per-asset limit — and `language_model_q4f16` (304 MB), the obvious middle ground, was never tested.
+  evidence: Post-review measurements on the same prompt: Q4 59 tokens / 2.32 s / 19.13 s total, FP32 57 tokens / 2.24 s / 22.59 s total. The speed cost of FP32 is ~18% end to end, not the 3.9x the language-model ratio suggests, because `conditional_decoder` dominates both and is indifferent to the weight variant — so quality, not speed, is the deciding factor, and distribution is the real obstacle. AD-7 already excludes FP32 from the mirrored set for the size reason. Resolve before Story 2.6 fixes a default and before Story 3.2 decides what to provision; testing q4f16 is one ~305 MB download and one run.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-5-spike-in-process-chatterbox-inference-on-onnx-runtime.md`
+  summary: FP16 was never re-measured after the repetition-penalty fix, so its recorded token count and audio length (61 tokens / 2.40 s) are from the buggy run.
+  evidence: The fix changed Q4 from 51 to 59 tokens and FP32 from 61 to 57 on the same prompt; FP16 ran under the same bug and was not repeated. Its timings stand (the penalty costs nothing measurable) but its token accounting does not. Low priority: FP16 on CPU measured 361 ms/token, 12.9x slower than Q4, so it is not a shipping candidate for the CPU variant regardless.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-5-spike-in-process-chatterbox-inference-on-onnx-runtime.md`
+  summary: Three WebGPU runs left core dumps on exit (Dawn cleanup after `VK_ERROR_DEVICE_LOST`), and `tests/reference_containers.rs` only covers the mp3/flac/ogg matrix row when `VOICE_ME_TEST_CLIPS` is set, so `cargo test --workspace` does not exercise it on its own.
+  evidence: The core dumps affect only the off-by-default `webgpu-probe` build and not anything CI compiles. The container test was run manually against ffmpeg re-encodes of the user's own clip and passed; making it unconditional needs committed binary fixtures, which the crate deliberately avoids.

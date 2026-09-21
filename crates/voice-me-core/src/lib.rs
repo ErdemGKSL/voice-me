@@ -1,12 +1,15 @@
 //! `voice-me-core` — the hexagon: platform-agnostic domain types, `AppState`,
 //! `AppEvent`, and the port traits every adapter implements (AD-1).
 
+mod audio;
 mod error;
 mod event;
 mod ports;
 mod settings_store;
 mod state;
+pub mod tokio_bridge;
 
+pub use audio::{AudioBuffer, SAMPLE_RATE};
 pub use error::VoiceMeError;
 pub use event::AppEvent;
 pub use ports::{

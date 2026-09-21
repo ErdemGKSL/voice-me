@@ -148,7 +148,9 @@ Users press a global hotkey from anywhere — including inside a fullscreen game
 **FRs covered:** FR2, FR3, FR4, FR5, FR6
 
 ### Epic 3: Never Get Stuck on Setup
-The app detects locally missing runtime dependencies itself and offers one-click provisioning from inside its own UI, naming anything it can't fix automatically with clear manual steps; it degrades to a CPU-only mode rather than failing outright when no GPU is available.
+The app detects locally missing runtime dependencies itself and offers one-click provisioning from inside its own UI, naming anything it can't fix automatically with clear manual steps; and it is honest about the relationship between the build the user downloaded and the hardware they are running it on.
+
+**Scope note (2026-09-21):** v1 ships one release artefact per backend variant — `cpu`, `cuda`, `local-webgpu` — chosen by the user at download time rather than detected at run time (AD-7). Every story in this epic is therefore variant-aware: what counts as a required dependency, and what "no GPU" means, both depend on which build is running. "Degrade to CPU-only" is no longer something a GPU build does silently — CPU-only is its own download.
 **FRs covered:** FR7
 
 ### Epic 4: Use It In Your Language
@@ -369,7 +371,9 @@ So that my teammates in voice chat hear it as if I'd spoken.
 
 ## Epic 3: Never Get Stuck on Setup
 
-The app detects locally missing runtime dependencies itself and offers one-click provisioning from inside its own UI, naming anything it can't fix automatically with clear manual steps; it degrades to a CPU-only mode rather than failing outright when no GPU is available.
+The app detects locally missing runtime dependencies itself and offers one-click provisioning from inside its own UI, naming anything it can't fix automatically with clear manual steps; and it is honest about the relationship between the build the user downloaded and the hardware they are running it on.
+
+**Scope note (2026-09-21):** v1 ships one release artefact per backend variant — `cpu`, `cuda`, `local-webgpu` — chosen by the user at download time rather than detected at run time (AD-7). Every story in this epic is therefore variant-aware: what counts as a required dependency, and what "no GPU" means, both depend on which build is running. "Degrade to CPU-only" is no longer something a GPU build does silently — CPU-only is its own download.
 
 ### Story 3.1: Detect Missing Dependencies
 
@@ -381,7 +385,10 @@ So that I always know what's missing instead of hitting a cryptic crash.
 
 **Given** the app starts, or I open Settings → Dependencies
 **When** the Dependency Check runs via `DependencyProvisioningPort`
-**Then** each dependency (the ONNX Runtime shared library, GPU execution providers, the Chatterbox ONNX weights, the Virtual Microphone driver) is listed as a Dependency row with status ready/missing (UX-DR12)
+**Then** each dependency this build actually needs — the ONNX Runtime shared library, the execution-provider libraries its variant requires, the Chatterbox ONNX weights for its language-model variant, the Virtual Microphone driver — is listed as a Dependency row with status ready/missing (UX-DR12)
+**And** the required list is derived from the running build's variant, not from a single fixed list: a `cpu` build never reports a missing GPU provider library, and a `cuda` build never reports the Q4 weights it does not use
+**And** the app states which variant it is, so a user who downloaded the wrong one can see that from the UI
+**And** on a GPU variant the check reports the candidate devices it can drive on this machine, as a list rather than a single verdict, since a machine may expose several (AD-9)
 **And** the check completes and reports results without requiring a terminal or external documentation
 
 ### Story 3.2: One-Click Provision a Missing Dependency
@@ -395,24 +402,26 @@ So that I never have to open a terminal or read a wiki to get voice-me working.
 **Given** a dependency is listed as missing and is automatable
 **When** I click "Install" on that Dependency row
 **Then** the app provisions it from this repo's GitHub Releases (AD-7) and the row updates to "ready" on success
-**And** the model-weight download — the largest asset, up to ~1.5 GB depending on the variant chosen for this machine's execution provider — reports progress and survives being resumed rather than appearing frozen
+**And** the assets fetched are the ones this build's variant needs — the ~1.56 GB CPU set (core runtime + Q4 weights), or a GPU variant's provider libraries plus FP16 weights — never both
+**And** the model-weight download — the largest asset, 354 MB (Q4) to 1.04 GB (FP16) — reports progress and survives being resumed rather than appearing frozen
 **And** a failure during provisioning shows a clear, specific message naming what went wrong
 **And** a dependency that isn't automatable shows a short manual-steps link instead of an Install button
 
-### Story 3.3: Degrade to CPU-Only Mode Without a GPU
+### Story 3.3: Be Honest When the Build and the Hardware Disagree
 
 As Erdem,
-I want the app to keep working in a slower CPU-only mode when no GPU is available,
-So that a missing GPU never fully blocks me from using voice-me.
+I want the app to tell me plainly when the build I downloaded can't use this machine's hardware,
+So that I'm never left wondering why it's slow, or staring at an inference error I can't interpret.
 
 **Acceptance Criteria:**
 
-**Given** no GPU execution provider is detected during the Dependency Check
-**When** TTS generation is requested
-**Then** the app runs the same Chatterbox model on the CPU execution provider with the Q4-quantized language model automatically, without failing (AD-12)
-**And** Settings → Dependencies shows an informational "CPU mode" badge, not an error (UX-DR18)
-**And** this capability detection flows from `voice-me-deps` to `voice-me-core` via `AppEvent` only, never a direct call to `voice-me-tts` (AD-9)
-**And** only the weight variant the detected backend needs is downloaded — a CPU-only machine never fetches the FP16 backbone
+**Given** a GPU variant is running on a machine with no device it can drive — a `cuda` build with no supported NVIDIA GPU, or a `local-webgpu` build with no usable Vulkan/D3D12 adapter
+**When** the Dependency Check runs
+**Then** Settings → Dependencies says so in words, names which variant would fit this machine, and links to where to download it (UX-DR18) — rather than failing at the first Speak Action with an engine error
+**And** the app does **not** silently fall back to CPU inside a GPU build: what the UI reports as the active backend is what was actually acquired, never what was requested (AD-9)
+**And** a `cpu` variant on a machine with a perfectly good GPU is a normal, non-error state — it is simply a different download
+**And** capability detection flows from `voice-me-deps` to `voice-me-core` via `AppEvent` only, never a direct call to `voice-me-tts` (AD-9)
+**And** only the weight variant this build needs is downloaded — a `cpu` build never fetches the FP16 backbone
 
 ### Story 3.4: Block the Overlay Gracefully on a Missing Dependency
 
@@ -427,6 +436,22 @@ So that I'm never confused about why speaking isn't working.
 **Then** Settings → Dependencies auto-opens naming the specific blocker (UX-DR17)
 **And** the Prompt Overlay still opens on hotkey press but shows an inline notice instead of accepting input until the dependency is resolved
 **And** once resolved, the Prompt Overlay returns to normal behavior without an app restart (NFR6)
+
+### Story 3.5: Choose Which GPU Runs Generation
+
+As Erdem,
+I want to pick which of my machine's GPUs voice-me uses,
+So that a laptop with both integrated and discrete graphics doesn't guess wrong on my behalf.
+
+**Acceptance Criteria:**
+
+**Given** a GPU variant is running and the Dependency Check found more than one candidate device
+**When** I open Settings → Dependencies
+**Then** the detected devices are listed by name and I can select which one generation uses
+**And** the selection persists across restarts through `SettingsStore` (AD-6), and an unset selection means "let the backend decide"
+**And** a previously selected device that is no longer present is reported as such and falls back to the default, rather than failing silently
+**And** a device that loses its context mid-generation surfaces as an error rather than playing the corrupted audio it produced — Story 2.5 measured exactly this on a Maxwell GPU under NVK
+**And** the selection reaches `voice-me-tts` through `AppState` only, never by querying `voice-me-deps` directly (AD-9)
 
 ## Epic 4: Use It In Your Language
 

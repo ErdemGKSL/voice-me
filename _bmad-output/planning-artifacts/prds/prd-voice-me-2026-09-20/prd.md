@@ -113,11 +113,15 @@ Generated audio plays out through the Virtual Microphone device rather than the 
 **Description:** Keeps the "single executable, no visible installer" promise honest without silently failing when something's missing.
 
 #### FR-7: In-app Dependency Check and guided/one-click setup
-On first run and on demand, the app checks for locally required components (the bundled Python runtime, GPU acceleration libraries, the chosen Virtual Microphone driver) and, where feasible, offers a one-click action to install or provision what's missing, inside the app UI.
+On first run and on demand, the app checks for locally required components (the ONNX Runtime shared library, the execution-provider libraries its build variant needs, the Chatterbox model weights, the chosen Virtual Microphone driver) and, where feasible, offers a one-click action to install or provision what's missing, inside the app UI. There is no bundled Python runtime — inference runs in-process (Architecture AD-12).
+
+**What gets checked depends on which build the user downloaded.** v1 ships one release artefact per backend variant — `cpu`, `cuda`, `local-webgpu` — rather than a single self-configuring binary, and the user chooses at download time (Architecture AD-7). The Dependency Check is therefore variant-aware: each variant has its own required-file list, and a GPU variant additionally reports which devices on this machine it can actually drive.
 
 **Consequences (testable):**
 - A missing dependency is named specifically to the user (not a generic error), with either a one-click fix or clear manual next steps if automation isn't possible for that item.
-- The app functions in a reduced/CPU-only mode (the "Chatterbox-Nano" CPU-oriented model variant) when GPU acceleration isn't available, rather than failing outright. `[ASSUMPTION]`
+- The app states which variant it is, and when the running build cannot use this machine's hardware — a `cuda` build with no supported NVIDIA GPU, or a selected GPU that has disappeared — it says so plainly, naming the variant that would fit, rather than silently running slower on CPU (Architecture AD-9).
+- On a GPU variant the user can see and choose which detected device is used; what the UI reports as the active backend reflects what was actually acquired, not what was requested.
+- Running without GPU acceleration is served by downloading the `cpu` variant, whose CPU path is the 4-bit-quantized language model — measured working, at a 0.10x real-time factor (Story 2.5). The earlier "Chatterbox-Nano" assumption is withdrawn: generation cost is dominated by the vocoder, which Nano shares, so a smaller language model would not meaningfully help.
 
 **Out of Scope:**
 - A traditional setup wizard or requirements page shown before the app can be used at all — dependency handling is in-app and as-needed, not a blocking upfront step.
@@ -146,7 +150,7 @@ The UI is implemented using gpui-kit components (`gpui_kit::component`, `gpui_ki
 ## 5. Non-Goals (Explicit)
 
 - Not a live, continuous voice changer — no real-time pass-through voice transformation.
-- Not a cloud service — no server-side inference, no accounts, no telemetry beyond what stays on-device.
+- Not a cloud service — no server-side inference, no accounts, no telemetry beyond what stays on-device. This holds unconditionally for every v1 variant; if a remote-generation variant is ever added (Open Question 7), this claim must be rewritten to name which variants it still covers rather than quietly narrowed.
 - Not a monetized product in v1 — free and open source.
 - Not targeting macOS in v1.
 - Not building Preset Phrase (hotkey → fixed phrase, no overlay) in v1 — real planned feature, deferred (see `brief.md` § Possible Future Features).
@@ -166,7 +170,7 @@ The UI is implemented using gpui-kit components (`gpui_kit::component`, `gpui_ki
 ### 6.2 Out of Scope for MVP
 - macOS support — deferred, no notarization/system-extension work scoped
 - Preset Phrase hotkey-to-fixed-phrase mapping — deferred to v2, tracked in `brief.md`
-- Cloud/hybrid inference — local-only is a hard requirement, not a v1-only default
+- Cloud/hybrid inference — local-only is a hard requirement for every variant v1 ships. A remote-API generation backend has since been raised as a possible *later, separate* variant; it is not in v1 and cannot be added to any existing variant without first settling Open Question 7.
 - Accounts, licensing, monetization
 - Saved/favorite phrase library, per-game profiles, and the other items under `brief.md` § Possible Future Features
 
@@ -189,12 +193,13 @@ Hobby-scale — kept intentionally light:
 
 ## 8. Open Questions
 
-1. What end-to-end latency (hotkey → audio playing) is actually achievable with Chatterbox-Multilingual V3 on typical consumer hardware, with and without GPU? No target is set until this is measured (affects FR-5, SM-2).
+1. ~~What end-to-end latency (hotkey → audio playing) is actually achievable with Chatterbox-Multilingual V3 on typical consumer hardware, with and without GPU?~~ **Partially answered 2026-09-21 by Story 2.5's spike.** On a 2017 4-core i7 with no usable GPU, a 2.0 s utterance costs ~20 s of CPU generation — a 0.10x real-time factor — after a one-off ~90 s session build. 86% of that is the vocoder, which is near-constant per utterance, so a short line costs almost as much as a long one. **Still open:** (a) whether ~20 s per utterance is acceptable for this product at all, which is a product judgement nobody has made yet, and (b) what a supported GPU actually buys — no CUDA-capable hardware was available to measure (affects FR-5, SM-2).
 2. Does the chosen Windows virtual audio driver (`VirtualDrivers/Virtual-Audio-Driver`, release 25.7.14) actually support named-pipe/IPC control out of the box, or does that require a custom build from the maintainer as the general README suggests? (affects FR-6, addendum architecture notes)
 3. Does global hotkey capture during fullscreen games risk conflicts with anti-cheat software in any target games? Needs investigation before committing to a specific hotkey-capture implementation (affects FR-3).
 4. What are Chatterbox-Multilingual V3's actual minimum reference-clip length/quality recommendations? Should set the bounds enforced in FR-1.
 5. ~~Is the "bundled Python sidecar" packaging approach actually deliverable as a clean single-executable experience?~~ **Resolved 2026-09-21 by removing the sidecar** — Chatterbox ships a complete ONNX export, so inference runs in-process via the Rust `ort` crate (see `addendum.md` § Superseded, Architecture Spine AD-12).
 6. Can GPUI (pre-1.0, no upstream tray or global-hotkey support) actually deliver FR-2 and FR-3 directly, or does this project need to depend on the unofficial "Adabraka GPUI" fork, or build platform-native tray/hotkey shims by hand? This is a foundational feasibility question for the whole UI shell, not a detail.
+7. Should voice-me ever generate speech through a **remote API**, as a separate download variant? Raised 2026-09-21 as a possible later direction. It is not an architecture detail: it would send the user's typed text, and probably their Reference Voice Sample, to a third party, which contradicts the local-only, no-telemetry promise this PRD makes in §Non-Goals and §Positioning, and which Architecture AD-8 exists to enforce. Deciding it means answering, explicitly: which variants may reach the network; what the UI discloses before the first byte leaves the machine; whether the user's voice sample is sent at all or only text; and whether the local-only claim is rewritten or scoped to the local variants. Until this is answered, no variant may make a generation-related network call (affects FR-5, FR-7, Non-Goals).
 
 ## 9. Assumptions Index
 

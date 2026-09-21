@@ -49,6 +49,8 @@ Behavioral. Visual specs live in `DESIGN.md.Components`.
 | Hotkey capture field | Settings → Hotkey | Click "Change," press the desired combination, it's captured live and rendered as a hotkey chip for confirmation before saving. Already-in-use combinations are rejected inline, not after Save. |
 | Voice recorder | Settings → Voice | Record button starts capture with the recording indicator (`DESIGN.md`); stop button ends it; a short playback control lets the user hear it back before accepting. Import is a standard file picker as an alternative entry point, same accept/re-record actions after either path. |
 | Dependency row | Settings → Dependencies | One row per dependency: name, status (`Badge`: ready / missing / installing), and a one-click "Install" action when missing and automatable, or a short manual-steps link when not. |
+| Build variant line | Settings → Dependencies, above the dependency rows | States which backend variant this binary is (`cpu`, `cuda`, `local-webgpu`) — read-only, since the variant is fixed at download time (AD-7). A user who downloaded the wrong build has to be able to see that here rather than infer it from slowness. |
+| GPU device selector | Settings → Dependencies, GPU variants only | A `Select` listing the devices the Dependency Check found this build can drive, by name. Unset means "let the backend decide". Hidden entirely on a `cpu` build, where there is nothing to choose. |
 | Tray menu | System tray | Two items: "Settings…", "Quit". No status submenu at this scope — Settings itself is the place to check state. |
 | UI language selector | Settings → General | A `Select` of Turkish/English. Applying a new value re-renders every open surface immediately — no restart, no confirmation dialog. Independent of the TTS speech language set in Settings → Voice; changing one never changes the other. |
 
@@ -63,7 +65,10 @@ Behavioral. Visual specs live in `DESIGN.md.Components`.
 | Speak failed | OS-native notification | "Couldn't generate speech. {short reason}." This notification, originating from voice-me itself, *is* the "clear failure" surface (SPEC CAP-5) — no overlay reappears automatically, and the user re-invokes the hotkey to retry. |
 | First run / no Reference Voice Sample yet | Settings → Voice (auto-opened) | Empty state: "Record your voice to get started," single primary action, no other Settings tabs distract from this blocking prerequisite. |
 | Dependency missing (blocking) | Settings → Dependencies (auto-opened) | Named dependency, status `missing`, one-click Install where possible. The Prompt Overlay still opens on hotkey press but shows an inline notice instead of accepting input until resolved. |
-| No GPU available | Settings → Dependencies | Informational `Badge`: "CPU mode" — not an error; generation still works, just slower. |
+| Running the `cpu` variant | Settings → Dependencies | Informational `Badge`: "CPU mode" — not an error, and not a fallback: this build has no GPU path by design. Generation works, just slower. |
+| GPU variant, no usable device | Settings → Dependencies | Named in words, not a bare error: what this build needs, what this machine has, and which variant would fit — with a link to download it. Never a silent fall back to CPU inside a GPU build (AD-9). |
+| Selected GPU no longer present | Settings → Dependencies | The selector reports the missing device by name and reverts to the default rather than failing silently. |
+| GPU lost mid-generation | OS-native notification | Surfaced as a generation failure. The audio produced by a device that lost its context is corrupted (measured on Maxwell/NVK, Story 2.5) and must never be played. |
 | Hotkey conflict | Settings → Hotkey | Inline error at the capture field: "Already used by {app}." Previous working hotkey stays active until a new one is confirmed. |
 
 ## Interaction Primitives

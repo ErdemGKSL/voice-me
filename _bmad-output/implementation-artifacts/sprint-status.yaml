@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-20-2026 19:26
-last_updated: 09-21-2026 12:48
+last_updated: 09-21-2026 16:30
 project: voice-me
 project_key: NOKEY
 tracking_system: file-system
@@ -48,7 +48,7 @@ development_status:
   2-2-run-as-a-background-tray-resident-process: review
   2-3-configure-a-global-hotkey: review
   2-4-summon-type-and-dismiss-the-prompt-overlay: review
-  2-5-spike-in-process-chatterbox-inference-on-onnx-runtime: backlog
+  2-5-spike-in-process-chatterbox-inference-on-onnx-runtime: review
   2-6-generate-speech-from-the-prompt-overlay-text: backlog
   2-7-spike-linux-virtual-microphone-via-pipewire: backlog
   2-8-spike-windows-virtual-microphone-control-surface: backlog
@@ -58,8 +58,9 @@ development_status:
   epic-3: backlog
   3-1-detect-missing-dependencies: backlog
   3-2-one-click-provision-a-missing-dependency: backlog
-  3-3-degrade-to-cpu-only-mode-without-a-gpu: backlog
+  3-3-be-honest-when-the-build-and-the-hardware-disagree: backlog
   3-4-block-the-overlay-gracefully-on-a-missing-dependency: backlog
+  3-5-choose-which-gpu-runs-generation: backlog
   epic-3-retrospective: optional
 
   epic-4: backlog

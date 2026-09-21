@@ -17,7 +17,124 @@ with a single focused field. Type a line and press `Enter` to send it;
 the overlay never quits the app — it stays in the tray either way.
 
 **Nothing is spoken yet.** A confirmed line is currently only printed to
-stdout. Speech generation and playback arrive in later stories.
+stdout. Speech generation and playback arrive in later stories — but the
+speech engine itself already exists and can be driven on its own; see
+"Speech generation" below.
+
+## Speech generation (spec-2-5 spike)
+
+Speech is generated **in this process**, by ONNX Runtime, from the
+Chatterbox-Multilingual V3 ONNX export. There is no sidecar process and no
+Python anywhere in the pipeline.
+
+The app never downloads model or runtime files (AD-8) — they are read from a
+cache directory. Until `voice-me-deps` exists (Story 3.2), provision them by
+hand with `curl`.
+
+### 1. ONNX Runtime
+
+```bash
+mkdir -p ~/.cache/voice-me/onnxruntime
+curl -L -o /tmp/ort.tgz \
+  https://github.com/microsoft/onnxruntime/releases/download/v1.28.2/onnxruntime-linux-x64-1.28.2.tgz
+tar xzf /tmp/ort.tgz -C ~/.cache/voice-me/onnxruntime
+export ORT_DYLIB_PATH=~/.cache/voice-me/onnxruntime/onnxruntime-linux-x64-1.28.2/lib/libonnxruntime.so
+```
+
+The tarball is 8.7 MB and ships the core library only — **no execution
+provider libraries at all**. That is the whole CPU path, which is the only
+one this machine can run; see "GPU" below for why the GPU path is deferred
+rather than absent by design.
+
+### 2. Model files
+
+All from `onnx-community/chatterbox-multilingual-ONNX` (MIT), pinned to
+revision `452d3f434aa592098f1eedac9099f33642ab2da5` — the tokenizer and the
+graphs have drifted against each other before, so the revision is not
+optional.
+
+```bash
+REV=452d3f434aa592098f1eedac9099f33642ab2da5
+BASE=https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/$REV
+mkdir -p ~/.cache/voice-me/onnx
+curl -L -o ~/.cache/voice-me/tokenizer.json "$BASE/tokenizer.json"
+for f in speech_encoder.onnx speech_encoder.onnx_data \
+         embed_tokens.onnx embed_tokens.onnx_data \
+         conditional_decoder.onnx conditional_decoder.onnx_data \
+         language_model_q4.onnx language_model_q4.onnx_data; do
+  curl -L -o ~/.cache/voice-me/onnx/$f "$BASE/onnx/$f"
+done
+```
+
+Each `.onnx_data` holds its graph's weights and records its own location as a
+**bare relative filename**, so it must sit next to its `.onnx`. The cache
+directory defaults to `$XDG_CACHE_HOME/voice-me`; `VOICE_ME_MODEL_CACHE`
+overrides it.
+
+### 3. Run the spike
+
+```bash
+cargo run --release -p voice-me-tts --example tts-spike -- tr "Merhaba, bugün nasılsın?"
+cargo run --release -p voice-me-tts --example tts-spike -- en "Hey, I'll be right back."
+```
+
+It decodes the Reference Voice Sample at
+`~/.local/share/voice-me/reference_voice_sample.wav` (any container; `--reference`
+points elsewhere), generates, prints per-stage timings, and writes a wav to
+`$TMPDIR`. `--variant fp32` loads the unquantized baseline for an A/B listen;
+that one is an extra 2.08 GB.
+
+If a file is missing, the run prints the **complete** list of files it needs
+with each one marked present or missing, rather than failing on the first.
+
+### What it measures (i7-7700HQ, 4C/8T, 15 GB, 2026-09-21)
+
+`"Merhaba, bugün nasılsın?"`, the 31 s Reference Voice Sample, one process
+per row:
+
+| Variant / provider | Session build | `language_model` | `conditional_decoder` | Utterance total |
+| --- | --- | --- | --- | --- |
+| **Q4 / CPU** | 86–91 s | 28.0 ms/token | 17.6 s | **20.5 s** for 2.0 s of audio |
+| FP32 / CPU | 94 s | 107.9 ms/token | 19.8 s | 28.1 s |
+| FP16 / CPU | 88 s | 361.0 ms/token | 18.5 s | 42.1 s |
+| FP16 / WebGPU (Intel HD 630) | 110 s | 344.4 ms/token | 49.1 s | 73.8 s |
+
+Q4 on CPU is the fastest path by a wide margin, and session construction
+dominates everything — which is exactly what AD-10's "build once and hold"
+rule is for. `conditional_decoder` is the real per-utterance cost (86 % of
+it), not the token loop.
+
+### GPU
+
+GPU acceleration is still planned — it just could not be exercised on the
+machine this was developed on, so it is deferred rather than dropped. What
+follows describes *this hardware*, not voice-me's direction:
+
+- **CUDA is unreachable here**, so it was skipped rather than ruled out. The Quadro M1200 is GM107 = sm_50. ONNX Runtime
+  1.28.2's prebuilt CUDA floor is sm_60 with no PTX target below
+  `120-virtual` to JIT from, so a correct install would still fail at run
+  with "no kernel image is available". Separately, Arch ships only
+  `nvidia-open` (Turing+). On an sm_60-or-newer NVIDIA GPU the CUDA
+  execution provider is expected to work as AD-9 describes; nothing here
+  tests that either way.
+- **WebGPU over Vulkan runs, and is far slower than the CPU.** Measured on
+  the same line, same binary: 24.9 ms/token on CPU against 311 ms/token on
+  the Intel HD 630 and 1174 ms/token on the Quadro via NVK. ORT's own
+  node-placement log confirms this is a real GPU run — 183 of the 189
+  `language_model_q4` nodes land on `WebGpuExecutionProvider`, including all
+  30 `GroupQueryAttention` and all 151 `MatMulNBits` — so the contrib ops are
+  not the problem; the hardware is. The Quadro additionally loses its Vulkan
+  device mid-run (`VK_ERROR_DEVICE_LOST` out of NVK) on anything longer than
+  a word.
+- Reaching WebGPU at all needs `--no-default-features --features
+  webgpu-probe`, which swaps `load-dynamic` for ort's `download-binaries`
+  (pyke's Dawn-bundling distribution): a build-time download and a static
+  link, i.e. the opposite of what AD-8 mandates, never built in CI. Its
+  `libwebgpu_dawn.so` is not installed anywhere, so the built example needs
+  `LD_LIBRARY_PATH` pointing into `~/.cache/ort.pyke.io/dfbin/...`.
+- `ort::ep::WebGPU::with_device_id` had **no effect** here — Dawn picked the
+  discrete adapter regardless. The only thing that selected a device was
+  restricting the Vulkan loader: `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/intel_icd.json`.
 
 ## Linux: prompt overlay and always-on-top
 

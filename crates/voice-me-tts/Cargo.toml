@@ -5,3 +5,73 @@ edition.workspace = true
 
 [dependencies]
 voice-me-core = { path = "../voice-me-core" }
+# AD-12: Chatterbox-Multilingual runs in-process on ONNX Runtime — there is
+# no sidecar and no Python. `default-features = false` is load-bearing: ort's
+# defaults pull in `download-binaries`, which drags `ureq` (an HTTP client)
+# into the workspace and fetches a runtime at build time — exactly what AD-8
+# forbids. `load-dynamic` instead resolves `libonnxruntime.so` at run time
+# from `ORT_DYLIB_PATH`, so the binary CI builds carries no runtime and
+# downloads nothing.
+ort = { version = "2.0.0-rc.13", default-features = false, features = [
+  "std",
+  "ndarray",
+  "half",
+  "api-27",
+] }
+# The version ort rc.13 itself depends on — a mismatch here means its
+# `try_extract_array` returns a type this crate cannot name.
+ndarray = "0.17"
+# The exported `tokenizer.json` is a BPE tokenizer whose `TemplateProcessing`
+# wraps every sequence as `[6563, 255, …, 0, 6561, 6561]`. Loading it with
+# this crate reproduces the template for free; hand-rolling it would mean
+# reimplementing the template exactly. `onig` only — the default feature set
+# pulls in the HF hub HTTP client.
+tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
+# The Reference Voice Sample is whatever the user recorded or picked, so the
+# decoder has to cover the common containers. Everything but mp3 is on by
+# default.
+symphonia = { version = "0.6.1", features = ["mp3"] }
+# The fp16 `language_model` variant's 60 KV tensors are f16, so the loop has
+# to be able to name that type. Pure Rust, no download.
+half = "2.4"
+# `speech_encoder` holds a fixed internal 24k→16k resample, so its input must
+# *literally* be 24 kHz — a clip at any other rate has to be converted, not
+# merely relabelled.
+rubato = "5.0.0"
+
+[dev-dependencies]
+# The spike example is hosted inside a real GPUI app (AD-5 is only proven
+# from inside `application().run(..)`).
+gpui-kit = { version = "0.6.4", default-features = false }
+futures = "0.3"
+tokio = { version = "1.53", default-features = false, features = ["rt", "rt-multi-thread"] }
+# Writing the generated buffer out as a wav, so it can be listened to.
+hound = "3.5"
+tempfile = "3.14"
+
+[features]
+default = ["dynamic-runtime"]
+
+# The AD-8 path, and the only one CI ever builds: ONNX Runtime is resolved at
+# run time from `ORT_DYLIB_PATH`, so the binary carries no runtime and the
+# build downloads nothing.
+#
+# It is a named feature rather than a flag glued onto the `ort` dependency
+# above because `webgpu-probe` has to be able to *turn it off*. Cargo features
+# are purely additive — `--features webgpu-probe` cannot unset a feature that
+# the dependency line always enables — and with `load-dynamic` on, ort-sys
+# skips its download entirely and the probe silently builds a CPU-only binary
+# that reports "WebGPU" on the command line. Splitting it out is what makes
+# `--no-default-features --features webgpu-probe` mean what it says.
+dynamic-runtime = ["ort/load-dynamic"]
+
+# Off by default, and never built in CI: the WebGPU execution provider is not
+# in Microsoft's linux-x64 tarball at all, so reaching it means ort's
+# `download-binaries` (pyke's Dawn-bundling distribution) — a build-time
+# download and a static link, i.e. the opposite of AD-8. It exists solely so
+# the spike could measure the Vulkan path; an architecture-clean WebGPU build
+# needs ONNX Runtime compiled from source with `--use_webgpu
+# --build_shared_lib` and mirrored per AD-7. Build it with
+# `--no-default-features --features webgpu-probe`; with the default feature
+# still on, `load-dynamic` wins and no WebGPU provider is linked at all.
+webgpu-probe = ["ort/download-binaries", "ort/webgpu", "ort/tls-rustls"]

@@ -23,6 +23,43 @@ pub enum VoiceMeError {
     )]
     InputDevicePermissionDenied,
 
+    /// A file the speech engine needs is not on disk. Its own variant
+    /// because it is the *only* failure a user can actually fix, and the
+    /// fix is mechanical: fetch that exact path. voice-me never downloads
+    /// model or runtime files itself (AD-8/AD-12), so the path has to
+    /// travel all the way to the surface intact rather than being folded
+    /// into a generic "failed to start" message.
+    #[error("missing runtime asset: {path}")]
+    MissingRuntimeAsset {
+        /// The absolute path that was looked for and not found.
+        path: std::path::PathBuf,
+    },
+
+    /// ONNX Runtime itself failed — building a session, or running one.
+    /// Separate from [`VoiceMeError::MissingRuntimeAsset`] because nothing
+    /// the user does to their filesystem fixes it: it means the graph, the
+    /// execution provider, or the inputs are wrong, which is a bug report,
+    /// not a provisioning step.
+    #[error("speech engine failure: {0}")]
+    SpeechEngine(String),
+
+    /// The Reference Voice Sample is in a container or codec this build
+    /// cannot decode. Its own variant so the message can name the format
+    /// the user handed over — "unsupported audio" without the format is
+    /// unactionable when the fix is a one-line `ffmpeg` conversion.
+    #[error("unsupported audio input: {format}")]
+    UnsupportedAudioInput {
+        /// The container/codec as far as it could be identified.
+        format: String,
+    },
+
+    /// Generation was asked for with nothing to say. Rejected as its own
+    /// variant rather than returning an empty buffer, because every caller
+    /// downstream (playback, notifications) would then have to decide what
+    /// an empty buffer means.
+    #[error("nothing to speak: the text is empty")]
+    EmptyText,
+
     #[error("{0}")]
     Other(String),
 }
