@@ -7,6 +7,7 @@
 //!
 //! Run with: `cargo run -p voice-me-tray-linux --example spike`
 
+use futures::channel::mpsc;
 use gpui_kit::{App, QuitMode, platform};
 use voice_me_core::TrayPort;
 use voice_me_tray_linux::LinuxTrayAdapter;
@@ -15,7 +16,8 @@ fn main() {
     platform::application()
         .with_quit_mode(QuitMode::Explicit)
         .run(|cx: &mut App| {
-            if let Err(error) = LinuxTrayAdapter.show(cx) {
+            let (events, _receiver) = mpsc::unbounded();
+            if let Err(error) = LinuxTrayAdapter.show(cx, events) {
                 eprintln!("failed to show tray: {error}");
                 cx.quit();
                 return;

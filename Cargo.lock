@@ -7785,8 +7785,11 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "voice-me-app"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "gpui-kit",
  "voice-me-core",
+ "voice-me-tray-linux",
+ "voice-me-tray-windows",
  "voice-me-ui",
 ]
 
@@ -7809,6 +7812,7 @@ name = "voice-me-core"
 version = "0.1.0"
 dependencies = [
  "directories",
+ "futures",
  "gpui-kit",
  "serde",
  "tempfile",
@@ -7857,6 +7861,7 @@ dependencies = [
 name = "voice-me-tray-linux"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "gpui-kit",
  "gpui-tray",
  "voice-me-core",

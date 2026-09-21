@@ -10,3 +10,8 @@ gpui-kit = { version = "0.6.4", default-features = false }
 # source instead of gpui-tray's default pinned Zed git dependency (spec-2-1
 # Design Notes / crate's own README "Choose a GPUI dependency").
 gpui-tray = { version = "0.1", default-features = false, features = ["gpui-kit"] }
+
+[dev-dependencies]
+# For the spike example's `AppEventSender` channel — already resolved to
+# 0.3.34 in Cargo.lock via gpui's own dependency graph.
+futures = "0.3"

@@ -14,3 +14,8 @@ pub use ports::{
 };
 pub use settings_store::FileSettingsStore;
 pub use state::AppState;
+
+/// Sender half of the shared `AppEvent` channel (AD-3). Adapters hold only
+/// this sender half; only `voice-me-app` (the composition root) holds the
+/// receiver half.
+pub type AppEventSender = futures::channel::mpsc::UnboundedSender<AppEvent>;

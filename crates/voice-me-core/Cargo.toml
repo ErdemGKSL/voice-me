@@ -11,6 +11,9 @@ toml = "1.1"
 # Only for the `gpui_kit::App` context type `TrayPort::show` threads through to
 # adapters (see ports.rs) — never the tray crate itself (spec-2-1).
 gpui-kit = { version = "0.6.4", default-features = false }
+# For the `AppEventSender` alias (AD-3) — already resolved to 0.3.34 in
+# Cargo.lock via gpui's own dependency graph.
+futures = "0.3"
 
 [dev-dependencies]
 tempfile = "3.14"

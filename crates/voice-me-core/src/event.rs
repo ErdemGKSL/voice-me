@@ -9,4 +9,6 @@ pub enum AppEvent {
     HotkeyPressed,
     /// `voice-me-deps`'s Dependency Check finished running.
     DependencyCheckCompleted,
+    /// The tray's "Settings…" menu item was clicked.
+    SettingsRequested,
 }

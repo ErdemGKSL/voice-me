@@ -1,4 +1,4 @@
-use voice_me_core::{TrayPort, VoiceMeError};
+use voice_me_core::{AppEventSender, TrayPort, VoiceMeError};
 
 /// Windows `TrayPort` adapter. Not yet implemented — Windows is deferred for
 /// spec-2-1 (no Windows target/toolchain in this dev environment); see
@@ -6,7 +6,7 @@ use voice_me_core::{TrayPort, VoiceMeError};
 pub struct WindowsTrayAdapter;
 
 impl TrayPort for WindowsTrayAdapter {
-    fn show(&self, _cx: &mut gpui_kit::App) -> Result<(), VoiceMeError> {
+    fn show(&self, _cx: &mut gpui_kit::App, _events: AppEventSender) -> Result<(), VoiceMeError> {
         todo!()
     }
 }

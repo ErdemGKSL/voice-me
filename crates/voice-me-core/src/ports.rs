@@ -1,3 +1,4 @@
+use crate::AppEventSender;
 use crate::error::VoiceMeError;
 use crate::state::AppState;
 
@@ -23,7 +24,12 @@ pub trait TrayPort {
     /// there is no way to stand up or drive a tray without it. `voice-me-core`
     /// depends on `gpui-kit` only for this context type, never on the tray
     /// crate itself, which stays confined to the `voice-me-tray-*` adapters.
-    fn show(&self, cx: &mut gpui_kit::App) -> Result<(), VoiceMeError>;
+    ///
+    /// `events` is the sender half of the shared `AppEvent` channel (AD-3):
+    /// adapters use it to signal actions like "Settings…" clicked back to
+    /// the composition root, without depending on `voice-me-ui` or calling
+    /// window APIs themselves.
+    fn show(&self, cx: &mut gpui_kit::App, events: AppEventSender) -> Result<(), VoiceMeError>;
 }
 
 /// Driven adapter port: generates speech via the Chatterbox sidecar.

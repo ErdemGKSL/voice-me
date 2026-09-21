@@ -1,8 +1,8 @@
 use gpui_kit::{App, Global, MenuItem, actions};
 use gpui_tray::{Icon, Tray};
-use voice_me_core::{TrayPort, VoiceMeError};
+use voice_me_core::{AppEvent, AppEventSender, TrayPort, VoiceMeError};
 
-actions!(voice_me_tray_linux, [Quit]);
+actions!(voice_me_tray_linux, [Settings, Quit]);
 
 /// Holds the live `gpui-tray` handle as a GPUI global so it stays open for
 /// the lifetime of the app. `Tray::close`/`Drop` tear the native item down,
@@ -12,12 +12,22 @@ struct TrayHandle(#[allow(dead_code)] Tray);
 
 impl Global for TrayHandle {}
 
+/// Holds the sender half of the shared `AppEvent` channel (AD-3) as a GPUI
+/// global, since the `Settings` action handler fires later, outside
+/// `LinuxTrayAdapter::show`'s call frame, and needs somewhere to read it
+/// from.
+struct EventSender(AppEventSender);
+
+impl Global for EventSender {}
+
 /// Linux `TrayPort` adapter backed by `gpui-tray`'s native StatusNotifierItem
 /// + DBusMenu backend (no GTK, no second event loop — see spec-2-1).
 pub struct LinuxTrayAdapter;
 
 impl TrayPort for LinuxTrayAdapter {
-    fn show(&self, cx: &mut App) -> Result<(), VoiceMeError> {
+    fn show(&self, cx: &mut App, events: AppEventSender) -> Result<(), VoiceMeError> {
+        cx.set_global(EventSender(events));
+        cx.on_action(on_settings);
         cx.on_action(on_quit);
 
         let tray = Tray::builder()
@@ -34,7 +44,17 @@ impl TrayPort for LinuxTrayAdapter {
 }
 
 fn build_menu(_cx: &mut App) -> Vec<MenuItem> {
-    vec![MenuItem::action("Quit", Quit)]
+    vec![
+        MenuItem::action("Settings…", Settings),
+        MenuItem::action("Quit", Quit),
+    ]
+}
+
+fn on_settings(_: &Settings, cx: &mut App) {
+    let _ = cx
+        .global::<EventSender>()
+        .0
+        .unbounded_send(AppEvent::SettingsRequested);
 }
 
 fn on_quit(_: &Quit, cx: &mut App) {

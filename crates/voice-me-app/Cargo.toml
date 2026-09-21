@@ -11,3 +11,12 @@ path = "src/main.rs"
 gpui-kit = "0.6.4"
 voice-me-core = { path = "../voice-me-core" }
 voice-me-ui = { path = "../voice-me-ui" }
+# For the `AppEvent` channel (AD-3) — already resolved to 0.3.34 in
+# Cargo.lock via gpui's own dependency graph.
+futures = "0.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+voice-me-tray-linux = { path = "../voice-me-tray-linux" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+voice-me-tray-windows = { path = "../voice-me-tray-windows" }
