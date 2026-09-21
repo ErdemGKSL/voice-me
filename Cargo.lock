@@ -3040,6 +3040,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "84e2a5ff79002223edfcfa76c6f9f79f4f60f6ec545ccc27832f12bd46348b39"
 
 [[package]]
+name = "gpui-tray"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c01af03fe16178c6051e7611ae1699d4d6d5b537d579e38aea7efeec0af2a433"
+dependencies = [
+ "async-channel",
+ "gpui-pre",
+ "image",
+ "log",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
+ "thiserror 2.0.20",
+ "windows 0.62.2",
+ "zbus",
+]
+
+[[package]]
 name = "granit-parser"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7791,6 +7809,7 @@ name = "voice-me-core"
 version = "0.1.0"
 dependencies = [
  "directories",
+ "gpui-kit",
  "serde",
  "tempfile",
  "thiserror 2.0.20",
@@ -7838,6 +7857,8 @@ dependencies = [
 name = "voice-me-tray-linux"
 version = "0.1.0"
 dependencies = [
+ "gpui-kit",
+ "gpui-tray",
  "voice-me-core",
 ]
 
@@ -7845,6 +7866,7 @@ dependencies = [
 name = "voice-me-tray-windows"
 version = "0.1.0"
 dependencies = [
+ "gpui-kit",
  "voice-me-core",
 ]
 

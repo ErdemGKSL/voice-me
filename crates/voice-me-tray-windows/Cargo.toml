@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 voice-me-core = { path = "../voice-me-core" }
+gpui-kit = { version = "0.6.4", default-features = false }

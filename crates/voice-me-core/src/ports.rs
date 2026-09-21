@@ -16,7 +16,14 @@ pub trait VirtualMicPort {
 /// Driven adapter port: manages the OS system tray presence.
 pub trait TrayPort {
     /// Show the application's tray icon and menu.
-    fn show(&self) -> Result<(), VoiceMeError>;
+    ///
+    /// Takes a `gpui_kit::App` context because tray-backed implementations
+    /// (e.g. `gpui-tray`, see spec-2-1) build their native tray item and
+    /// dispatch menu-item clicks as ordinary GPUI actions through `cx` —
+    /// there is no way to stand up or drive a tray without it. `voice-me-core`
+    /// depends on `gpui-kit` only for this context type, never on the tray
+    /// crate itself, which stays confined to the `voice-me-tray-*` adapters.
+    fn show(&self, cx: &mut gpui_kit::App) -> Result<(), VoiceMeError>;
 }
 
 /// Driven adapter port: generates speech via the Chatterbox sidecar.

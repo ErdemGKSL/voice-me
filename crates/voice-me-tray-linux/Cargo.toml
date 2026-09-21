@@ -5,3 +5,8 @@ edition.workspace = true
 
 [dependencies]
 voice-me-core = { path = "../voice-me-core" }
+gpui-kit = { version = "0.6.4", default-features = false }
+# gpui-kit feature: uses gpui-kit's own gpui-pre re-export as the version
+# source instead of gpui-tray's default pinned Zed git dependency (spec-2-1
+# Design Notes / crate's own README "Choose a GPUI dependency").
+gpui-tray = { version = "0.1", default-features = false, features = ["gpui-kit"] }
