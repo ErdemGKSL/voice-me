@@ -40,11 +40,13 @@ fn main() {
 
         cx.spawn(async move |cx| {
             cx.open_window(WindowOptions::default(), move |window, cx| {
-                let view = cx.new(|_| {
+                let view = cx.new(|cx| {
                     VoiceSetupView::new(
                         settings_store.clone(),
                         has_active_sample,
                         selected_mic_device,
+                        window,
+                        cx,
                     )
                 });
                 cx.new(|cx| Root::new(view, window, cx))
