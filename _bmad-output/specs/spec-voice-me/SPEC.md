@@ -38,6 +38,7 @@ A vision to realize, for its own builder first: Erdem wants to "speak" in voice 
 - **CAP-5 — TTS generation via the cloned voice**
   - **intent:** The typed text, the active Reference Voice Sample, and the selected speech language produce spoken audio in the user's own voice.
   - **success:** Generated audio is in the selected speech language; a generation failure surfaces a clear in-app failure, never silent nothing.
+  - **how:** the model runs in-process on ONNX Runtime — no Python runtime and no separate process (Architecture Spine AD-12).
 
 - **CAP-6 — Playback through the Virtual Microphone**
   - **intent:** Generated audio plays through a Virtual Microphone device that other applications can select as their microphone input.
@@ -70,7 +71,8 @@ A vision to realize, for its own builder first: Erdem wants to "speak" in voice 
 - Preset Phrase (a hotkey bound directly to a fixed spoken phrase, no overlay) in v1 — planned for a later version.
 - Cloud or hybrid inference.
 - Accounts, licensing, monetization.
-- Speech languages beyond what Chatterbox-Multilingual V3 supports natively.
+- Speech languages beyond what Chatterbox-Multilingual V3 supports natively — and, in v1, further narrowed to the languages whose text needs no Python-only normalization, which excludes Chinese, Japanese, Hebrew and Korean but keeps Turkish and English (Architecture Spine AD-12).
+- Watermarking generated audio in v1: Resemble's optional Perth watermarker is Python-only and has no Rust/ONNX equivalent (Architecture Spine AD-12).
 
 ## Success signal
 
@@ -78,18 +80,18 @@ Erdem uses voice-me during real gaming sessions at least weekly, instead of fall
 
 ## Assumptions
 
-- Minimum/maximum Reference Voice Sample length and supported import formats are not yet fixed; to be set from Chatterbox's own guidance during implementation.
+- Minimum/maximum Reference Voice Sample length and supported import formats are not yet fixed; to be set from Chatterbox's own guidance during implementation. Whatever the clip's source format, it is decoded and resampled to 24 kHz mono f32 before reaching the speech encoder.
 - Exact tray UX (icon, menu contents) per OS is not yet designed.
 - Prompt Overlay hotkey-to-ready-for-input latency target is under ~200ms; no measured baseline yet.
 - gpui-kit is assumed to cover enough standard components (buttons, inputs, dialogs) to avoid hand-rolled UI for most of the app; not verified against gpui-kit's actual component set.
 
 ## Open Questions
 
-- What end-to-end latency (hotkey press to audio playing) is actually achievable with Chatterbox-Multilingual V3 on typical consumer hardware, with and without a GPU?
+- What end-to-end latency (hotkey press to audio playing) is actually achievable with Chatterbox-Multilingual V3 on typical consumer hardware, with and without a GPU? In-process ONNX Runtime removes process-startup cost but not the autoregressive decode loop itself, and the CPU path runs a Q4-quantized backbone.
 - Does the chosen Windows virtual audio driver (`VirtualDrivers/Virtual-Audio-Driver`, release 25.7.14) support named-pipe/IPC control out of the box, or does that require a custom build from the maintainer?
 - Does global hotkey capture during fullscreen games risk conflicts with anti-cheat software (e.g. BattlEye, EasyAntiCheat) in any target games?
 - What are Chatterbox-Multilingual V3's actual minimum reference-clip length/quality recommendations?
-- Is the bundled-Python-sidecar packaging approach actually deliverable as a clean single-executable experience, or will early spikes surface blockers?
+- ~~Is the bundled-Python-sidecar packaging approach actually deliverable as a clean single-executable experience?~~ **Resolved 2026-09-21 by dropping the premise:** Chatterbox-Multilingual V3 ships a complete ONNX export (MIT), so inference runs in-process via the `ort` crate and there is no Python to package (Architecture Spine AD-12). The packaging question that replaces it is smaller: how the ONNX Runtime shared library and its GPU execution providers get provisioned per OS.
 - Can GPUI/gpui-kit actually deliver tray + global-hotkey support (neither provides it upstream) — or is the unofficial "Adabraka GPUI" fork, or a hand-rolled per-OS shim, needed?
-- Do Chatterbox's model weights fit within GitHub Releases' practical hosting limits, and are they legally redistributable there at all?
-- What exact audio buffer format (sample rate, bit depth, channel layout) crosses the TTS-to-Virtual-Microphone boundary?
+- ~~Do Chatterbox's model weights fit within GitHub Releases' practical hosting limits, and are they legally redistributable there at all?~~ **Resolved 2026-09-21:** the ONNX weights are MIT-licensed and every file v1 ships is under the 2 GB per-asset limit (largest: `language_model_fp16.onnx_data`, 1.04 GB); only the unused FP32 backbone (2.08 GB) exceeds it (Architecture Spine AD-7).
+- ~~What exact audio buffer format crosses the TTS-to-Virtual-Microphone boundary?~~ **Resolved 2026-09-21:** 32-bit float, 24 000 Hz, mono — Chatterbox's own output rate, converted to whatever the driver needs inside each `voice-me-audio-*` adapter (Architecture Spine AD-11).

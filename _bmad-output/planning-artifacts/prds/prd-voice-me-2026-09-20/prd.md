@@ -41,7 +41,7 @@ voice-me lets you "speak" in your own cloned voice without speaking out loud. A 
 - **Speak Action** — the act of the Prompt Overlay closing on Enter, triggering TTS generation and playback for the typed line.
 - **TTS Engine** — Chatterbox-Multilingual V3, the local voice-cloning text-to-speech model that turns (text, language, Reference Voice Sample) into audio.
 - **Virtual Microphone** — an OS-level virtual audio input device that other applications (games, Discord, Zoom) can select as their microphone; voice-me plays generated audio into it instead of a physical mic.
-- **Sidecar Process** — the local background process that hosts the TTS Engine's Python/PyTorch runtime, managed and provisioned automatically by the main app (detailed in `addendum.md`).
+- **Sidecar Process** — the local background process that hosts the TTS Engine's Python/PyTorch runtime, managed and provisioned automatically by the main app (detailed in `addendum.md`). *(Superseded 2026-09-21: there is no Sidecar Process — the model runs in-process on ONNX Runtime. See `addendum.md` § Superseded and Architecture Spine AD-12.)*
 - **Dependency Check** — the app's on-demand scan for locally missing components the Sidecar Process needs (e.g. the bundled Python runtime, GPU acceleration libraries), surfaced in-app rather than as a setup wizard.
 - **Preset Phrase** — (v2+, not in v1) a fixed phrase bound directly to a hotkey, spoken with no Prompt Overlay shown at all.
 - **GPUI** — the underlying Rust GPU-accelerated UI framework (Zed Industries) the app's interface is built on.
@@ -193,7 +193,7 @@ Hobby-scale — kept intentionally light:
 2. Does the chosen Windows virtual audio driver (`VirtualDrivers/Virtual-Audio-Driver`, release 25.7.14) actually support named-pipe/IPC control out of the box, or does that require a custom build from the maintainer as the general README suggests? (affects FR-6, addendum architecture notes)
 3. Does global hotkey capture during fullscreen games risk conflicts with anti-cheat software in any target games? Needs investigation before committing to a specific hotkey-capture implementation (affects FR-3).
 4. What are Chatterbox-Multilingual V3's actual minimum reference-clip length/quality recommendations? Should set the bounds enforced in FR-1.
-5. Is the "bundled Python sidecar" packaging approach (see brief `addendum.md`) actually deliverable as a clean single-executable experience, or will early spikes surface blockers requiring a different approach?
+5. ~~Is the "bundled Python sidecar" packaging approach actually deliverable as a clean single-executable experience?~~ **Resolved 2026-09-21 by removing the sidecar** — Chatterbox ships a complete ONNX export, so inference runs in-process via the Rust `ort` crate (see `addendum.md` § Superseded, Architecture Spine AD-12).
 6. Can GPUI (pre-1.0, no upstream tray or global-hotkey support) actually deliver FR-2 and FR-3 directly, or does this project need to depend on the unofficial "Adabraka GPUI" fork, or build platform-native tray/hotkey shims by hand? This is a foundational feasibility question for the whole UI shell, not a detail.
 
 ## 9. Assumptions Index

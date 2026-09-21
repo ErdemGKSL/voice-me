@@ -35,9 +35,9 @@ Microcopy. Brand posture lives in `DESIGN.md.Brand & Style` — quiet, gets out 
 | Do | Don't |
 |---|---|
 | "Recording…" | "We're capturing your voice! 🎙️" |
-| "Couldn't generate speech. Check the sidecar and try again." | "Oops! Something went wrong with the TTS engine." |
+| "Couldn't generate speech. Try again." | "Oops! Something went wrong with the TTS engine." |
 | "Hotkey already in use by {app}." | "Error: hotkey conflict detected." |
-| "Missing: Python runtime. Install now?" | "Dependency check failed (code 3)." |
+| "Missing: speech model files. Download now?" | "Dependency check failed (code 3)." |
 
 ## Component Patterns
 
@@ -119,4 +119,4 @@ Failure: generation takes unusually long → a brief OS notification says it's s
 4. Settings → Hotkey is the natural next stop: he clicks "Change," presses `Alt+Shift+Space`, sees the chip confirm the combination isn't taken elsewhere, and saves.
 5. **Climax:** he closes Settings entirely. The app drops to the tray — no window, no chrome, just the icon — and is now, silently, ready for the hotkey he just set. The whole setup took under a few minutes and never asked him to open a terminal.
 
-Failure: a required dependency (e.g. the bundled Python runtime) isn't provisioned yet → Settings → Dependencies opens instead, named specifically, with a one-click Install; Voice Setup resumes once it completes.
+Failure: a required dependency (e.g. the speech model files, or the ONNX Runtime library) isn't provisioned yet → Settings → Dependencies opens instead, named specifically, with a one-click Install; Voice Setup resumes once it completes.

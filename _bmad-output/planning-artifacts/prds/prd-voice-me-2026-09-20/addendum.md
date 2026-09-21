@@ -34,3 +34,11 @@ Rationale sketch (for architecture stage to confirm or revise):
 - `voice-me-tts` isolates all Sidecar Process/IPC concerns so the "how we talk to the Python sidecar" decision can change without touching UI or hotkey code.
 - `voice-me-app` stays thin — composition root only, no business logic — so `voice-me-tests` (and any future headless testing) can exercise the lib crates without spinning up the GPUI app.
 - Exact crate boundaries, naming, and whether some of these merge (e.g. `voice-me-deps` folding into `voice-me-tts`) are architecture-stage decisions, not fixed here.
+
+---
+
+## Superseded: the bundled-Python sidecar (2026-09-21)
+
+Everything above that assumes a **Sidecar Process** — a bundled CPython/PyTorch runtime reached from `voice-me-tts` over local IPC — is superseded. Chatterbox-Multilingual V3 is published as a complete ONNX export (`onnx-community/chatterbox-multilingual-ONNX`, MIT), reference-voice cloning included, so `voice-me-tts` runs the model **in-process** via the `ort` crate (ONNX Runtime): no Python, no child process, no IPC.
+
+This resolves PRD Open Question 5 by removing its premise. Binding detail lives in **Architecture Spine AD-12** (with consequences recorded in AD-5, AD-7, AD-8, AD-9, AD-10 and AD-11); `epics.md` and `SPEC.md` are updated to match. Two scope consequences worth carrying forward: v1 speech languages exclude Chinese, Japanese, Hebrew and Korean (their text normalization is Python-only), and generated audio is not Perth-watermarked in v1.

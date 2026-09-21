@@ -27,11 +27,11 @@ FR3: User can assign and change a single global hotkey combination that summons 
 
 FR4: Pressing the configured hotkey opens a minimal, borderless, always-on-top single-line Prompt Overlay; pressing Enter closes it immediately and triggers the Speak Action with the typed text (generation happens after the UI is gone); pressing Escape or losing focus closes it without speaking and discards the text.
 
-FR5: On a Speak Action, the typed text plus the active Reference Voice Sample and selected speech language are sent to the TTS Engine (Chatterbox-Multilingual V3) via the Sidecar Process, producing audio in the user's cloned voice; a generation failure surfaces a clear failure indication rather than silence.
+FR5: On a Speak Action, the typed text plus the active Reference Voice Sample and selected speech language are passed to the Inference Engine (Chatterbox-Multilingual V3's ONNX export, run in-process on ONNX Runtime — Architecture Spine AD-12), producing audio in the user's cloned voice; a generation failure surfaces a clear failure indication rather than silence. v1 speech languages are limited to those needing no Python-only text normalization (Turkish and English included; Chinese, Japanese, Hebrew and Korean excluded).
 
 FR6: Generated audio plays out through the Virtual Microphone device (not the default speaker) on both Linux and Windows, timed to the Speak Action, so any application selecting it as input receives the audio; the user's real physical microphone is unaffected.
 
-FR7: On first run and on demand, the app checks for locally required components (bundled Python runtime, GPU acceleration libraries, the Virtual Microphone driver) and offers one-click provisioning inside the app UI where feasible, naming any unfixable-automatically dependency specifically with manual next steps; the app degrades to a reduced/CPU-only mode (Chatterbox-Nano) rather than failing outright when no GPU is available.
+FR7: On first run and on demand, the app checks for locally required components (the ONNX Runtime shared library, GPU execution providers, the ONNX model weights, the Virtual Microphone driver) and offers one-click provisioning inside the app UI where feasible, naming any unfixable-automatically dependency specifically with manual next steps; the app degrades to a CPU-only mode — the Q4-quantized language model on the CPU execution provider — rather than failing outright when no GPU is available.
 
 FR8: The application interface (menus, settings, Prompt Overlay chrome, error messages) is available in Turkish and English, user-selectable, switching without requiring a restart, and independent of the TTS speech language.
 
@@ -43,7 +43,7 @@ NFR1 (Performance): The Prompt Overlay must appear and be ready for keystrokes w
 
 NFR2 (Compatibility/Risk): Global hotkey capture must function while a fullscreen or borderless-fullscreen game holds input focus, on Linux and Windows, without being blocked by the OS or the game. Whether this risks conflicts with anti-cheat software (BattlEye, EasyAntiCheat) in specific games is unresolved and must be investigated before the hotkey-capture implementation is locked in (PRD Open Question 3).
 
-NFR3 (Privacy/Security): The app must be local-only — no cloud calls, no accounts, no telemetry. Network egress is limited to the dependency-provisioning adapter's fetches from this project's own GitHub Releases; every other component (including the TTS sidecar's IPC) is loopback-only (Architecture Spine AD-8), enforced by a CI check rather than review discipline alone.
+NFR3 (Privacy/Security): The app must be local-only — no cloud calls, no accounts, no telemetry. Network egress is limited to the dependency-provisioning adapter's fetches from this project's own GitHub Releases; every other component is fully offline — the Inference Engine runs in-process and opens no socket at all (Architecture Spine AD-8, AD-12), enforced by a CI check rather than review discipline alone.
 
 NFR4 (Reliability): The app must degrade gracefully — to a CPU-only mode when no GPU is available (FR7), and to a clear, specific in-app or OS-notification failure state (never silent nothing) when TTS generation or a dependency check fails.
 
@@ -61,18 +61,19 @@ NFR6 (Distribution): The app ships as a single native executable per platform wi
 - Single `AppState`/`AppEvent` ownership: only `voice-me-core` use-cases mutate `AppState`; `voice-me-app` is the sole `AppEvent` receiver (AD-3).
 - One `thiserror` domain error enum in core; adapters map their own errors at the boundary; `anyhow` aggregates at the composition root (AD-4).
 - Tokio runs alongside GPUI's own executor via one in-house bridge (Zed's `gpui_tokio` pattern reimplemented, not depended on directly — that crate is workspace-internal to `zed-industries/zed` and not consumable as-is) (AD-5).
-- Settings (one TOML) and the Reference Voice Sample (a file path) live behind `SettingsStore`, implemented inside `voice-me-core` itself; large runtime assets (Python runtime, model weights, driver installer) live in a separate cache directory owned by `voice-me-deps` (AD-6).
+- Settings (one TOML) and the Reference Voice Sample (a file path) live behind `SettingsStore`, implemented inside `voice-me-core` itself; large runtime assets (ONNX Runtime library and execution providers, model weights, driver installer) live in a separate cache directory owned by `voice-me-deps` (AD-6).
 - CI/release: GitHub Actions, separate Linux/Windows build jobs (no macOS), binaries and mirrored runtime assets on this repo's GitHub Releases (AD-7).
 - No network egress outside `voice-me-deps`'s declared fetches, anywhere in the app (AD-8).
 - GPU-capability detection is core-owned: `voice-me-deps` reports via `AppEvent` only; `voice-me-tts` never calls `voice-me-deps` directly (AD-9).
-- Speak Action sequencing: Prompt Overlay dismissal is synchronous and never waits on `TtsPort::generate`; sidecar lifecycle/supervision is entirely internal to `voice-me-tts` (AD-10).
-- One shared audio buffer type crosses the `TtsPort` → `VirtualMicPort` boundary — never a raw byte slice or a per-adapter struct (AD-11).
+- Speak Action sequencing: Prompt Overlay dismissal is synchronous and never waits on `TtsPort::generate`; ONNX session lifecycle (built once lazily, held for the process lifetime, one generation in flight at a time) is entirely internal to `voice-me-tts` (AD-10).
+- TTS inference runs in-process via the `ort` crate — no Python, no child process, no IPC; generation runs on `spawn_blocking` because it is CPU/GPU-bound (AD-12, AD-5).
+- One shared audio buffer type crosses the `TtsPort` → `VirtualMicPort` boundary — never a raw byte slice or a per-adapter struct; its format is fixed at 24 kHz mono f32 (AD-11).
 
 **Crate/workspace structure (Structural Seed):** `voice-me-app` (bin, composition root) · `voice-me-core` · `voice-me-ui` (gpui-kit) · `voice-me-hotkey-linux` / `voice-me-hotkey-windows` · `voice-me-audio-linux` / `voice-me-audio-windows` · `voice-me-tray-linux` / `voice-me-tray-windows` · `voice-me-tts` · `voice-me-deps` · `voice-me-i18n` · `voice-me-tests`.
 
 **Infrastructure/deployment:** GitHub Actions CI with separate `ubuntu-latest` and `windows-latest` jobs; GitHub Releases as the sole distribution and runtime-asset-hosting channel (AD-7). No server/cloud environment exists.
 
-**Integration requirements:** Linux Virtual Microphone via a PipeWire/PulseAudio null-sink (no driver, no signing). Windows Virtual Microphone via `VirtualDrivers/Virtual-Audio-Driver` (release 25.7.14, SignPath-signed) — its named-pipe/IPC control surface is unconfirmed and must be verified before `voice-me-audio-windows` is implemented (PRD Open Question 2). Chatterbox-Multilingual V3 runs in a bundled-Python Sidecar Process reached over local IPC from `voice-me-tts`.
+**Integration requirements:** Linux Virtual Microphone via a PipeWire/PulseAudio null-sink (no driver, no signing). Windows Virtual Microphone via `VirtualDrivers/Virtual-Audio-Driver` (release 25.7.14, SignPath-signed) — its named-pipe/IPC control surface is unconfirmed and must be verified before `voice-me-audio-windows` is implemented (PRD Open Question 2). Chatterbox-Multilingual V3 runs **in-process** inside `voice-me-tts` on ONNX Runtime via the `ort` crate (AD-12) — four ONNX graphs (`speech_encoder`, `embed_tokens`, `language_model`, `conditional_decoder`) plus `tokenizer.json`, all MIT-licensed, from `onnx-community/chatterbox-multilingual-ONNX`. No Python, no sidecar, no IPC. `voice-me-deps` provisions the ONNX Runtime shared library and execution providers (CUDA / DirectML / CPU) alongside the weights.
 
 **Monitoring/logging:** `tracing`, initialized once centrally in `voice-me-app`; no crate sets up its own logger.
 
@@ -143,7 +144,7 @@ Users can record their own voice directly in the app, or import an existing audi
 **FRs covered:** FR1
 
 ### Epic 2: Speak Without Speaking (Core Loop)
-Users press a global hotkey from anywhere — including inside a fullscreen game — get a minimal overlay, type a line, hit Enter, and a moment later hear that line spoken in their own cloned voice through a virtual microphone that other apps pick up as input. This is the product's entire reason to exist, delivered end to end. Two distinct technical risks live inside this epic (GPUI/gpui-kit's missing tray+hotkey support; the Chatterbox sidecar/virtual-mic-driver packaging and control surface) and are spiked early via story sequencing rather than epic splitting, since both belong to one inseparable user outcome.
+Users press a global hotkey from anywhere — including inside a fullscreen game — get a minimal overlay, type a line, hit Enter, and a moment later hear that line spoken in their own cloned voice through a virtual microphone that other apps pick up as input. This is the product's entire reason to exist, delivered end to end. Two distinct technical risks live inside this epic (GPUI/gpui-kit's missing tray+hotkey support; the ONNX inference port and the virtual-mic-driver control surface) and are spiked early via story sequencing rather than epic splitting, since both belong to one inseparable user outcome.
 **FRs covered:** FR2, FR3, FR4, FR5, FR6
 
 ### Epic 3: Never Get Stuck on Setup
@@ -292,20 +293,23 @@ So that the interaction never breaks my flow.
 **And** the Overlay is a custom gpui-kit-based component (not a stock surface), fixed non-resizable width, with the overlay-specific corner radius and elevation (UX-DR4), and only a short fade/scale-in and fade-out animation (UX-DR22)
 **And** the Overlay is fully keyboard-operable from summon to dismissal with no extra click required (UX-DR20)
 
-### Story 2.5: Spike — Chatterbox Sidecar Packaging and IPC
+### Story 2.5: Spike — In-Process Chatterbox Inference on ONNX Runtime
 
 As Erdem,
-I want to validate that Chatterbox-Multilingual V3 can run as a bundled-Python sidecar reachable over local IPC,
-So that the packaging risk (PRD Open Question 5) is resolved before wiring the full generation pipeline.
+I want to validate that Chatterbox-Multilingual V3's ONNX export runs in-process from Rust and is fast enough to be usable,
+So that the remaining TTS risk — the ported generation loop and real latency (PRD Open Question 1) — is resolved before the full pipeline is wired.
 
 **Acceptance Criteria:**
 
 **Given** `voice-me-tts` is an empty stub crate
-**When** a minimal spike bundles a Python runtime, loads Chatterbox, and exchanges one request/response over local IPC with a Rust caller
-**Then** typed text plus a sample Reference Voice Sample produces generated audio successfully on the developer's machine
-**And** the in-house Tokio/GPUI bridge (AD-5) is proven to work end-to-end with this IPC call
-**And** the shared audio buffer type (AD-11) is defined based on what Chatterbox actually outputs
-**And** the outcome (works as bundled sidecar / needs a different approach) is documented
+**When** a minimal spike loads the four ONNX graphs plus `tokenizer.json` with the `ort` crate and runs the AD-12 generation loop end to end
+**Then** typed Turkish and English text plus a sample Reference Voice Sample produce audible, recognizably-cloned 24 kHz audio on the developer's machine, with no Python installed or invoked
+**And** the reference clip is decoded and resampled to 24 kHz mono f32 from at least one non-wav source format
+**And** generation latency is measured and recorded for both paths available on this machine — CPU (Q4) and GPU (FP16, CUDA) — as the first real data for PRD Open Question 1, along with a note on whether Q4 degrades the cloned voice audibly versus FP16
+**And** one-off session-construction cost is measured separately from per-utterance cost, confirming AD-10's build-once/hold decision
+**And** the in-house Tokio/GPUI bridge (AD-5) is proven to work end-to-end with generation running on `spawn_blocking`
+**And** the shared audio buffer type (AD-11) is implemented in `voice-me-core` as 24 kHz mono f32
+**And** the outcome (viable as-is / needs quantization or backend changes) is documented, including which ONNX Runtime library and execution-provider files had to be present for each path — the input Story 3.2's provisioning work depends on
 
 ### Story 2.6: Generate Speech from the Prompt Overlay Text
 
@@ -316,11 +320,12 @@ So that I don't have to do anything beyond typing and pressing Enter.
 **Acceptance Criteria:**
 
 **Given** a Speak Action has been triggered (Story 2.4) and a Reference Voice Sample exists (Epic 1)
-**When** the typed text, active Reference Voice Sample, and selected speech language are sent to the TTS Engine via the Sidecar Process
+**When** the typed text, active Reference Voice Sample, and selected speech language are passed to the in-process Inference Engine via `TtsPort` (AD-12)
 **Then** generated audio is produced in the selected speech language, independent of the UI language
+**And** the ONNX sessions are built once and reused across Speak Actions; a second Speak Action arriving mid-generation is queued, not run concurrently (AD-10)
 **And** if generation fails, an OS-native notification names the failure clearly (UX-DR15) rather than silence
 **And** if generation takes unusually long, a brief OS-native notification reports it's still working (UX-DR14)
-**And** hardware capability (GPU vs CPU-only) is read from `AppState` per AD-9, never queried directly from `voice-me-deps`
+**And** hardware capability (which execution provider, and therefore which language-model weight variant) is read from `AppState` per AD-9, never queried directly from `voice-me-deps`
 
 ### Story 2.7: Spike — Linux Virtual Microphone via PipeWire
 
@@ -376,7 +381,7 @@ So that I always know what's missing instead of hitting a cryptic crash.
 
 **Given** the app starts, or I open Settings → Dependencies
 **When** the Dependency Check runs via `DependencyProvisioningPort`
-**Then** each dependency (bundled Python runtime, GPU acceleration libraries, the Virtual Microphone driver) is listed as a Dependency row with status ready/missing (UX-DR12)
+**Then** each dependency (the ONNX Runtime shared library, GPU execution providers, the Chatterbox ONNX weights, the Virtual Microphone driver) is listed as a Dependency row with status ready/missing (UX-DR12)
 **And** the check completes and reports results without requiring a terminal or external documentation
 
 ### Story 3.2: One-Click Provision a Missing Dependency
@@ -390,6 +395,7 @@ So that I never have to open a terminal or read a wiki to get voice-me working.
 **Given** a dependency is listed as missing and is automatable
 **When** I click "Install" on that Dependency row
 **Then** the app provisions it from this repo's GitHub Releases (AD-7) and the row updates to "ready" on success
+**And** the model-weight download — the largest asset, up to ~1.5 GB depending on the variant chosen for this machine's execution provider — reports progress and survives being resumed rather than appearing frozen
 **And** a failure during provisioning shows a clear, specific message naming what went wrong
 **And** a dependency that isn't automatable shows a short manual-steps link instead of an Install button
 
@@ -401,11 +407,12 @@ So that a missing GPU never fully blocks me from using voice-me.
 
 **Acceptance Criteria:**
 
-**Given** no GPU acceleration is detected during the Dependency Check
+**Given** no GPU execution provider is detected during the Dependency Check
 **When** TTS generation is requested
-**Then** the app uses the CPU-oriented Chatterbox-Nano variant automatically, without failing
+**Then** the app runs the same Chatterbox model on the CPU execution provider with the Q4-quantized language model automatically, without failing (AD-12)
 **And** Settings → Dependencies shows an informational "CPU mode" badge, not an error (UX-DR18)
 **And** this capability detection flows from `voice-me-deps` to `voice-me-core` via `AppEvent` only, never a direct call to `voice-me-tts` (AD-9)
+**And** only the weight variant the detected backend needs is downloaded — a CPU-only machine never fetches the FP16 backbone
 
 ### Story 3.4: Block the Overlay Gracefully on a Missing Dependency
 

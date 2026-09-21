@@ -48,7 +48,7 @@ development_status:
   2-2-run-as-a-background-tray-resident-process: review
   2-3-configure-a-global-hotkey: review
   2-4-summon-type-and-dismiss-the-prompt-overlay: backlog
-  2-5-spike-chatterbox-sidecar-packaging-and-ipc: backlog
+  2-5-spike-in-process-chatterbox-inference-on-onnx-runtime: backlog
   2-6-generate-speech-from-the-prompt-overlay-text: backlog
   2-7-spike-linux-virtual-microphone-via-pipewire: backlog
   2-8-spike-windows-virtual-microphone-control-surface: backlog
