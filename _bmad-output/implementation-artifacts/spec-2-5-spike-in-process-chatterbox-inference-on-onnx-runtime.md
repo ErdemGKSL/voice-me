@@ -266,10 +266,12 @@ All verified, none by inspection alone:
   22.59 s (FP32), i.e. ~18 % slower**, because `conditional_decoder` dominates
   both and is indifferent to the weight variant.
 
-  The obstacle is distribution, not speed: `language_model.onnx_data` is
-  **2.08 GB**, over GitHub Releases' 2 GB per-asset limit, which is exactly why
-  AD-7 excluded FP32 from the mirrored set. Shipping it means splitting the
-  asset, hosting it elsewhere, or falling back to the Hugging Face origin.
+  Nor is distribution the obstacle it first appeared to be. `language_model.onnx_data`
+  is **2.08 GB**, over GitHub Releases' 2 GB per-asset limit — but mirroring
+  there was only ever a convenience. AD-7 has been revised accordingly: an
+  oversized asset is fetched by direct static URL from the MIT-licensed
+  Hugging Face origin at the pinned revision, using the same resumable ranged
+  download Story 3.2 owes anyway. FP32 is therefore the intended CPU default.
   **`language_model_q4f16` (304 MB) was never tested** and is the obvious
   candidate before accepting either horn of that trade — it is smaller than Q4
   and may carry most of FP32's quality. Resolve before Story 2.6 fixes a
