@@ -967,6 +967,10 @@ mod tests {
             Ok(AppState::default())
         }
 
+        fn save_hotkey(&self, _hotkey: Option<&str>) -> Result<AppState, VoiceMeError> {
+            Ok(AppState::default())
+        }
+
         fn save_selected_mic_device(&self, device: Option<&str>) -> Result<AppState, VoiceMeError> {
             if *self.mic_device_save_fails.lock().unwrap() {
                 return Err(VoiceMeError::Other(

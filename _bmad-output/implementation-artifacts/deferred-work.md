@@ -16,3 +16,23 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-2-run-as-a-background-tray-resident-process.md`
   summary: `voice-me-tray-windows`'s `todo!()` body now panics at process startup on any Windows build, since `crates/voice-me-app/src/main.rs` calls `WindowsTrayAdapter::show` unconditionally — a real regression from before this story (Windows previously opened the Voice Setup window fine with no tray at all).
   evidence: Confirmed by reading `main.rs`'s `#[cfg(target_os = "windows")]` branch, which calls `WindowsTrayAdapter.show(cx, event_tx.clone())` unconditionally at startup, and `crates/voice-me-tray-windows/src/lib.rs`, whose `show` body is still `todo!()`. No Windows toolchain exists in this dev environment or any CI to build, run, or guard against this; the rest of Epic 2's Windows support (hotkey, audio, virtual-mic adapters) is still `backlog`, so the platform is non-functional regardless of this specific panic. `voice-me-tray-windows` staying a deferred `todo!()` stub is the explicit precedent set by spec-2-1.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-3-configure-a-global-hotkey.md`
+  summary: `voice-me-hotkey-windows`'s `todo!()` bodies are now reachable at runtime — a Windows build panics at startup with a saved hotkey, and on every Hotkey-tab Save.
+  evidence: Verified real. `main.rs` calls `start_listening` whenever a saved hotkey exists and `HotkeyView::save` calls `rebind`; both are `todo!()` on Windows. Deferred on spec-2-2's precedent for the identical `voice-me-tray-windows` case — no Windows toolchain exists here or in CI to build or verify a guard against, and every Windows adapter in this epic is still a stub. Smallest future fix: return `Err(VoiceMeError::Other(...))` instead of `todo!()`, which the UI's existing `HotkeyIssueKind::Other` path already renders.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-3-configure-a-global-hotkey.md`
+  summary: The Wayland/evdev backend enumerates `/dev/input` once at startup — a keyboard connected later is never read, and a reader thread that dies is never replaced.
+  evidence: Verified real and acknowledged in `evdev.rs`'s own comments, which name unplug and suspend as causes for a thread exiting. The hotkey can therefore stop working silently after a suspend/resume cycle, with only a stderr line. A missing capability rather than a defect in what was built; closing it needs an inotify watch on `/dev/input` plus reader-thread supervision.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-3-configure-a-global-hotkey.md`
+  summary: A `Matcher` is created per input device, so a combination whose modifiers and trigger key arrive on two different event nodes would never match.
+  evidence: Unverified (`maybe-false`); would be `medium` if true. `is_keyboard` admits only devices reporting `KEY_A`, which normally also report their own modifiers, but some laptops and USB combo receivers expose several `eventN` nodes. Settling it needs hardware that splits modifiers from the main key matrix; a shared modifier set across matchers would fix it if confirmed.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-3-configure-a-global-hotkey.md`
+  summary: X11 `rebind`'s register-before-unregister ordering, and the composition root's startup re-activation of a saved hotkey, are both unexercised by any automated test.
+  evidence: Verified by search — no test executes `X11Backend::rebind`, and `voice-me-app` has no test target. Reversing the rebind order would leave a user with no working hotkey after a rejected Save while the UI blames a conflict; deleting the startup block would stop hotkeys surviving a restart. Both stay green today. The first needs a real X display plus a second grab-holding client; the second needs the startup sequence extracted into a library crate — the same gap Story 2.2's tray wiring already carries.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-3-configure-a-global-hotkey.md`
+  summary: A configured hotkey can be changed but never cleared — no UI path calls `save_hotkey(None)`, so the "None set" empty state is unreachable once a hotkey exists.
+  evidence: Verified real. `SettingsStore::save_hotkey` accepts and persists `None` and is tested for it, and `HotkeyView` renders a `NO_HOTKEY_LABEL` state, but the view offers only Change / Cancel / Save. Rejected from this story as `low`: Story 2.3's intent is "assign and change", not remove, and a Clear control is new public UI surface. Worth adding alongside the Settings shell's later sections, together with an `unbind` on `HotkeyPort`.

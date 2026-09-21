@@ -5,3 +5,20 @@ edition.workspace = true
 
 [dependencies]
 voice-me-core = { path = "../voice-me-core" }
+# X11 backend: a real `XGrabKey` exclusive grab, which is also what makes
+# inline conflict detection possible (spec-2-3 Design Notes). Its accelerator
+# syntax (`Ctrl+Alt+KeyV`) is the persisted hotkey format for *both* backends,
+# so this crate is also the parser for the evdev path.
+global-hotkey = "0.8"
+# Wayland fallback: `global-hotkey` is X11-only and GNOME does not implement
+# the GlobalShortcuts portal, so a passive read of `/dev/input/event*` is the
+# only way a global hotkey works in a GNOME/Wayland session (spec-2-3
+# decision 1). No default features: this path only needs the blocking
+# `Device`/`fetch_events` API, so the optional `tokio`/`stream-trait` async
+# stack stays out of the build.
+evdev = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+# For the spike example's `AppEventSender` channel — already resolved to
+# 0.3.34 in Cargo.lock via gpui's own dependency graph.
+futures = "0.3"

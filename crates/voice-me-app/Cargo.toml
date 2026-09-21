@@ -17,6 +17,8 @@ futures = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 voice-me-tray-linux = { path = "../voice-me-tray-linux" }
+voice-me-hotkey-linux = { path = "../voice-me-hotkey-linux" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 voice-me-tray-windows = { path = "../voice-me-tray-windows" }
+voice-me-hotkey-windows = { path = "../voice-me-hotkey-windows" }

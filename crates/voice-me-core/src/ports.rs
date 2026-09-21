@@ -4,8 +4,28 @@ use crate::state::AppState;
 
 /// Driving adapter port: captures the configured global hotkey per OS.
 pub trait HotkeyPort {
-    /// Start listening for the configured hotkey, signaling presses via `AppEvent`.
-    fn start_listening(&self, hotkey: &str) -> Result<(), VoiceMeError>;
+    /// Start listening for `hotkey`, signaling each press through `events`.
+    ///
+    /// `events` is the sender half of the shared `AppEvent` channel (AD-3),
+    /// threaded in the same way as `TrayPort::show`: the adapter signals
+    /// presses only by sending `AppEvent::HotkeyPressed`, never by depending
+    /// on `voice-me-ui` or touching windows itself.
+    ///
+    /// Called once at startup by the composition root, and only when a
+    /// hotkey was actually saved in a previous run — an app that has never
+    /// had one configured must start with no hotkey active and no error.
+    fn start_listening(&self, hotkey: &str, events: AppEventSender) -> Result<(), VoiceMeError>;
+
+    /// Make `hotkey` the live combination, replacing whichever one is
+    /// currently bound.
+    ///
+    /// This is the "confirm it works before persisting it" step the Settings
+    /// UI calls on Save: on a backend that can detect a conflict it returns
+    /// [`VoiceMeError::HotkeyAlreadyInUse`] *without* disturbing the
+    /// previously bound combination, so the caller can surface the conflict
+    /// and leave both the old binding and `settings.toml` untouched. Any
+    /// other `Err` leaves the old binding in place too.
+    fn rebind(&self, hotkey: &str) -> Result<(), VoiceMeError>;
 }
 
 /// Driven adapter port: plays generated audio through the OS virtual microphone.
@@ -61,4 +81,11 @@ pub trait SettingsStore {
     /// clear the selection back to the OS default. Returns the resulting
     /// `AppState`.
     fn save_selected_mic_device(&self, device: Option<&str>) -> Result<AppState, VoiceMeError>;
+
+    /// Persist the configured global hotkey, or `None` to clear it. The
+    /// string is stored in `global-hotkey`'s accelerator syntax (e.g.
+    /// `Ctrl+Alt+KeyV`) so it round-trips through `HotKey::from_str` with no
+    /// bespoke parser; the display form shown on a chip is derived for
+    /// rendering only and never persisted. Returns the resulting `AppState`.
+    fn save_hotkey(&self, hotkey: Option<&str>) -> Result<AppState, VoiceMeError>;
 }

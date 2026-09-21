@@ -147,6 +147,13 @@ impl SettingsStore for FileSettingsStore {
         self.write_settings_file(&settings)?;
         Ok(self.build_state(settings))
     }
+
+    fn save_hotkey(&self, hotkey: Option<&str>) -> Result<AppState, VoiceMeError> {
+        let mut settings = self.read_settings_file()?;
+        settings.hotkey = hotkey.map(str::to_string);
+        self.write_settings_file(&settings)?;
+        Ok(self.build_state(settings))
+    }
 }
 
 #[cfg(test)]
@@ -238,5 +245,60 @@ mod tests {
         // `None` clears the selection back to the OS default.
         let cleared = store.save_selected_mic_device(None).unwrap();
         assert_eq!(cleared.selected_mic_device, None);
+    }
+
+    #[test]
+    fn save_hotkey_round_trips_across_a_fresh_load() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = FileSettingsStore::with_dirs(
+            config_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+        assert_eq!(store.load().unwrap().hotkey, None);
+
+        let state = store.save_hotkey(Some("Ctrl+Alt+KeyV")).unwrap();
+        assert_eq!(state.hotkey, Some("Ctrl+Alt+KeyV".to_string()));
+
+        // A brand new store (simulating the next run of the process) still
+        // reports it — this is what re-activates the hotkey at next startup.
+        let reloaded_store = FileSettingsStore::with_dirs(
+            config_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+        assert_eq!(
+            reloaded_store.load().unwrap().hotkey,
+            Some("Ctrl+Alt+KeyV".to_string())
+        );
+
+        // Saving a different combination replaces the previous one rather
+        // than accumulating bindings.
+        let replaced = store.save_hotkey(Some("Ctrl+Alt+KeyB")).unwrap();
+        assert_eq!(replaced.hotkey, Some("Ctrl+Alt+KeyB".to_string()));
+
+        // `None` clears the configured hotkey back to "none configured".
+        let cleared = store.save_hotkey(None).unwrap();
+        assert_eq!(cleared.hotkey, None);
+        let reloaded_store = FileSettingsStore::with_dirs(
+            config_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+        assert_eq!(reloaded_store.load().unwrap().hotkey, None);
+    }
+
+    #[test]
+    fn save_hotkey_leaves_the_other_settings_intact() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = FileSettingsStore::with_dirs(
+            config_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        store.save_selected_mic_device(Some("USB Mic")).unwrap();
+        let state = store.save_hotkey(Some("Ctrl+Alt+KeyV")).unwrap();
+
+        assert_eq!(state.selected_mic_device, Some("USB Mic".to_string()));
+        assert_eq!(state.hotkey, Some("Ctrl+Alt+KeyV".to_string()));
     }
 }
