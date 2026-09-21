@@ -43,4 +43,9 @@ pub trait SettingsStore {
     /// resulting `AppState`. Adapters (e.g. `voice-me-ui`'s recorder) call
     /// this instead of writing to the data directory themselves.
     fn save_reference_voice_sample(&self, wav_bytes: &[u8]) -> Result<AppState, VoiceMeError>;
+
+    /// Persist the selected input (microphone) device name, or `None` to
+    /// clear the selection back to the OS default. Returns the resulting
+    /// `AppState`.
+    fn save_selected_mic_device(&self, device: Option<&str>) -> Result<AppState, VoiceMeError>;
 }

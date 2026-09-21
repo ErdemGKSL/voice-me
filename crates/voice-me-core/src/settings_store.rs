@@ -140,6 +140,13 @@ impl SettingsStore for FileSettingsStore {
 
         Ok(self.build_state(settings))
     }
+
+    fn save_selected_mic_device(&self, device: Option<&str>) -> Result<AppState, VoiceMeError> {
+        let mut settings = self.read_settings_file()?;
+        settings.selected_mic_device = device.map(str::to_string);
+        self.write_settings_file(&settings)?;
+        Ok(self.build_state(settings))
+    }
 }
 
 #[cfg(test)]
@@ -204,5 +211,32 @@ mod tests {
 
         assert_eq!(path, path2, "same fixed filename, not a new id/manifest");
         assert_eq!(fs::read(&path2).unwrap(), second);
+    }
+
+    #[test]
+    fn save_selected_mic_device_round_trips_across_a_fresh_load() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = FileSettingsStore::with_dirs(
+            config_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+        assert_eq!(store.load().unwrap().selected_mic_device, None);
+
+        let state = store.save_selected_mic_device(Some("USB Mic")).unwrap();
+        assert_eq!(state.selected_mic_device, Some("USB Mic".to_string()));
+
+        let reloaded_store = FileSettingsStore::with_dirs(
+            config_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+        assert_eq!(
+            reloaded_store.load().unwrap().selected_mic_device,
+            Some("USB Mic".to_string())
+        );
+
+        // `None` clears the selection back to the OS default.
+        let cleared = store.save_selected_mic_device(None).unwrap();
+        assert_eq!(cleared.selected_mic_device, None);
     }
 }

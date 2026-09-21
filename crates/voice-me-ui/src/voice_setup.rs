@@ -18,8 +18,8 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Context, IntoElement, ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _,
-    Task, Window, div, px,
+    Context, InteractiveElement as _, IntoElement, ParentElement as _, PathPromptOptions, Render,
+    SharedString, Styled as _, Task, TestSupportExt as _, Window, div, px,
 };
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Source as _};
 use voice_me_core::{SettingsStore, VoiceMeError};
@@ -58,7 +58,33 @@ pub fn should_auto_stop(elapsed_secs: f32) -> bool {
 /// Record/Stop/Accept state machine deterministically, without a real audio
 /// device (or a real wall-clock 60s wait) in the loop.
 pub trait CaptureSource: Send + Sync {
-    fn start(&self) -> Result<Box<dyn CaptureHandle>, VoiceMeError>;
+    /// `device` names the input device to capture from (Story 1.5); `None`
+    /// means the OS default, matching this method's original behavior.
+    fn start(&self, device: Option<&str>) -> Result<Box<dyn CaptureHandle>, VoiceMeError>;
+}
+
+/// Where `VoiceSetupView` enumerates available input (microphone) devices
+/// from (Story 1.5). Abstracted behind a trait for the same reason as
+/// `CaptureSource` — tests get a fixed device list without a real `cpal`
+/// host in the loop.
+pub trait InputDeviceSource: Send + Sync {
+    /// List available input device names. Empty on enumeration failure —
+    /// never surfaced as an error; the caller falls back to the OS default
+    /// device and hides the device selector.
+    fn list_devices(&self) -> Vec<String>;
+}
+
+/// Production `InputDeviceSource`: every input device `cpal` can enumerate
+/// on the OS default host.
+pub struct CpalInputDeviceSource;
+
+impl InputDeviceSource for CpalInputDeviceSource {
+    fn list_devices(&self) -> Vec<String> {
+        cpal::default_host()
+            .input_devices()
+            .map(|devices| devices.map(|device| device.to_string()).collect())
+            .unwrap_or_default()
+    }
 }
 
 /// A single in-progress recording started by a `CaptureSource`.
@@ -102,8 +128,8 @@ impl CaptureHandle for ActiveCapture {
 }
 
 impl CaptureSource for CpalCaptureSource {
-    fn start(&self) -> Result<Box<dyn CaptureHandle>, VoiceMeError> {
-        start_capture().map(|capture| Box::new(capture) as Box<dyn CaptureHandle>)
+    fn start(&self, device: Option<&str>) -> Result<Box<dyn CaptureHandle>, VoiceMeError> {
+        start_capture(device).map(|capture| Box::new(capture) as Box<dyn CaptureHandle>)
     }
 }
 
@@ -152,6 +178,19 @@ struct PendingClip {
     wav_bytes: Vec<u8>,
 }
 
+/// `InputDeviceSource` with no devices — used as the default for
+/// constructors that don't take one explicitly, so the device selector
+/// stays hidden (identical to this view's behavior before Story 1.5's
+/// device-selection addition) unless a caller opts in via
+/// [`VoiceSetupView::new_with_all_sources`].
+struct NoInputDevices;
+
+impl InputDeviceSource for NoInputDevices {
+    fn list_devices(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
 /// The Voice Setup view.
 pub struct VoiceSetupView {
     settings_store: Arc<dyn SettingsStore>,
@@ -162,40 +201,101 @@ pub struct VoiceSetupView {
     pending_clip: Option<PendingClip>,
     error_message: Option<SharedString>,
     just_saved: bool,
+    /// Whether an active Reference Voice Sample exists (Story 1.5): seeded
+    /// at construction from the caller's `AppState.reference_voice_sample`
+    /// check (the sole "has active sample" signal — no separate persisted
+    /// first-run flag), then flipped to `true` by a successful `accept()`
+    /// so the empty-state copy this drives never reappears for the rest of
+    /// the run once a sample has been accepted, even across a subsequent
+    /// re-record/re-import.
+    has_active_sample: bool,
+    /// Input device names available to record from (Story 1.5), enumerated
+    /// once at construction. Empty means the device selector stays hidden
+    /// and Record uses the OS default, exactly as before this story.
+    available_devices: Vec<String>,
+    /// The currently selected input device name, or `None` for the OS
+    /// default. Seeded at construction from `AppState.selected_mic_device`
+    /// and updated (and persisted via `SettingsStore`) whenever the user
+    /// picks a different device.
+    selected_device: Option<String>,
     _duration_watch: Option<Task<()>>,
     _playback: Option<MixerDeviceSink>,
 }
 
 impl VoiceSetupView {
-    pub fn new(settings_store: Arc<dyn SettingsStore>) -> Self {
-        Self::new_with_capture_and_import_sources(
+    /// Constructs the view. `has_active_sample` reflects whether an active
+    /// Reference Voice Sample already existed at launch (Story 1.5) —
+    /// callers (`voice-me-app`'s composition root) determine this via
+    /// `settings_store.load()` up front and pass the result in, since the
+    /// view itself is the sole thing deciding which copy to show from it.
+    /// `selected_mic_device` is that same load's `AppState.selected_mic_device`.
+    pub fn new(
+        settings_store: Arc<dyn SettingsStore>,
+        has_active_sample: bool,
+        selected_mic_device: Option<String>,
+    ) -> Self {
+        Self::new_with_all_sources(
             settings_store,
             Arc::new(CpalCaptureSource),
             Arc::new(GpuiImportSource),
+            Arc::new(CpalInputDeviceSource),
+            has_active_sample,
+            selected_mic_device,
         )
     }
 
     /// Construct with an explicit `CaptureSource` — used in tests to drive
-    /// the Record/Stop/Accept state machine without a real audio device.
+    /// the Record/Stop/Accept state machine without a real audio device. No
+    /// input devices are enumerable (the selector stays hidden); tests that
+    /// need one use [`Self::new_with_all_sources`].
     pub fn new_with_capture_source(
         settings_store: Arc<dyn SettingsStore>,
         capture_source: Arc<dyn CaptureSource>,
+        has_active_sample: bool,
     ) -> Self {
-        Self::new_with_capture_and_import_sources(
+        Self::new_with_all_sources(
             settings_store,
             capture_source,
             Arc::new(GpuiImportSource),
+            Arc::new(NoInputDevices),
+            has_active_sample,
+            None,
         )
     }
 
     /// Construct with explicit `CaptureSource` and `ImportSource` — used in
     /// tests to drive both the Record/Stop/Accept and Import state machines
     /// deterministically, without a real audio device or native file dialog.
+    /// No input devices are enumerable (the selector stays hidden); tests
+    /// that need one use [`Self::new_with_all_sources`].
     pub fn new_with_capture_and_import_sources(
         settings_store: Arc<dyn SettingsStore>,
         capture_source: Arc<dyn CaptureSource>,
         import_source: Arc<dyn ImportSource>,
+        has_active_sample: bool,
     ) -> Self {
+        Self::new_with_all_sources(
+            settings_store,
+            capture_source,
+            import_source,
+            Arc::new(NoInputDevices),
+            has_active_sample,
+            None,
+        )
+    }
+
+    /// Construct with every source explicit, including `InputDeviceSource`
+    /// and the previously-selected device (Story 1.5) — used by tests that
+    /// exercise device enumeration/selection.
+    pub fn new_with_all_sources(
+        settings_store: Arc<dyn SettingsStore>,
+        capture_source: Arc<dyn CaptureSource>,
+        import_source: Arc<dyn ImportSource>,
+        input_device_source: Arc<dyn InputDeviceSource>,
+        has_active_sample: bool,
+        selected_mic_device: Option<String>,
+    ) -> Self {
+        let available_devices = input_device_source.list_devices();
         Self {
             settings_store,
             capture_source,
@@ -205,6 +305,9 @@ impl VoiceSetupView {
             pending_clip: None,
             error_message: None,
             just_saved: false,
+            has_active_sample,
+            available_devices,
+            selected_device: selected_mic_device,
             _duration_watch: None,
             _playback: None,
         }
@@ -216,7 +319,7 @@ impl VoiceSetupView {
         self.just_saved = false;
         self._playback = None;
 
-        match self.capture_source.start() {
+        match self.capture_source.start(self.selected_device.as_deref()) {
             Ok(capture) => {
                 self.capture = Some(capture);
                 self._duration_watch = Some(cx.spawn(async move |this, cx| {
@@ -418,6 +521,13 @@ impl VoiceSetupView {
         {
             Ok(_state) => {
                 self.just_saved = true;
+                // An active sample now exists (Story 1.5): flip this
+                // permanently for the rest of the run so the first-run
+                // empty-state copy never comes back, even if the user goes
+                // on to re-record/re-import again this same run — it's
+                // still an accurate reflection of `SettingsStore` state,
+                // just kept in memory rather than reloaded on every render.
+                self.has_active_sample = true;
                 self.error_message = None;
                 self._playback = None;
             }
@@ -429,6 +539,43 @@ impl VoiceSetupView {
         }
         cx.notify();
     }
+
+    /// Cycles the selected input device through "System default" followed
+    /// by every enumerated `available_devices` entry, wrapping around, and
+    /// persists the new selection via `SettingsStore` (Story 1.5). A no-op
+    /// when no devices are enumerable — the selector isn't shown in that
+    /// case, but this stays safe to call regardless.
+    fn cycle_device(&mut self, cx: &mut Context<Self>) {
+        if self.available_devices.is_empty() {
+            return;
+        }
+        let options: Vec<Option<String>> = std::iter::once(None)
+            .chain(self.available_devices.iter().cloned().map(Some))
+            .collect();
+        let current_index = options
+            .iter()
+            .position(|option| option.as_deref() == self.selected_device.as_deref())
+            .unwrap_or(0);
+        let next = options[(current_index + 1) % options.len()].clone();
+        let previous = self.selected_device.clone();
+        self.selected_device = next.clone();
+        match self
+            .settings_store
+            .save_selected_mic_device(next.as_deref())
+        {
+            Ok(_) => self.error_message = None,
+            Err(err) => {
+                // Roll back to the last-persisted selection so in-memory
+                // state never diverges from disk: a failed save must not
+                // leave the UI showing (and Record capturing from) a device
+                // choice that won't survive a restart.
+                self.selected_device = previous;
+                self.error_message =
+                    Some(format!("Couldn't save microphone selection: {err}").into());
+            }
+        }
+        cx.notify();
+    }
 }
 
 impl Render for VoiceSetupView {
@@ -436,6 +583,12 @@ impl Render for VoiceSetupView {
         let is_recording = self.capture.is_some();
         let is_importing = self.is_importing;
         let has_pending_clip = self.pending_clip.is_some();
+        // First-run empty state (Story 1.5): shown only while no active
+        // Reference Voice Sample exists. `has_active_sample` starts from
+        // the caller's `AppState` check and flips permanently to `true` on
+        // a successful `accept()`, so this branch is never taken again once
+        // a sample exists — for the rest of this run or any later one.
+        let is_first_run = !self.has_active_sample;
 
         v_flex()
             .size_full()
@@ -443,12 +596,27 @@ impl Render for VoiceSetupView {
             .gap_4()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .child(div().text_lg().child("Voice Setup"))
+            .child(div().text_lg().child(if is_first_run {
+                "Record your voice to get started"
+            } else {
+                "Voice Setup"
+            }))
             .child(
                 div()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Record a short clip of your voice (5-60 seconds) to use as your Reference Voice Sample."),
+                    .child(if is_first_run {
+                        "Record a short clip of your voice (5-60 seconds) to use as your Reference Voice Sample — you'll need one before you can use voice-me."
+                    } else {
+                        "Record a short clip of your voice (5-60 seconds) to use as your Reference Voice Sample."
+                    }),
             )
+            // Test-only marker (zero visual footprint) so UI tests can assert
+            // the empty-state copy renders — as element presence/absence,
+            // per this file's established pattern — without needing to read
+            // rendered text back out of a `div`.
+            .when(is_first_run, |el| {
+                el.child(div().id("voice-setup-first-run-empty-state").test_support())
+            })
             .when(is_recording, |el| {
                 el.child(
                     h_flex()
@@ -473,6 +641,28 @@ impl Render for VoiceSetupView {
                         .label("Play")
                         .disabled(is_importing)
                         .on_click(cx.listener(|this, _, _, cx| this.play_pending_clip(cx))),
+                )
+            })
+            .when(!self.available_devices.is_empty(), |el| {
+                el.child(
+                    h_flex().items_center().gap_2().child("Microphone:").child(
+                        Button::new("voice-setup-mic-device")
+                            .label(
+                                self.selected_device
+                                    .clone()
+                                    // A persisted selection that's no longer
+                                    // enumerable (e.g. unplugged since it
+                                    // was picked) displays as "System
+                                    // default" — matching what Record
+                                    // actually falls back to and what the
+                                    // next cycle click starts from — rather
+                                    // than showing a stale device name.
+                                    .filter(|device| self.available_devices.contains(device))
+                                    .unwrap_or_else(|| "System default".to_string()),
+                            )
+                            .disabled(is_recording || is_importing)
+                            .on_click(cx.listener(|this, _, _, cx| this.cycle_device(cx))),
+                    ),
                 )
             })
             .child(
@@ -508,14 +698,21 @@ impl Render for VoiceSetupView {
     }
 }
 
-/// Start capturing from the OS default input device. Any failure (no device,
-/// unsupported config, stream start failure) is mapped to the single
-/// "microphone unavailable" case at this `voice-me-ui` boundary — never
-/// surfaced from `voice-me-core`.
-fn start_capture() -> Result<ActiveCapture, VoiceMeError> {
+/// Start capturing from `device` (matched by name against `cpal`'s
+/// enumerated input devices), or the OS default input device when `device`
+/// is `None` or no longer present (e.g. unplugged since it was selected).
+/// Any failure (no device, unsupported config, stream start failure) is
+/// mapped to the single "microphone unavailable" case at this `voice-me-ui`
+/// boundary — never surfaced from `voice-me-core`.
+fn start_capture(device: Option<&str>) -> Result<ActiveCapture, VoiceMeError> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
+    let named_device = device.and_then(|name| {
+        host.input_devices()
+            .ok()?
+            .find(|candidate| candidate.to_string() == name)
+    });
+    let device = named_device
+        .or_else(|| host.default_input_device())
         .ok_or_else(|| VoiceMeError::Other("no default input device".to_string()))?;
     let supported_config = device
         .default_input_config()
@@ -671,6 +868,10 @@ mod tests {
     struct FakeCaptureSource {
         outcome: FakeOutcome,
         calls: Mutex<u32>,
+        /// The `device` argument passed to the most recent `start()` call —
+        /// lets tests assert Record used the currently selected device
+        /// (Story 1.5).
+        last_requested_device: Mutex<Option<String>>,
     }
 
     impl FakeCaptureSource {
@@ -678,13 +879,15 @@ mod tests {
             Self {
                 outcome,
                 calls: Mutex::new(0),
+                last_requested_device: Mutex::new(None),
             }
         }
     }
 
     impl CaptureSource for FakeCaptureSource {
-        fn start(&self) -> Result<Box<dyn CaptureHandle>, VoiceMeError> {
+        fn start(&self, device: Option<&str>) -> Result<Box<dyn CaptureHandle>, VoiceMeError> {
             *self.calls.lock().unwrap() += 1;
+            *self.last_requested_device.lock().unwrap() = device.map(str::to_string);
             match &self.outcome {
                 FakeOutcome::Fail => Err(VoiceMeError::Other("no fake microphone".to_string())),
                 FakeOutcome::Succeed(config) => {
@@ -723,6 +926,15 @@ mod tests {
         /// exercise `accept()`'s `Err` branch (which restores the pending
         /// clip for a retry) without touching any real filesystem.
         remaining_failures: Mutex<u32>,
+        /// Every device name (or `None`, for "system default") passed to
+        /// `save_selected_mic_device`, in call order — lets tests assert
+        /// which selection(s) were persisted (Story 1.5).
+        saved_mic_devices: Mutex<Vec<Option<String>>>,
+        /// When `true`, every `save_selected_mic_device` call fails without
+        /// recording anything into `saved_mic_devices` — lets a test
+        /// exercise `cycle_device`'s `Err` branch (which must roll back
+        /// `selected_device` rather than leave it diverged from disk).
+        mic_device_save_fails: Mutex<bool>,
     }
 
     impl FakeSettingsStore {
@@ -730,6 +942,15 @@ mod tests {
             Self {
                 saved_clips: Mutex::new(Vec::new()),
                 remaining_failures: Mutex::new(times),
+                saved_mic_devices: Mutex::new(Vec::new()),
+                mic_device_save_fails: Mutex::new(false),
+            }
+        }
+
+        fn failing_mic_device_save() -> Self {
+            Self {
+                mic_device_save_fails: Mutex::new(true),
+                ..Self::default()
             }
         }
     }
@@ -747,6 +968,31 @@ mod tests {
             }
             self.saved_clips.lock().unwrap().push(wav_bytes.to_vec());
             Ok(AppState::default())
+        }
+
+        fn save_selected_mic_device(&self, device: Option<&str>) -> Result<AppState, VoiceMeError> {
+            if *self.mic_device_save_fails.lock().unwrap() {
+                return Err(VoiceMeError::Other(
+                    "fake mic device save failure".to_string(),
+                ));
+            }
+            self.saved_mic_devices
+                .lock()
+                .unwrap()
+                .push(device.map(str::to_string));
+            Ok(AppState::default())
+        }
+    }
+
+    /// Fake `InputDeviceSource`: hands back a fixed device-name list, no
+    /// real `cpal` host in the loop.
+    struct FakeInputDeviceSource {
+        devices: Vec<String>,
+    }
+
+    impl InputDeviceSource for FakeInputDeviceSource {
+        fn list_devices(&self) -> Vec<String> {
+            self.devices.clone()
         }
     }
 
@@ -923,6 +1169,7 @@ mod tests {
                 VoiceSetupView::new_with_capture_source(
                     settings_store_dyn.clone(),
                     capture_source.clone(),
+                    true,
                 )
             });
             Root::new(view, window, cx)
@@ -961,6 +1208,7 @@ mod tests {
                 VoiceSetupView::new_with_capture_source(
                     settings_store.clone(),
                     capture_source.clone(),
+                    true,
                 )
             });
             Root::new(view, window, cx)
@@ -1001,6 +1249,7 @@ mod tests {
                 VoiceSetupView::new_with_capture_source(
                     settings_store_dyn.clone(),
                     capture_source.clone(),
+                    true,
                 )
             });
             Root::new(view, window, cx)
@@ -1050,6 +1299,7 @@ mod tests {
                 VoiceSetupView::new_with_capture_source(
                     settings_store_dyn.clone(),
                     capture_source.clone(),
+                    true,
                 )
             });
             Root::new(view, window, cx)
@@ -1095,6 +1345,7 @@ mod tests {
                     settings_store_dyn.clone(),
                     capture_source.clone(),
                     import_source.clone(),
+                    true,
                 )
             });
             Root::new(view, window, cx)
@@ -1150,6 +1401,7 @@ mod tests {
                 VoiceSetupView::new_with_capture_source(
                     settings_store_dyn.clone(),
                     capture_source.clone(),
+                    true,
                 )
             });
             Root::new(view, window, cx)
@@ -1205,6 +1457,7 @@ mod tests {
                 VoiceSetupView::new_with_capture_source(
                     settings_store.clone(),
                     capture_source.clone(),
+                    true,
                 )
             });
             Root::new(view, window, cx)
@@ -1258,6 +1511,7 @@ mod tests {
                     settings_store_dyn.clone(),
                     capture_source.clone(),
                     import_source.clone(),
+                    true,
                 )
             });
             Root::new(view, window, cx)
@@ -1307,6 +1561,7 @@ mod tests {
                     settings_store_dyn.clone(),
                     capture_source.clone(),
                     import_source.clone(),
+                    true,
                 )
             });
             Root::new(view, window, cx)
@@ -1352,6 +1607,7 @@ mod tests {
                     settings_store_dyn.clone(),
                     capture_source.clone(),
                     import_source.clone(),
+                    true,
                 )
             });
             Root::new(view, window, cx)
@@ -1398,6 +1654,7 @@ mod tests {
                     settings_store_dyn.clone(),
                     capture_source.clone(),
                     import_source.clone(),
+                    true,
                 )
             });
             Root::new(view, window, cx)
@@ -1442,6 +1699,7 @@ mod tests {
                     settings_store_dyn.clone(),
                     capture_source.clone(),
                     import_source.clone(),
+                    true,
                 )
             });
             Root::new(view, window, cx)
@@ -1485,6 +1743,7 @@ mod tests {
                     settings_store.clone(),
                     capture_source.clone(),
                     import_source.clone(),
+                    true,
                 )
             });
             Root::new(view, window, cx)
@@ -1538,6 +1797,7 @@ mod tests {
                     settings_store_dyn.clone(),
                     capture_source.clone(),
                     import_source.clone(),
+                    true,
                 )
             });
             Root::new(view, window, cx)
@@ -1588,6 +1848,7 @@ mod tests {
                     settings_store_dyn.clone(),
                     capture_source.clone(),
                     import_source.clone(),
+                    true,
                 )
             });
             Root::new(view, window, cx)
@@ -1633,6 +1894,7 @@ mod tests {
                     settings_store.clone(),
                     capture_source.clone(),
                     import_source.clone(),
+                    true,
                 )
             });
             Root::new(view, window, cx)
@@ -1651,6 +1913,254 @@ mod tests {
             assert!(
                 window.try_find("voice-setup-play").is_none(),
                 "a genuine picker failure must not offer playback"
+            );
+        })
+        .unwrap();
+    }
+
+    // Story 1.5: the first-run empty-state copy is driven purely by the
+    // `has_active_sample` flag threaded through construction (never by a
+    // separate persisted flag). The marker element below
+    // ("voice-setup-first-run-empty-state") is only ever mounted by
+    // `.when(is_first_run, ...)`, so its presence/absence is a real fact
+    // about which copy branch rendered — mirroring this file's existing
+    // pattern of asserting on element presence rather than on rendered text.
+
+    #[gpui_kit::test]
+    fn no_active_sample_at_construction_shows_the_first_run_empty_state(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let capture_source = Arc::new(FakeCaptureSource::new(FakeOutcome::Fail));
+        let settings_store: Arc<dyn SettingsStore> = Arc::new(FakeSettingsStore::default());
+        let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+            let view = cx.new(|_| {
+                VoiceSetupView::new_with_capture_source(
+                    settings_store.clone(),
+                    capture_source.clone(),
+                    false, // no active sample at construction
+                )
+            });
+            Root::new(view, window, cx)
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .try_find("voice-setup-first-run-empty-state")
+                    .is_some(),
+                "constructing with no active sample must show the first-run empty state"
+            );
+            assert_eq!(
+                window.find("voice-setup-record").disabled(),
+                None,
+                "Record must be the highlighted primary action in the empty state"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn an_existing_active_sample_at_construction_shows_the_normal_view(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let capture_source = Arc::new(FakeCaptureSource::new(FakeOutcome::Fail));
+        let settings_store: Arc<dyn SettingsStore> = Arc::new(FakeSettingsStore::default());
+        let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+            let view = cx.new(|_| {
+                VoiceSetupView::new_with_capture_source(
+                    settings_store.clone(),
+                    capture_source.clone(),
+                    true, // active sample already exists at construction
+                )
+            });
+            Root::new(view, window, cx)
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .try_find("voice-setup-first-run-empty-state")
+                    .is_none(),
+                "constructing with an existing active sample must not show the first-run empty state"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn the_first_run_empty_state_never_reappears_after_accepting_a_sample_this_run(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let capture_source = Arc::new(FakeCaptureSource::new(FakeOutcome::Succeed(
+            valid_clip_config(12.0),
+        )));
+        let settings_store: Arc<dyn SettingsStore> = Arc::new(FakeSettingsStore::default());
+        let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+            let view = cx.new(|_| {
+                VoiceSetupView::new_with_capture_source(
+                    settings_store.clone(),
+                    capture_source.clone(),
+                    false, // first run: no active sample yet
+                )
+            });
+            Root::new(view, window, cx)
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .try_find("voice-setup-first-run-empty-state")
+                    .is_some(),
+                "must start in the first-run empty state"
+            );
+
+            window.click("voice-setup-record", cx);
+            window.click("voice-setup-stop", cx);
+            window.click("voice-setup-accept", cx);
+            window.render_frame(cx);
+
+            assert!(
+                window
+                    .try_find("voice-setup-first-run-empty-state")
+                    .is_none(),
+                "the empty-state copy must not reappear for the rest of the run once a \
+                 sample has just been accepted"
+            );
+        })
+        .unwrap();
+    }
+
+    // Story 1.5: input device selection. The selector is hidden whenever no
+    // devices are enumerable (matching this view's pre-story behavior
+    // exactly), shown otherwise, and cycling it both persists the choice via
+    // `SettingsStore` and feeds it to the next `CaptureSource::start` call.
+
+    #[gpui_kit::test]
+    fn no_enumerable_devices_hides_the_device_selector(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let capture_source = Arc::new(FakeCaptureSource::new(FakeOutcome::Fail));
+        let settings_store: Arc<dyn SettingsStore> = Arc::new(FakeSettingsStore::default());
+        let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+            let view = cx.new(|_| {
+                VoiceSetupView::new_with_capture_source(
+                    settings_store.clone(),
+                    capture_source.clone(),
+                    true,
+                )
+            });
+            Root::new(view, window, cx)
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("voice-setup-mic-device").is_none(),
+                "no devices enumerable must hide the device selector"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn cycling_the_device_selector_persists_the_choice_and_is_used_to_record(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_kit::init);
+        let capture_source = Arc::new(FakeCaptureSource::new(FakeOutcome::Succeed(
+            valid_clip_config(12.0),
+        )));
+        let import_source = Arc::new(FakeImportSource::new(None));
+        let input_device_source = Arc::new(FakeInputDeviceSource {
+            devices: vec!["Mic A".to_string(), "Mic B".to_string()],
+        });
+        let settings_store = Arc::new(FakeSettingsStore::default());
+        let settings_store_dyn: Arc<dyn SettingsStore> = settings_store.clone();
+        let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+            let view = cx.new(|_| {
+                VoiceSetupView::new_with_all_sources(
+                    settings_store_dyn.clone(),
+                    capture_source.clone(),
+                    import_source.clone(),
+                    input_device_source.clone(),
+                    true,
+                    None, // no device selected yet — starts on "System default"
+                )
+            });
+            Root::new(view, window, cx)
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("voice-setup-mic-device").is_some(),
+                "enumerable devices must show the device selector"
+            );
+
+            // "System default" -> "Mic A".
+            window.click("voice-setup-mic-device", cx);
+            window.render_frame(cx);
+            assert_eq!(
+                settings_store.saved_mic_devices.lock().unwrap().as_slice(),
+                [Some("Mic A".to_string())],
+                "the first cycle must persist the first enumerated device"
+            );
+
+            window.click("voice-setup-record", cx);
+            window.render_frame(cx);
+            assert_eq!(
+                *capture_source.last_requested_device.lock().unwrap(),
+                Some("Mic A".to_string()),
+                "Record must capture from the currently selected device"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn a_failed_persist_rolls_back_the_selection(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let capture_source = Arc::new(FakeCaptureSource::new(FakeOutcome::Succeed(
+            valid_clip_config(12.0),
+        )));
+        let import_source = Arc::new(FakeImportSource::new(None));
+        let input_device_source = Arc::new(FakeInputDeviceSource {
+            devices: vec!["Mic A".to_string(), "Mic B".to_string()],
+        });
+        let settings_store = Arc::new(FakeSettingsStore::failing_mic_device_save());
+        let settings_store_dyn: Arc<dyn SettingsStore> = settings_store.clone();
+        let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+            let view = cx.new(|_| {
+                VoiceSetupView::new_with_all_sources(
+                    settings_store_dyn.clone(),
+                    capture_source.clone(),
+                    import_source.clone(),
+                    input_device_source.clone(),
+                    true,
+                    None,
+                )
+            });
+            Root::new(view, window, cx)
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+
+            window.click("voice-setup-mic-device", cx);
+            window.render_frame(cx);
+            assert!(
+                settings_store.saved_mic_devices.lock().unwrap().is_empty(),
+                "a failed save must not be recorded as persisted"
+            );
+
+            window.click("voice-setup-record", cx);
+            window.render_frame(cx);
+            assert_eq!(
+                *capture_source.last_requested_device.lock().unwrap(),
+                None,
+                "the rolled-back selection (system default) must be what Record uses, \
+                 not the device the failed save attempted to pick"
             );
         })
         .unwrap();

@@ -15,6 +15,24 @@ fn main() {
     let settings_store: Arc<dyn SettingsStore> =
         Arc::new(FileSettingsStore::new().expect("failed to resolve settings/data directories"));
 
+    // Story 1.5: determine whether an active Reference Voice Sample already
+    // exists before opening the window, so `VoiceSetupView` can decide
+    // between the first-run empty-state copy and today's normal
+    // recorder/replace view. A load failure is treated the same as "no
+    // sample" — falling back to the empty-state copy is safe, whereas
+    // silently treating an unreadable store as "has a sample" would hide
+    // the first-run prompt from someone who actually needs it. The window
+    // still opens unconditionally either way (Epic 2's tray/hotkey isn't
+    // built yet).
+    // Story 1.5 also restores the previously selected input device (if
+    // any) from the same load, so the recorder starts on the device the
+    // user last picked rather than always the OS default.
+    let loaded_state = settings_store.load().ok();
+    let has_active_sample = loaded_state
+        .as_ref()
+        .is_some_and(|state| state.reference_voice_sample.is_some());
+    let selected_mic_device = loaded_state.and_then(|state| state.selected_mic_device);
+
     let app = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
 
     app.run(move |cx| {
@@ -22,7 +40,13 @@ fn main() {
 
         cx.spawn(async move |cx| {
             cx.open_window(WindowOptions::default(), move |window, cx| {
-                let view = cx.new(|_| VoiceSetupView::new(settings_store.clone()));
+                let view = cx.new(|_| {
+                    VoiceSetupView::new(
+                        settings_store.clone(),
+                        has_active_sample,
+                        selected_mic_device,
+                    )
+                });
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .expect("failed to open window");
