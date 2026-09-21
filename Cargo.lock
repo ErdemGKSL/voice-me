@@ -7986,6 +7986,7 @@ name = "voice-me-ui"
 version = "0.1.0"
 dependencies = [
  "cpal 0.18.2",
+ "futures",
  "gpui-kit",
  "hound",
  "rodio",

@@ -12,4 +12,6 @@ rodio = { version = "0.22", default-features = false, features = ["playback", "w
 
 [dev-dependencies]
 gpui-kit = { version = "0.6.4", features = ["test-support"] }
+# The `AppEvent` channel the Prompt Overlay tests drain (AD-3).
+futures = "0.3"
 tempfile = "3.14"

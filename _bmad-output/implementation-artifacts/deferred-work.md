@@ -36,3 +36,19 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-3-configure-a-global-hotkey.md`
   summary: A configured hotkey can be changed but never cleared — no UI path calls `save_hotkey(None)`, so the "None set" empty state is unreachable once a hotkey exists.
   evidence: Verified real. `SettingsStore::save_hotkey` accepts and persists `None` and is tested for it, and `HotkeyView` renders a `NO_HOTKEY_LABEL` state, but the view offers only Change / Cancel / Save. Rejected from this story as `low`: Story 2.3's intent is "assign and change", not remove, and a Clear control is new public UI surface. Worth adding alongside the Settings shell's later sections, together with an `unbind` on `HotkeyPort`.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-4-summon-type-and-dismiss-the-prompt-overlay.md`
+  summary: The composition root's `open_overlay` — one-at-a-time re-summon and stale-handle recovery — has no automated test.
+  evidence: Deleting the slot-clearing recovery in `crates/voice-me-app/src/main.rs` makes the hotkey work exactly once per launch while `cargo test --workspace` stays green. `voice-me-app` is a binary crate with no test target and the repo has no window-server harness; the same gap Stories 2.2 and 2.3 already carry.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-4-summon-type-and-dismiss-the-prompt-overlay.md`
+  summary: The Prompt Overlay's blur dismissal has no "has been activated at least once" guard, so it may self-close the instant it appears under GNOME/Wayland focus-stealing prevention.
+  evidence: `cx.observe_window_activation` dismisses on any `!window.is_window_active()`; a newly mapped window can arrive unfocused under Wayland. Would be high severity if real. Settled by running the built binary in a GNOME/Wayland session and pressing the hotkey — one of this story's own manual checks.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-4-summon-type-and-dismiss-the-prompt-overlay.md`
+  summary: CI never runs `cargo test`, so no pipeline executes any of the workspace's tests.
+  evidence: Both jobs in `.github/workflows/ci.yml` end at `cargo build --workspace`; `grep -rn "cargo test" .github/workflows/*` returns nothing. Repo-wide and pre-existing, but it is what lets a behavioral regression merge green.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-4-summon-type-and-dismiss-the-prompt-overlay.md`
+  summary: With `QuitMode::Explicit` set, a tray-registration failure now leaves the process running with neither tray nor window once the fallback Settings window is closed.
+  evidence: `crates/voice-me-app/src/main.rs` falls back to `open_settings` when `TrayPort::show` fails; under the old quit-on-empty default, closing that window ended the process, and it no longer does. Rare path, but the right behavior (quit, retry the tray, or warn) is a product decision rather than a mechanical fix.

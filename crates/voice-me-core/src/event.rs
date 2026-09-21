@@ -11,4 +11,15 @@ pub enum AppEvent {
     DependencyCheckCompleted,
     /// The tray's "Settings…" menu item was clicked.
     SettingsRequested,
+    /// The Speak Action: the Prompt Overlay was confirmed with a non-empty
+    /// line of text.
+    ///
+    /// This is the *only* route the Speak Action takes out of the UI
+    /// (AD-3/AD-10): the overlay view sends this and closes, without waiting
+    /// on generation or playback. Whoever handles it downstream (Story 2.6)
+    /// owns everything that happens next.
+    SpeakRequested {
+        /// The text the user typed, trimmed of surrounding whitespace.
+        text: String,
+    },
 }

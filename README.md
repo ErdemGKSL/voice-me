@@ -11,6 +11,32 @@ cargo run -p voice-me-app
 The app is tray-resident: closing the Settings window leaves it running in
 the tray, and "Settings…" in the tray menu brings the window back.
 
+Pressing the global hotkey summons the prompt overlay: a borderless window
+with a single focused field. Type a line and press `Enter` to send it;
+`Escape`, or clicking away, closes it and discards what you typed. Dismissing
+the overlay never quits the app — it stays in the tray either way.
+
+**Nothing is spoken yet.** A confirmed line is currently only printed to
+stdout. Speech generation and playback arrive in later stories.
+
+## Linux: prompt overlay and always-on-top
+
+Whether the overlay is drawn **above a fullscreen window from another
+application** depends on the session, the same way the global hotkey's
+backend does:
+
+| Session | Overlay window | Above a fullscreen window? |
+|---------|----------------|----------------------------|
+| X11 | always-on-top, taskbar-less popup | expected — **not yet verified on real hardware** |
+| Wayland | ordinary focused window | no — and the compositor, not voice-me, decides where it appears |
+
+This is a platform limitation, not a bug. The GPUI version this app is built
+on has no always-on-top window type that works under Wayland, and the one
+mechanism that could provide it — `zwlr_layer_shell_v1` — is not implemented
+by GNOME/Mutter, so it is deliberately not used. Under Wayland the overlay
+still opens, focuses, and accepts typing normally; it may simply sit behind a
+fullscreen game instead of over it.
+
 ## Linux: global hotkey setup
 
 The global hotkey uses one of two backends, chosen at runtime from the
