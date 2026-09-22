@@ -5,3 +5,25 @@ edition.workspace = true
 
 [dependencies]
 voice-me-core = { path = "../voice-me-core" }
+
+# Linux-only, and gated so the Windows CI job can still build the whole
+# workspace: these link against the system `libpulse`, which does not exist
+# on a Windows runner. The crate body is `cfg`-gated to match (AD-2 — this
+# crate is the Linux capability, not a cross-platform one).
+[target.'cfg(target_os = "linux")'.dependencies]
+# The PulseAudio client API (spec-2-7 Decision 1). `libpulse-binding` is the
+# full API — it is what can load and unload a null-sink module, which the
+# simple API cannot. It is a *client* of the user's own audio server over a
+# local socket; it opens no network connection (AD-8).
+libpulse-binding = "2.30"
+# The blocking write-and-drain playback API, which is exactly the shape
+# `VirtualMicPort::play` promises: hand over a whole buffer, return when the
+# server has consumed it.
+libpulse-simple-binding = "2.29"
+# The user's config directory, resolved the same way `voice-me-core`'s
+# settings store resolves its own (spec-2-7 Decision 2 writes one drop-in
+# under it).
+directories = "6.0"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile = "3"

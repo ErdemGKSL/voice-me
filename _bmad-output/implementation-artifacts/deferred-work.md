@@ -76,3 +76,27 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-6-generate-speech-from-the-prompt-overlay-text.md`
   summary: `voice-me-notify-linux`'s only test sets `DBUS_SESSION_BUS_ADDRESS` process-wide through `unsafe { set_var }`, which becomes racy the moment that crate gains a second test.
   evidence: The SAFETY comment asserts a single-threaded body; cargo's harness is multi-threaded, and the assertion holds today only because the crate has exactly one test. Settling it means a scoped env guard or serialized execution.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-7-spike-linux-virtual-microphone-via-pipewire.md`
+  summary: A playback stream opened from the cargo *test* binary is routed to the default sink instead of the Virtual Microphone, while the identical call from an ordinary binary is routed correctly — cause unknown.
+  evidence: Reproduced repeatedly with exactly one `voice-me` device present and the stream's own node carrying `target.object = voice-me`; `pw-link` shows it linked to `alsa_output…analog-stereo`. Ruled out: duplicate device nodes, a concurrent recording client (in-process and external both), the stream's application name, and WirePlumber's saved stream state (`~/.local/state/wireplumber/stream-properties` holds volumes only). The only differing stream property is `application.process.binary`. Worked around by making `mic-spike` a `src/bin` so `tests/virtual_mic.rs` drives a real binary; the workaround is sound, but the underlying routing behaviour is unexplained and could bite any future in-test playback.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-7-spike-linux-virtual-microphone-via-pipewire.md`
+  summary: The classic-PulseAudio (non-PipeWire) host is entirely unverified — the persistent drop-in does not apply there at all.
+  evidence: `~/.config/pipewire/pipewire-pulse.conf.d/` is meaningless to a real PulseAudio daemon, so on such a host only the runtime module load would create the device and it would vanish at logout; persistence would need `~/.config/pulse/default.pa` instead. No classic-PulseAudio machine was available. The matrix row says as much; closing it needs such a host, or a decision that PipeWire is the only supported Linux audio stack.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-7-spike-linux-virtual-microphone-via-pipewire.md`
+  summary: `install` tears down and recreates the device on every call, which drops any capture stream another application already had open on it.
+  evidence: Unloading every matching module before loading one is what guarantees a single, addressable device, and it is the right trade at voice-me's startup. But a game or Discord already capturing from `voice-me` when voice-me starts loses that stream and has to re-select the device. A narrower fix would reload only when the device is actually unaddressable, which needs a way to detect that — the very thing this spike could not do without playing audio and listening to it.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-7-spike-linux-virtual-microphone-via-pipewire.md`
+  summary: Nothing bounds how long a PulseAudio operation can block, so a server that accepts the socket but never answers would hang a Speak Action forever with no error and no speech.
+  evidence: `PulseSession::connect` and `PulseSession::wait` both loop on `mainloop.iterate(true)` and escape only on operation completion or a `Failed`/`Terminated` context; a context that stays `Ready` with an operation stuck `Running` never exits. `play` is documented as running on the AD-5 blocking pool, so the thread parks indefinitely. Never observed — settling it means either reproducing a wedged server or adding a deadline to both loops, which is real machinery rather than a guard.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-7-spike-linux-virtual-microphone-via-pipewire.md`
+  summary: `play`'s "exactly one device" check is a time-of-check/time-of-use window — the device could vanish between the check and the stream opening, and the audio would then go to the speakers.
+  evidence: `play` calls `source_count` on its own short-lived `PulseSession`, then opens `Simple::new` on a second connection. Closing the window needs a way to ask an open stream which device it actually got, which `libpulse-simple` does not offer; the full API's `pa_stream_get_device_name` would, at the cost of dropping the simple API that made this adapter small.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-7-spike-linux-virtual-microphone-via-pipewire.md`
+  summary: A failed `load_null_sink` leaves the machine with no Virtual Microphone at all, because `install` unloads every existing module before loading a fresh one.
+  evidence: The unload-all-then-load sequence in `LinuxVirtualMicAdapter::install` is what guarantees a single addressable device, and the failure is reported rather than swallowed — but a user who had a working device and a failing install ends up worse off than before. Restoring it means capturing the previous module's arguments and replaying them on failure.

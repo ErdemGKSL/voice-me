@@ -69,6 +69,17 @@ pub enum VoiceMeError {
     #[error("no Reference Voice Sample yet — record or import one in Settings → Voice")]
     NoReferenceVoiceSample,
 
+    /// The Virtual Microphone could not be created, addressed, or written
+    /// to. Its own variant rather than [`VoiceMeError::Other`] because it
+    /// is the one failure whose fix is a *device* problem, not a voice-me
+    /// problem: no audio server running, the device removed from under us,
+    /// or a config the audio server never picked up. Callers that already
+    /// have generated audio in hand need to tell those apart from "speech
+    /// generation failed", since the speech is fine and only its way out is
+    /// missing.
+    #[error("virtual microphone unavailable: {0}")]
+    VirtualMicUnavailable(String),
+
     #[error("{0}")]
     Other(String),
 }
