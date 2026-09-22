@@ -22,9 +22,25 @@ use std::path::{Path, PathBuf};
 
 use voice_me_core::VoiceMeError;
 
-/// The device's node name — what other applications match on, and what
-/// [`crate::LinuxVirtualMicAdapter::play`] addresses the playback stream to.
+/// The device's node name — what other applications match on when the user
+/// picks voice-me as their microphone.
 pub const DEVICE_NAME: &str = "voice-me";
+
+/// The sink [`crate::LinuxVirtualMicAdapter::play`] writes into, and the
+/// thing [`DEVICE_NAME`] is a remap of.
+///
+/// Two nodes rather than one, because a single `Audio/Source/Virtual`
+/// null-sink is *not addressable by name from another process*: it is
+/// published as a source, playback streams resolve names against sinks, and
+/// pipewire-pulse answers a name it cannot resolve by substituting the
+/// default sink — so the generated line comes out of the speakers. Measured
+/// after spec-2-7 shipped: `paplay --device=voice-me` into such a node
+/// captures silence, and only the process that had just loaded the module
+/// could address it, which is why the spike's own binary appeared to work.
+/// A plain sink resolves by name from anywhere; the remap turns its monitor
+/// back into an ordinary-looking microphone, so the user still sees one
+/// clean input device and nothing named "Monitor of".
+pub const SINK_NAME: &str = "voice-me-sink";
 
 /// What the user actually reads in a microphone list.
 pub const DEVICE_DESCRIPTION: &str = "voice-me (Virtual Microphone)";
@@ -44,27 +60,42 @@ const CONF_FILE_NAME: &str = "voice-me.conf";
 /// quietly differ.
 pub const NULL_SINK_MODULE: &str = "module-null-sink";
 
-/// `media.class` is what makes this a microphone rather than a speaker:
-/// without it the node is an `Audio/Sink` and no application lists it as an
-/// input. The description is single-quoted because the drop-in embeds these
-/// arguments inside a double-quoted string.
+/// The module that turns the sink's monitor into a real capture source.
+pub const REMAP_SOURCE_MODULE: &str = "module-remap-source";
+
+/// The sink half: an ordinary null-sink, deliberately *without*
+/// `media.class=Audio/Source/Virtual`, so it stays a real sink that any
+/// process can address by name. The description is single-quoted because
+/// the drop-in embeds these arguments inside a double-quoted string.
 pub fn null_sink_arguments() -> String {
     format!(
-        "sink_name={DEVICE_NAME} media.class=Audio/Source/Virtual channel_map=mono \
-         node.description='{DEVICE_DESCRIPTION}'"
+        "sink_name={SINK_NAME} channel_map=mono \
+         node.description='voice-me (speech output)'"
     )
 }
 
-/// The drop-in's contents: tell pipewire-pulse to load the same null-sink
-/// module `install` loads, every time it starts.
+/// The microphone half: the sink's monitor, republished under
+/// [`DEVICE_NAME`] as a source applications list like any other input.
+pub fn remap_source_arguments() -> String {
+    format!(
+        "source_name={DEVICE_NAME} master={SINK_NAME}.monitor channel_map=mono \
+         source_properties=device.description='{DEVICE_DESCRIPTION}'"
+    )
+}
+
+/// The drop-in's contents: tell pipewire-pulse to load the same two modules
+/// `install` loads, every time it starts. Order matters — the remap needs a
+/// monitor to attach to.
 pub fn conf_contents() -> String {
     format!(
         "# Created by voice-me. Delete this file (or run voice-me's uninstall)\n\
          # to remove the Virtual Microphone.\n\
          pulse.cmd = [\n\
          \x20   {{ cmd = \"load-module\" args = \"{NULL_SINK_MODULE} {}\" }}\n\
+         \x20   {{ cmd = \"load-module\" args = \"{REMAP_SOURCE_MODULE} {}\" }}\n\
          ]\n",
-        null_sink_arguments()
+        null_sink_arguments(),
+        remap_source_arguments()
     )
 }
 
@@ -132,18 +163,47 @@ mod tests {
     /// can start an audio server to find out whether it is accepted — so
     /// the properties the device depends on are pinned here.
     #[test]
-    fn the_drop_in_loads_the_module_that_publishes_a_virtual_source() {
+    fn the_drop_in_loads_both_halves_in_the_order_they_depend_on() {
         let conf = conf_contents();
 
+        let sink = conf
+            .find(NULL_SINK_MODULE)
+            .expect("the drop-in has to create the sink");
+        let remap = conf
+            .find(REMAP_SOURCE_MODULE)
+            .expect("the drop-in has to republish the monitor as a microphone");
         assert!(
-            conf.contains("media.class=Audio/Source/Virtual"),
-            "without Audio/Source/Virtual the node is a speaker, not a microphone"
+            sink < remap,
+            "the remap attaches to the sink's monitor, so a drop-in that loads it \
+             first silently yields no microphone"
         );
-        assert!(conf.contains(&format!("sink_name={DEVICE_NAME}")));
+
         assert!(
-            conf.contains("pulse.cmd") && conf.contains(NULL_SINK_MODULE),
-            "a context.objects node is not addressable by a PulseAudio \
-             client — see the module docs"
+            conf.contains(&format!("sink_name={SINK_NAME}")),
+            "playback addresses the sink by name"
+        );
+        assert!(
+            conf.contains(&format!("source_name={DEVICE_NAME}")),
+            "the microphone the user picks has to carry the plain device name"
+        );
+        assert!(
+            !conf.contains("media.class=Audio/Source/Virtual"),
+            "a node published straight as a virtual source is not addressable by name \
+             from another process — playback lands on the default sink, i.e. the \
+             user's speakers"
+        );
+        assert!(conf.contains("pulse.cmd"));
+    }
+
+    /// The one state the whole adapter is built to avoid: two nodes called
+    /// `voice-me`. The remap owns that name, so the sink must not also
+    /// claim it.
+    #[test]
+    fn the_two_halves_do_not_share_a_name() {
+        assert_ne!(SINK_NAME, DEVICE_NAME);
+        assert!(
+            !null_sink_arguments().contains(&format!("sink_name={DEVICE_NAME} ")),
+            "the sink must not take the microphone's name"
         );
     }
 

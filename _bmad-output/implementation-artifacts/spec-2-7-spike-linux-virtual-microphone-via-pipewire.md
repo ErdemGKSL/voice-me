@@ -134,6 +134,40 @@ the device, any classic-PulseAudio host, and an actual Windows build of the
 workspace — the bin's target gating is reasoned and structurally checked,
 not compiled for Windows, since no Windows toolchain exists here.
 
+### Correction (after Story 2.9 shipped, 2026-09-22)
+
+**The mechanism recorded above is wrong, and the verification that "proved"
+it could not have caught the error.** A single `module-null-sink` published
+as `media.class=Audio/Source/Virtual` is *not addressable by name from
+another process*: playback streams resolve device names against sinks, a
+virtual source is not one, and pipewire-pulse answers a name it cannot
+resolve by substituting the **default sink**. Every generated line therefore
+came out of the user's speakers, with the stream still carrying
+`target.object = voice-me` — the exact failure this spike's own notes call
+the worst this product has.
+
+It looked verified because every check ran inside a process that had *just
+loaded the module*, which is the one case that works. `mic-spike` installs
+and then plays; the live tests drove `mic-spike`. The app installs once at
+startup and plays later, so it failed on every utterance, and that is how it
+was found — by the human running it. `paplay --device=voice-me` into such a
+node captures silence, which settles it independently of any voice-me code.
+
+The "unexplained routing asymmetry" between the test binary and the bin,
+recorded above as unexplainable, was the same thing all along: neither had
+loaded the module.
+
+**What replaced it** (see `ARCHITECTURE-SPINE.md`): a plain
+`module-null-sink` named `voice-me-sink`, which any process can address by
+name, plus a `module-remap-source` republishing its monitor as `voice-me` —
+still an ordinary microphone in the user's list, not a "Monitor of". Above
+it, `play` now opens its stream with `PA_STREAM_DONT_MOVE` and then asks the
+server which device the stream actually reached, refusing to play at all
+unless it is the expected one. A new live row
+(`audio_from_a_process_that_did_not_create_the_device_still_reaches_it`)
+covers the case none of the original four did; with the old target it fails,
+naming the speakers it would have played to.
+
 ## Spec Change Log
 
 ## Review Triage Log

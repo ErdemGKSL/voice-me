@@ -45,11 +45,10 @@ fn fixture() -> (tempfile::TempDir, LinuxVirtualMicAdapter) {
 /// leave a null-sink module loaded on the developer's machine because a
 /// helper panicked on the way out.
 ///
-/// Both halves are separate processes on purpose — `parecord` captures
+/// Both halves are separate processes on purpose: `parecord` captures
 /// exactly as Discord would, and the playing side is the `mic-spike` binary
-/// rather than this test, because a playback stream opened from the cargo
-/// test binary is routed to the default sink despite carrying the right
-/// `target.object` (see `src/bin/mic-spike.rs`).
+/// because that is the shape the real app has — a process that plays into a
+/// device some earlier process created.
 fn capture_while_mic_spike_runs(
     temp: &tempfile::TempDir,
     args: &[&str],
@@ -60,10 +59,7 @@ fn capture_while_mic_spike_runs(
     // a recorder pointed at a name that is not there yet captures nothing
     // and reports no error, which reads exactly like a routing failure —
     // and with each of these tests uninstalling on its way out, the second
-    // one to run would always find nothing there. The playing child below
-    // still installs for itself, because only the process that loaded the
-    // module can address it by name; pipewire-pulse moves the attached
-    // recorder onto the replacement node.
+    // one to run would always find nothing there.
     let installed = std::process::Command::new(env!("CARGO_BIN_EXE_mic-spike"))
         .arg("--install-only")
         .env("XDG_CONFIG_HOME", temp.path())
@@ -215,5 +211,33 @@ fn playing_without_installing_is_a_domain_error() {
     assert!(
         matches!(result, Err(VoiceMeError::VirtualMicUnavailable(_))),
         "a missing device must be reported, not silently ignored"
+    );
+}
+
+/// The case the app is actually in, and the one that shipped broken: the
+/// process that plays did not create the device.
+///
+/// The first mechanism published a single `Audio/Source/Virtual` node.
+/// Playback streams resolve names against *sinks*, so that name did not
+/// resolve for anyone but the process that had just loaded the module, and
+/// pipewire-pulse answers an unresolvable name by substituting the default
+/// sink — every generated line came out of the user's speakers with
+/// `target.object` still reading `voice-me`. Nothing above catches that,
+/// because every other row has the playing child install for itself.
+#[test]
+#[ignore = "needs a running audio server and `parecord`"]
+fn audio_from_a_process_that_did_not_create_the_device_still_reaches_it() {
+    let (temp, adapter) = fixture();
+
+    let (played, captured) = capture_while_mic_spike_runs(&temp, &["--play-only"]);
+
+    adapter.uninstall().expect("uninstall");
+    assert!(played.status.success(), "mic-spike failed: {played:?}");
+
+    let peak = peak_of(&captured);
+    assert!(
+        peak > 0.05,
+        "the capture client heard {peak}, i.e. silence — a process that did not \
+         create the device cannot address it, so the line went to the speakers"
     );
 }

@@ -91,14 +91,11 @@ fn main() {
         return;
     }
 
-    // Everything but `--play-only` installs first. The playing process has
-    // to be the one that loaded the module: a device installed by a
-    // *different* process is one this one cannot address by name — playing
-    // at it lands on the default sink instead, which is the same
-    // unexplained asymmetry that made `mic-spike` a bin rather than an
-    // example. `--install-only` therefore only stands the device up so a
-    // capture client has something to attach to; the playing child then
-    // reinstalls, and pipewire-pulse moves the recorder to the new node.
+    // Everything but `--play-only` installs first. `--install-only` stops
+    // there, so a test can stand the device up and attach a capture client
+    // before anything plays; `--play-only` skips the install so the crate
+    // can exercise the case the real app is in — playing into a device some
+    // earlier process created.
     if argument.as_deref() != Some("--play-only") {
         match adapter.install() {
             Ok(conf) => println!("installed; drop-in at {}", conf.display()),

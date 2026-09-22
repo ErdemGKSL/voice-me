@@ -37,11 +37,16 @@ The generated line is played into a virtual microphone called `voice-me`
 Discord, a browser mic test, or Sound settings, and what you type is what
 that application hears.
 
-On **Linux** the device is a PipeWire/PulseAudio null-sink published as a
-virtual source — no kernel driver, no `sudo`. The app installs it for you the
-first time it starts without it, in the background; it persists across
-reboots, because installing also writes one drop-in at
-`~/.config/pipewire/pipewire-pulse.conf.d/voice-me.conf`. Check it with:
+On **Linux** the device is two PipeWire/PulseAudio nodes — no kernel driver,
+no `sudo`: a plain sink called `voice-me-sink` that voice-me plays into, and
+`voice-me`, an ordinary-looking microphone remapped from that sink's monitor,
+which is the one you select in other applications. (Two nodes because a
+single node published as a virtual source cannot be addressed by name from
+another process — playback silently lands on your default output instead.)
+The app installs both for you the first time it starts without them, in the
+background; they persist across reboots, because installing also writes one
+drop-in at `~/.config/pipewire/pipewire-pulse.conf.d/voice-me.conf`. Check it
+with:
 
 ```bash
 pactl list short sources | grep voice-me   # expect exactly one entry

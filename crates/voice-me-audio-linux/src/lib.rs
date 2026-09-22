@@ -34,12 +34,11 @@ mod pulse;
 use std::path::PathBuf;
 
 use libpulse_binding::sample::{Format, Spec};
-use libpulse_binding::stream::Direction;
-use libpulse_simple_binding::Simple;
 use voice_me_core::{AudioBuffer, SAMPLE_RATE, VirtualMicPort, VoiceMeError};
 
 pub use config::{DEVICE_DESCRIPTION, DEVICE_NAME};
 
+use config::SINK_NAME;
 use pulse::PulseSession;
 
 /// What the audio server shows this stream as, next to the device.
@@ -102,7 +101,7 @@ impl LinuxVirtualMicAdapter {
         for index in session.loaded_null_sinks()? {
             session.unload_module(index)?;
         }
-        session.load_null_sink()?;
+        session.load_device()?;
 
         config::write_conf(&self.config_dir)
     }
@@ -160,7 +159,8 @@ impl VirtualMicPort for LinuxVirtualMicAdapter {
         // voice chat. For this product that is not a degraded outcome, it is
         // the outcome the product exists to prevent, so it is checked rather
         // than hoped for.
-        match PulseSession::connect()?.source_count(DEVICE_NAME)? {
+        let mut session = PulseSession::connect_as(APP_NAME)?;
+        match session.source_count(DEVICE_NAME)? {
             1 => {}
             0 => {
                 return Err(VoiceMeError::VirtualMicUnavailable(format!(
@@ -187,41 +187,11 @@ impl VirtualMicPort for LinuxVirtualMicAdapter {
         };
         debug_assert!(spec.is_valid());
 
-        let stream = Simple::new(
-            None,
-            APP_NAME,
-            Direction::Playback,
-            // Addressing the device by name is the whole trick — see the
-            // module docs on WirePlumber's routing policy.
-            Some(DEVICE_NAME),
-            STREAM_NAME,
-            &spec,
-            None,
-            None,
-        )
-        .map_err(|error| {
-            VoiceMeError::VirtualMicUnavailable(format!(
-                "could not open the Virtual Microphone ({DEVICE_NAME}) for playback: {error} — \
-                 has it been installed?"
-            ))
-        })?;
-
-        stream
-            .write(&to_le_bytes(audio.samples()))
-            .map_err(|error| {
-                VoiceMeError::VirtualMicUnavailable(format!(
-                    "could not write to the Virtual Microphone: {error}"
-                ))
-            })?;
-
-        // `play` returning before the audio has left means Story 2.9 would
-        // have no way to know when the line was actually spoken — and this
-        // call already runs on the blocking pool (AD-5).
-        stream.drain().map_err(|error| {
-            VoiceMeError::VirtualMicUnavailable(format!(
-                "the Virtual Microphone did not finish playing: {error}"
-            ))
-        })
+        // `play_to` does not return until the server has drained the
+        // buffer, which is why this call belongs on the blocking pool
+        // (AD-5) — and it refuses to play at all unless the stream landed
+        // on the device this adapter asked for.
+        session.play_to(SINK_NAME, STREAM_NAME, &spec, &to_le_bytes(audio.samples()))
     }
 }
 
@@ -267,6 +237,8 @@ mod tests {
     /// default sink and the user hears it through their speakers).
     #[test]
     fn playback_targets_the_installed_device() {
-        assert!(config::conf_contents().contains(&format!("sink_name={DEVICE_NAME}")));
+        // `play` writes into the sink; the drop-in has to create that same
+        // sink, or a persisted device would have nothing to play into.
+        assert!(config::conf_contents().contains(&format!("sink_name={SINK_NAME}")));
     }
 }
