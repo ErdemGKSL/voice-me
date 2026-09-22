@@ -46,17 +46,20 @@ baseline_commit: 'b163a54336a875103d3366b4ab376e961bb75077'
 
 ## Code Map
 
-- `crates/voice-me-tts/src/lib.rs` -- `TtsAdapter` is a unit struct whose `generate` is `todo!()`. Give it the session slot (`Mutex<Option<Sessions>>` — the mutex *is* AD-10's queue) plus a `warm_up`. Reuse `sessions::Sessions::build(cache, variant, target, verbose)`, `reference::load_reference_clip`, `generate::generate(&mut Sessions, text, language, &AudioBuffer, GenerationSettings)` unchanged — do not re-derive the loop.
-- `crates/voice-me-tts/src/sessions.rs` -- `LanguageModel {Q4,Fp16,Fp32}`, `ExecutionTarget {Cpu, WebGpu{device_id}}`, `ModelCache::from_env()`. These stay `voice-me-tts`-private vocabulary; map to them from the new core type.
-- `crates/voice-me-core/src/state.rs` -- add the AD-9 resolved backend (execution target + optional device + weight variant) to `AppState`. Core-side type, since core cannot depend on `voice-me-tts`.
-- `crates/voice-me-core/src/ports.rs` -- `TtsPort` gains warm-up; add the new notification port next to `TrayPort` (same driven-adapter shape).
-- `crates/voice-me-core/src/error.rs` -- add the "no active Reference Voice Sample" variant; follow the existing style (each variant documents *why* it is its own variant).
-- `crates/voice-me-core/src/settings_store.rs` -- `SettingsFile` + `build_state`: where a persisted speech language and device selection would land; `save_*` methods return a fresh `AppState`.
-- `crates/voice-me-core/src/tokio_bridge.rs` -- `TokioRuntime::install(cx)` / `spawn_blocking(cx, work)`. **`install` is never called in `main.rs` today** — only in `examples/tts-spike.rs:125`.
-- `crates/voice-me-app/src/main.rs:~315` -- the single `AppEvent` receiver; `AppEvent::SpeakRequested { text } => println!(...)` is the exact hook to replace. Adapters are composed above it; `Cargo.toml` has no `voice-me-tts` edge yet.
-- `crates/voice-me-tray-linux/src/lib.rs` -- the newtype-`Global` pattern (`TrayHandle`, `EventSender`) for holding long-lived adapter state.
-- `crates/voice-me-ui/src/prompt_overlay.rs` -- `speak()` sends `AppEvent::SpeakRequested` and dismisses. **Do not change it**; its tests pin the trim/empty/once-only contract.
-- `crates/voice-me-tts/examples/tts-spike.rs` -- the working end-to-end driver, including `ORT_DYLIB_PATH`/cache setup; the README documents fetching the assets.
+Written against the delivered code (commit `03286d9`), not the state that
+preceded it — see the first Implementation Note for why.
+
+- `crates/voice-me-core/src/speak.rs` -- the Speak Action as a use-case function, and the first one in the hexagon. `speak` (`:50`) wraps `speak_inner` (`:72`) so that *every* failure path notifies exactly once; `speak_inner` rejects empty text, validates `speech_language` against `SUPPORTED_SPEECH_LANGUAGES` (`:22`), requires a Reference Voice Sample before any session work, and emits the cold-start notice. The three notification strings are consts (`:29`–`:36`) so tests assert against the same text the user sees.
+- `crates/voice-me-tts/src/lib.rs` -- `SessionSlot<T>` (`:42`) is AD-10 in one type: a `Mutex<Option<T>>` whose lock is held across the whole generation, so the lock *is* the queue, plus an `AtomicBool` mirroring readiness that `is_ready` can read without blocking. Generic over `T` purely so the contract is testable without 1.56 GB of weights. `TtsAdapter` (`:109`) holds it; `from_state` reads the backend off `AppState` and builds no session. `language_model_for`/`execution_target_for` (`:207`, `:221`) are the only place core vocabulary meets `ort` vocabulary.
+- `crates/voice-me-tts/src/sessions.rs`, `reference.rs`, `generate.rs` -- spec-2-5's engine, reused unchanged. `Sessions::build`, `load_reference_clip`, `generate(&mut Sessions, ..)`. Do not re-derive the decode loop.
+- `crates/voice-me-core/src/ports.rs` -- `TtsPort` (`:70`) gained `warm_up` and the non-blocking `is_ready`, and is now `Send + Sync` because every call crosses the AD-5 bridge. `NotificationPort` (`:138`) is the new driven port: `TrayPort`'s shape without the `gpui_kit::App` context, since notifications originate off the main thread.
+- `crates/voice-me-core/src/state.rs` -- `SpeechExecutionTarget`/`SpeechWeights`/`SpeechBackend` (`:21`–`:63`) are the AD-9 vocabulary, core-side so core never names an `ort` type. `SpeechBackend::CPU` (`:63`) is the shipped default, Q4 per Decision 1. `AppState` (`:81`) gained `speech_language` and `speech_backend`; its `Default` is hand-written (`:99`) so the language fields are real languages, never empty strings.
+- `crates/voice-me-core/src/error.rs` -- `NoReferenceVoiceSample`, alongside the `MissingRuntimeAsset`/`SpeechEngine`/`EmptyText` variants spec-2-5 added.
+- `crates/voice-me-core/src/settings_store.rs` -- `SettingsFile` (`:43`) carries `speech_language`, with a hand-written `Default` (`:59`) for the same reason `AppState`'s is hand-written. `speech_backend` is deliberately *not* persisted — it describes the machine, not the user.
+- `crates/voice-me-app/src/main.rs` -- the composition root. `resolved_speech_backend` (`:114`) is the single honest AD-9 input until Story 3.1; `current_state` (`:123`) re-reads settings per Speak Action so a sample recorded after launch counts; `notify_engine_unavailable` (`:152`) covers the engine that never came up; `report_generated`/`write_wav` (`:162`, `:190`) are the Story 2.9 seam. The `SpeakRequested` arm is at `:642`.
+- `crates/voice-me-notify-linux/src/lib.rs` -- the `NotificationPort` adapter: one `org.freedesktop.Notifications` call through `notify-rust`'s pure-Rust `zbus` backend. `crates/voice-me-notify-windows` returns a domain error rather than `todo!()`, because unlike the other Windows stubs this one sits on a path that is actually taken.
+- `crates/voice-me-ui/src/prompt_overlay.rs` -- unchanged by this story, and must stay that way: `speak()` sends the event and dismisses, and its tests pin the trim/empty/once-only contract.
+- `crates/voice-me-tts/examples/tts-spike.rs` -- still the fastest way to exercise the engine alone, including `ORT_DYLIB_PATH`/cache setup; the README documents fetching the assets.
 
 ## Tasks & Acceptance
 
@@ -84,8 +87,13 @@ existed, uncommitted, when this planning pass ran; the original spec file was
 overwritten before that was noticed. The frozen block above was re-derived
 from the same four decisions the code cites by number (`spec-2-6 Decision
 1..4` in `state.rs`, `settings_store.rs`, `ports.rs`, `main.rs`) and the human
-re-confirmed all four, so intent and code agree — but the Code Map and task
-list here describe work that was already done, not work planned ahead of it.
+re-confirmed all four, so intent and code agree. The Code Map was then
+rewritten against the delivered code at commit `03286d9` — it is a map of
+what exists, which is what a later story needs from it, not a record of what
+was planned. The task list likewise describes work already done. What the
+overwrite destroyed and no reconstruction recovers is the original spec's own
+account of itself: whatever its Code Map pointed at before the code existed,
+and any notes its author left along the way.
 
 **Shape of what landed.** `SessionSlot<T>` in `voice-me-tts` is AD-10 in one
 type: a `Mutex<Option<T>>` whose lock is held across the whole generation, so
