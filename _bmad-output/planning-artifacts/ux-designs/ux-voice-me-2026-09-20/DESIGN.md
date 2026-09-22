@@ -71,7 +71,7 @@ Rounder than gpui-kit's default app-chrome radius for exactly one surface: the P
 
 ## Components
 
-voice-me uses the following gpui-kit components as-is, unchanged: `Button`, `Input`, `Dialog`, `Switch`, `Select`, `Tooltip`, `DropdownMenu` (tray/context menus), `Badge` (dependency/status states). The contract: don't customize these beyond the one primary-color override.
+voice-me uses the following gpui-kit components as-is, unchanged: `Button`, `Input`, `Dialog`, `Switch`, `Select`, `Tooltip`, `DropdownMenu` (tray/context menus), `Badge` (dependency/status states), masked `Input` (provider API key). The contract: don't customize these beyond the one primary-color override.
 
 Brand-layer components:
 

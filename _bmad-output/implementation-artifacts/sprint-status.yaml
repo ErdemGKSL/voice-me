@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-20-2026 19:26
-last_updated: 09-22-2026 15:40
+last_updated: 09-22-2026 18:05
 project: voice-me
 project_key: NOKEY
 tracking_system: file-system
@@ -58,9 +58,13 @@ development_status:
   epic-3: backlog
   3-1-detect-missing-dependencies: backlog
   3-2-one-click-provision-a-missing-dependency: backlog
-  3-3-be-honest-when-the-build-and-the-hardware-disagree: backlog
+  3-3-be-honest-when-the-selected-backend-cant-run-here: backlog
   3-4-block-the-overlay-gracefully-on-a-missing-dependency: backlog
-  3-5-choose-which-gpu-runs-generation: backlog
+  3-5-choose-which-backend-generates-speech: backlog
+  3-6-generate-through-a-remote-provider: backlog
+  3-7-add-fal-ai-as-a-second-provider: backlog
+  3-8-build-and-mirror-the-all-provider-onnx-runtime: backlog
+  3-9-choose-which-gpu-runs-generation: backlog
   epic-3-retrospective: optional
 
   epic-4: backlog

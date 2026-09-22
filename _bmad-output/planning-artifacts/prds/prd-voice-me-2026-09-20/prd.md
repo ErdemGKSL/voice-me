@@ -2,7 +2,7 @@
 title: "PRD: voice-me"
 status: final
 created: 2026-09-20
-updated: 2026-09-20
+updated: 2026-09-22
 ---
 
 # PRD: voice-me
@@ -13,7 +13,7 @@ This PRD is for the creator (Erdem, sole builder) as the working spec for v1 of 
 
 ## 1. Vision
 
-voice-me lets you "speak" in your own cloned voice without speaking out loud. A global hotkey pops open a tiny overlay over whatever you're doing — a game, a call — you type a line, hit Enter, and it's gone; a moment later, the line plays through a virtual microphone in your own voice, so anything listening to your mic hears it as if you'd said it. It runs entirely local, with no account and no cloud calls, as a single native app the creator actually uses during real gaming sessions.
+voice-me lets you "speak" in your own cloned voice without speaking out loud. A global hotkey pops open a tiny overlay over whatever you're doing — a game, a call — you type a line, hit Enter, and it's gone; a moment later, the line plays through a virtual microphone in your own voice, so anything listening to your mic hears it as if you'd said it. It runs as a single native app the creator actually uses during real gaming sessions. Speech is generated on your own machine by default — nothing leaves it — or, if you pick a remote backend, through a third-party speech API you supply your own key for. Which backend is running is always visible in the UI, and the local backends never reach the network.
 
 ## 2. Target User
 
@@ -27,7 +27,7 @@ voice-me lets you "speak" in your own cloned voice without speaking out loud. A 
 
 - Anyone wanting real-time, continuous voice transformation while actually speaking (that's a voice changer; this is discrete typed-line playback).
 - macOS users (platform deferred past v1).
-- Anyone who needs cloud/hybrid inference or multi-device sync — this is single-machine, local-only by design.
+- Anyone who needs multi-device sync or a hosted service — voice-me is a single-machine app; remote generation, where used, runs on the user's own API account, not a voice-me service.
 
 ### 2.3 Key User Journeys
 
@@ -42,7 +42,7 @@ voice-me lets you "speak" in your own cloned voice without speaking out loud. A 
 - **TTS Engine** — Chatterbox-Multilingual V3, the local voice-cloning text-to-speech model that turns (text, language, Reference Voice Sample) into audio.
 - **Virtual Microphone** — an OS-level virtual audio input device that other applications (games, Discord, Zoom) can select as their microphone; voice-me plays generated audio into it instead of a physical mic.
 - **Sidecar Process** — the local background process that hosts the TTS Engine's Python/PyTorch runtime, managed and provisioned automatically by the main app (detailed in `addendum.md`). *(Superseded 2026-09-21: there is no Sidecar Process — the model runs in-process on ONNX Runtime. See `addendum.md` § Superseded and Architecture Spine AD-12.)*
-- **Dependency Check** — the app's on-demand scan for locally missing components the Sidecar Process needs (e.g. the bundled Python runtime, GPU acceleration libraries), surfaced in-app rather than as a setup wizard.
+- **Dependency Check** — the app's on-demand scan for whatever the selected backend needs and this machine is missing (the ONNX Runtime distribution, execution-provider libraries, model weights, the Virtual Microphone driver; for a remote backend, a key and a reachable provider), surfaced in-app rather than as a setup wizard.
 - **Preset Phrase** — (v2+, not in v1) a fixed phrase bound directly to a hotkey, spoken with no Prompt Overlay shown at all.
 - **GPUI** — the underlying Rust GPU-accelerated UI framework (Zed Industries) the app's interface is built on.
 - **gpui-kit** — the component/design-system layer built on top of GPUI (`gpui_kit::component`, `gpui_kit::base`, `gpui_kit::assets`) that voice-me's UI is implemented with, rather than raw GPUI primitives.
@@ -93,11 +93,11 @@ Pressing the configured hotkey opens a minimal, borderless, always-on-top single
 - Escape or losing focus without pressing Enter discards the typed text and does not trigger playback.
 
 #### FR-5: Text-to-speech generation via the TTS Engine
-On a Speak Action, the typed text plus the active Reference Voice Sample and selected language are sent to the TTS Engine (Chatterbox-Multilingual V3) via the Sidecar Process, producing audio in the user's cloned voice.
+On a Speak Action, the typed text plus the active Reference Voice Sample and selected language are handed to the **selected speech backend** — a local ONNX backend running in-process, or a remote speech API (FR-10) — producing audio in the user's cloned voice.
 
 **Consequences (testable):**
 - Generated audio is in the language the user selected for speech output (independent of UI language), from Chatterbox-Multilingual V3's supported language set.
-- If generation fails (Sidecar Process unavailable, model error), the user sees a clear in-app failure indication rather than silence with no feedback.
+- If generation fails, the user sees a clear in-app failure indication rather than silence with no feedback, and it names which backend failed and why (missing local asset, no API key, provider error) rather than a generic message.
 
 **Feature-specific NFRs:**
 - `[ASSUMPTION]` End-to-end latency (Enter press → audio starts playing) should feel usable in live voice chat; no hard numeric target is set yet — flagged as an Open Question pending a real measurement during implementation.
@@ -113,15 +113,15 @@ Generated audio plays out through the Virtual Microphone device rather than the 
 **Description:** Keeps the "single executable, no visible installer" promise honest without silently failing when something's missing.
 
 #### FR-7: In-app Dependency Check and guided/one-click setup
-On first run and on demand, the app checks for locally required components (the ONNX Runtime shared library, the execution-provider libraries its build variant needs, the Chatterbox model weights, the chosen Virtual Microphone driver) and, where feasible, offers a one-click action to install or provision what's missing, inside the app UI. There is no bundled Python runtime — inference runs in-process (Architecture AD-12).
+On first run and on demand, the app checks for locally required components (the ONNX Runtime shared library, the execution-provider libraries the selected backend needs, the Chatterbox model weights, the chosen Virtual Microphone driver) and, where feasible, offers a one-click action to install or provision what's missing, inside the app UI. There is no bundled Python runtime — inference runs in-process (Architecture AD-12).
 
-**What gets checked depends on which build the user downloaded.** v1 ships one release artefact per backend variant — `cpu`, `cuda`, `local-webgpu` — rather than a single self-configuring binary, and the user chooses at download time (Architecture AD-7). The Dependency Check is therefore variant-aware: each variant has its own required-file list, and a GPU variant additionally reports which devices on this machine it can actually drive.
+**What gets checked depends on which backends this install has, and which one is selected.** v1 ships one artefact per OS carrying every local backend (Architecture AD-7, revised 2026-09-22). The Dependency Check is therefore **backend-aware**: each local backend declares its own required assets — its ONNX Runtime distribution, its execution-provider libraries, its language-model weights — and only the selected backend's missing assets block a Speak Action. A GPU backend additionally reports the candidate devices it can drive on this machine. The remote backend's readiness is not a file check at all: it is whether a key is present and the provider is reachable.
 
 **Consequences (testable):**
 - A missing dependency is named specifically to the user (not a generic error), with either a one-click fix or clear manual next steps if automation isn't possible for that item.
-- The app states which variant it is, and when the running build cannot use this machine's hardware — a `cuda` build with no supported NVIDIA GPU, or a selected GPU that has disappeared — it says so plainly, naming the variant that would fit, rather than silently running slower on CPU (Architecture AD-9).
-- On a GPU variant the user can see and choose which detected device is used; what the UI reports as the active backend reflects what was actually acquired, not what was requested.
-- Running without GPU acceleration is served by downloading the `cpu` variant, whose CPU path is the 4-bit-quantized language model — measured working, at a 0.10x real-time factor (Story 2.5). The earlier "Chatterbox-Nano" assumption is withdrawn: generation cost is dominated by the vocoder, which Nano shares, so a smaller language model would not meaningfully help.
+- The app states which backend is selected and what it actually acquired at session build — never what was requested — and when the selected backend cannot run on this machine (a GPU backend with no drivable device, a selected GPU that has disappeared, a remote backend with no key) it says so plainly rather than silently substituting another backend (Architecture AD-9).
+- On a GPU backend the user can see and choose which detected device is used; what the UI reports as the active backend reflects what was actually acquired, not what was selected.
+- Running without GPU acceleration is served by selecting the CPU backend, whose path is the 4-bit-quantized language model — measured working, at a 0.10x real-time factor (Story 2.5). It is a selection, not a separate download. The earlier "Chatterbox-Nano" assumption is withdrawn: generation cost is dominated by the vocoder, which Nano shares, so a smaller language model would not meaningfully help.
 
 **Out of Scope:**
 - A traditional setup wizard or requirements page shown before the app can be used at all — dependency handling is in-app and as-needed, not a blocking upfront step.
@@ -147,10 +147,23 @@ The UI is implemented using gpui-kit components (`gpui_kit::component`, `gpui_ki
 - Visual design decisions (color theme, spacing, component choice) are checked against `gpui-kit-design-guides` before being considered done, not designed ad hoc.
 - `[NOTE FOR PM]` gpui-kit is a component/design layer on top of GPUI — it does not itself add system tray or global hotkey support (see FR-2/FR-3, Open Question 6). Using gpui-kit for visual polish does not resolve that separate feasibility risk.
 
+### 4.6 Backend Selection
+**Description:** Which engine generates the speech is the user's choice, local or remote. Added 2026-09-22 with PRD Open Question 7's resolution.
+
+#### FR-10: Backend selection and remote disclosure
+The user selects which speech backend generates their voice, from Settings. Local backends (CPU, CUDA, WebGPU) run entirely on the machine. A remote backend (DeepInfra `ensembleAI/chatterbox-multilingual`, fal.ai) generates through a third-party API using a key the user supplies.
+
+**Consequences (testable):**
+- A local backend is the default on first run; no network call is possible until the user selects a remote backend and enters a key.
+- Before the first byte leaves the machine, the app states plainly what is sent — the typed text and the Reference Voice Sample — and to which provider, and the user confirms it once per provider.
+- The Reference Voice Sample is uploaded once per provider and referenced by id on later calls; the app shows that the sample is stored on the provider's infrastructure and offers a way to delete it there.
+- The API key is stored in the settings file in plaintext (Architecture AD-13). The app says so where the key is entered, so a user sharing a config knows what is in it.
+- Switching backends takes effect on the next Speak Action, with no restart.
+
 ## 5. Non-Goals (Explicit)
 
 - Not a live, continuous voice changer — no real-time pass-through voice transformation.
-- Not a cloud service — no server-side inference, no accounts, no telemetry beyond what stays on-device. This holds unconditionally for every v1 variant; if a remote-generation variant is ever added (Open Question 7), this claim must be rewritten to name which variants it still covers rather than quietly narrowed.
+- Not a hosted service — voice-me runs no server of its own, has no voice-me account, and sends no telemetry, ever. **It is no longer local-only as a headline claim** (revised 2026-09-22): a user-selected remote backend generates speech through a third-party API using the user's own key, and sends that provider the typed text and the Reference Voice Sample. What each backend sends is documented per backend (FR-10) rather than covered by a blanket guarantee. Local backends remain strictly offline.
 - Not a monetized product in v1 — free and open source.
 - Not targeting macOS in v1.
 - Not building Preset Phrase (hotkey → fixed phrase, no overlay) in v1 — real planned feature, deferred (see `brief.md` § Possible Future Features).
@@ -163,6 +176,8 @@ The UI is implemented using gpui-kit components (`gpui_kit::component`, `gpui_ki
 - Background/tray operation and global hotkey configuration through the Prompt Overlay speak flow (FR-2 through FR-6)
 - Virtual Microphone output on both Linux and Windows (developed/validated on Linux first, then Windows, following whichever machine is in hand — not a strict phase gate)
 - In-app Dependency Check with one-click setup where feasible (FR-7)
+- Backend selection across local CPU / CUDA / WebGPU and remote providers, with per-backend dependency reporting (FR-7, FR-10)
+- Remote generation through DeepInfra and fal.ai with user-supplied keys (FR-10)
 - Turkish/English UI (FR-8)
 - Modern, clean visual design built with gpui-kit components, per gpui-kit's Design Guides (FR-9)
 - Rust workspace structured as multiple crates (binary, lib(s), tests) — see `addendum.md` for the proposed breakdown
@@ -170,7 +185,8 @@ The UI is implemented using gpui-kit components (`gpui_kit::component`, `gpui_ki
 ### 6.2 Out of Scope for MVP
 - macOS support — deferred, no notarization/system-extension work scoped
 - Preset Phrase hotkey-to-fixed-phrase mapping — deferred to v2, tracked in `brief.md`
-- Cloud/hybrid inference — local-only is a hard requirement for every variant v1 ships. A remote-API generation backend has since been raised as a possible *later, separate* variant; it is not in v1 and cannot be added to any existing variant without first settling Open Question 7.
+- Remote models that cannot clone a voice (stock-voice-only providers) — the AD-13 abstraction allows them, v1 ships only voice-cloning providers
+- A voice-me-hosted proxy, shared keys, or any billing relationship — the user brings their own provider account
 - Accounts, licensing, monetization
 - Saved/favorite phrase library, per-game profiles, and the other items under `brief.md` § Possible Future Features
 
@@ -199,7 +215,7 @@ Hobby-scale — kept intentionally light:
 4. What are Chatterbox-Multilingual V3's actual minimum reference-clip length/quality recommendations? Should set the bounds enforced in FR-1.
 5. ~~Is the "bundled Python sidecar" packaging approach actually deliverable as a clean single-executable experience?~~ **Resolved 2026-09-21 by removing the sidecar** — Chatterbox ships a complete ONNX export, so inference runs in-process via the Rust `ort` crate (see `addendum.md` § Superseded, Architecture Spine AD-12).
 6. Can GPUI (pre-1.0, no upstream tray or global-hotkey support) actually deliver FR-2 and FR-3 directly, or does this project need to depend on the unofficial "Adabraka GPUI" fork, or build platform-native tray/hotkey shims by hand? This is a foundational feasibility question for the whole UI shell, not a detail.
-7. Should voice-me ever generate speech through a **remote API**, as a separate download variant? Raised 2026-09-21 as a possible later direction. It is not an architecture detail: it would send the user's typed text, and probably their Reference Voice Sample, to a third party, which contradicts the local-only, no-telemetry promise this PRD makes in §Non-Goals and §Positioning, and which Architecture AD-8 exists to enforce. Deciding it means answering, explicitly: which variants may reach the network; what the UI discloses before the first byte leaves the machine; whether the user's voice sample is sent at all or only text; and whether the local-only claim is rewritten or scoped to the local variants. Until this is answered, no variant may make a generation-related network call (affects FR-5, FR-7, Non-Goals).
+7. ~~Should voice-me ever generate speech through a **remote API**, as a separate download variant?~~ **Answered 2026-09-22 (product owner).** Yes — as a user-selected backend in v1, not a separate download. Settled: **which backends may reach the network** — only the named remote backend adapter, never the local ones or any other crate (AD-8); **what is sent** — the typed text, the language tag, and the Reference Voice Sample, the sample uploaded once per provider and referenced by id thereafter, so it persists on the provider's infrastructure; **disclosure** — stated in full and confirmed once per provider before the first request; **the local-only claim** — dropped as a headline claim and replaced by per-backend documentation (§5, FR-10). Providers for v1: DeepInfra `ensembleAI/chatterbox-multilingual` (default) and fal.ai (affects FR-5, FR-7, FR-10, Non-Goals).
 
 ## 9. Assumptions Index
 
@@ -207,6 +223,6 @@ Hobby-scale — kept intentionally light:
 - §4.2 FR-2 — Exact tray UX (icon, menu contents) per OS not yet designed.
 - §4.2 FR-4 — Target under ~200ms hotkey-to-ready-for-input latency for the Prompt Overlay; no measured baseline yet.
 - §4.2 FR-5 — No hard numeric end-to-end latency target set yet; tracked as Open Question 1.
-- §4.3 FR-7 — App should degrade to a reduced/CPU-only mode when no GPU is available, rather than failing outright.
+- §4.3 FR-7 — With all local backends in one binary, "no usable GPU" resolves to selecting the CPU backend; the app never silently substitutes one backend for another (AD-9).
 - §4.4 FR-8 — UI language switch takes effect live, without an app restart.
 - §4.5 FR-9 — gpui-kit is assumed to cover enough standard components (buttons, inputs, dialogs) to avoid hand-rolled UI for most of the app; not yet verified against the actual component set.

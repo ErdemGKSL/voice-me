@@ -43,9 +43,9 @@ NFR1 (Performance): The Prompt Overlay must appear and be ready for keystrokes w
 
 NFR2 (Compatibility/Risk): Global hotkey capture must function while a fullscreen or borderless-fullscreen game holds input focus, on Linux and Windows, without being blocked by the OS or the game. Whether this risks conflicts with anti-cheat software (BattlEye, EasyAntiCheat) in specific games is unresolved and must be investigated before the hotkey-capture implementation is locked in (PRD Open Question 3).
 
-NFR3 (Privacy/Security): The app must be local-only — no cloud calls, no accounts, no telemetry. Network egress is limited to the dependency-provisioning adapter's fetches from this project's own GitHub Releases; every other component is fully offline — the Inference Engine runs in-process and opens no socket at all (Architecture Spine AD-8, AD-12), enforced by a CI check rather than review discipline alone.
+NFR3 (Privacy/Security): Network egress is confined to exactly two components — the dependency-provisioning adapter fetching from this project's trusted sources, and the remote speech-backend adapter calling the provider the user selected with the user's own key. Every other component is fully offline, and the local Inference Engine opens no socket at all (Architecture Spine AD-8, AD-12, AD-13), enforced by a CI allowlist rather than review discipline. voice-me runs no server, has no account of its own, and sends no telemetry, ever; local-only is no longer a blanket claim but a per-backend property (PRD §5, FR-10, revised 2026-09-22).
 
-NFR4 (Reliability): The app must degrade gracefully — to a CPU-only mode when no GPU is available (FR7), and to a clear, specific in-app or OS-notification failure state (never silent nothing) when TTS generation or a dependency check fails.
+NFR4 (Reliability): The app must fail honestly — a selected backend that cannot run here is named in words with the CPU-backend selection offered (FR7, AD-9), never a silent substitution, and any failure of generation, provisioning or a dependency check reaches the user as a clear, specific in-app or OS notification rather than silent nothing.
 
 NFR5 (Usability): Switching UI language must take effect live, without an app restart (PRD Assumptions Index).
 
@@ -148,10 +148,10 @@ Users press a global hotkey from anywhere — including inside a fullscreen game
 **FRs covered:** FR2, FR3, FR4, FR5, FR6
 
 ### Epic 3: Never Get Stuck on Setup
-The app detects locally missing runtime dependencies itself and offers one-click provisioning from inside its own UI, naming anything it can't fix automatically with clear manual steps; and it is honest about the relationship between the build the user downloaded and the hardware they are running it on.
+The app detects missing runtime dependencies itself and offers one-click provisioning from inside its own UI, naming anything it can't fix automatically with clear manual steps; it lets the user choose which backend generates their speech — local or remote — and it is honest about whether the selected backend can actually run on this machine.
 
-**Scope note (2026-09-21):** v1 ships one release artefact per backend variant — `cpu`, `cuda`, `local-webgpu` — chosen by the user at download time rather than detected at run time (AD-7). Every story in this epic is therefore variant-aware: what counts as a required dependency, and what "no GPU" means, both depend on which build is running. "Degrade to CPU-only" is no longer something a GPU build does silently — CPU-only is its own download.
-**FRs covered:** FR7
+**Scope note (2026-09-22, replacing 2026-09-21):** one artefact per OS carries every backend, and the user selects one inside the app (AD-7). Every story in this epic is therefore *backend-aware* rather than variant-aware: what counts as a required dependency depends on the **selected** backend, and a remote backend's readiness is a key and a reachable provider rather than a file list. Selecting the CPU backend is what "no GPU" resolves to — never a silent substitution (AD-9). See `sprint-change-proposal-2026-09-22.md`.
+**FRs covered:** FR7, FR10
 
 ### Epic 4: Use It In Your Language
 The interface is available in Turkish and English, switchable instantly without a restart, independent of the TTS speech language.
@@ -371,9 +371,9 @@ So that my teammates in voice chat hear it as if I'd spoken.
 
 ## Epic 3: Never Get Stuck on Setup
 
-The app detects locally missing runtime dependencies itself and offers one-click provisioning from inside its own UI, naming anything it can't fix automatically with clear manual steps; and it is honest about the relationship between the build the user downloaded and the hardware they are running it on.
+The app detects missing runtime dependencies itself and offers one-click provisioning from inside its own UI, naming anything it can't fix automatically with clear manual steps; it lets the user choose which backend generates their speech — local or remote — and it is honest about whether the selected backend can actually run on this machine.
 
-**Scope note (2026-09-21):** v1 ships one release artefact per backend variant — `cpu`, `cuda`, `local-webgpu` — chosen by the user at download time rather than detected at run time (AD-7). Every story in this epic is therefore variant-aware: what counts as a required dependency, and what "no GPU" means, both depend on which build is running. "Degrade to CPU-only" is no longer something a GPU build does silently — CPU-only is its own download.
+**Scope note (2026-09-22, replacing 2026-09-21):** one artefact per OS carries every backend, and the user selects one inside the app (AD-7). Every story in this epic is therefore *backend-aware* rather than variant-aware: what counts as a required dependency depends on the **selected** backend, and a remote backend's readiness is a key and a reachable provider rather than a file list. Selecting the CPU backend is what "no GPU" resolves to — never a silent substitution (AD-9). See `sprint-change-proposal-2026-09-22.md`.
 
 ### Story 3.1: Detect Missing Dependencies
 
@@ -385,10 +385,11 @@ So that I always know what's missing instead of hitting a cryptic crash.
 
 **Given** the app starts, or I open Settings → Dependencies
 **When** the Dependency Check runs via `DependencyProvisioningPort`
-**Then** each dependency this build actually needs — the ONNX Runtime shared library, the execution-provider libraries its variant requires, the Chatterbox ONNX weights for its language-model variant, the Virtual Microphone driver — is listed as a Dependency row with status ready/missing (UX-DR12)
-**And** the required list is derived from the running build's variant, not from a single fixed list: a `cpu` build never reports a missing GPU provider library, and a `cuda` build never reports the Q4 weights it does not use
-**And** the app states which variant it is, so a user who downloaded the wrong one can see that from the UI
-**And** on a GPU variant the check reports the candidate devices it can drive on this machine, as a list rather than a single verdict, since a machine may expose several (AD-9)
+**Then** each dependency the **selected** backend actually needs — the ONNX Runtime distribution, the execution-provider libraries it requires, the Chatterbox ONNX weights for its language-model variant, the Virtual Microphone driver — is listed as a Dependency row with status ready/missing (UX-DR12)
+**And** the required list is derived from the selected backend, not from a single fixed list: the CPU backend never reports a missing GPU provider library, and a GPU backend never reports the Q4 weights it does not use
+**And** a remote backend's readiness is a key and a reachable provider, not a file list
+**And** the app states which backend is selected and what it actually acquired at session build, never what was requested (AD-9)
+**And** when a GPU backend is selected the check reports the candidate devices it can drive on this machine, as a list rather than a single verdict, since a machine may expose several (AD-9)
 **And** the check completes and reports results without requiring a terminal or external documentation
 
 ### Story 3.2: One-Click Provision a Missing Dependency
@@ -402,26 +403,26 @@ So that I never have to open a terminal or read a wiki to get voice-me working.
 **Given** a dependency is listed as missing and is automatable
 **When** I click "Install" on that Dependency row
 **Then** the app provisions it from this repo's GitHub Releases (AD-7) and the row updates to "ready" on success
-**And** the assets fetched are the ones this build's variant needs — the ~1.56 GB CPU set (core runtime + Q4 weights), or a GPU variant's provider libraries plus FP16 weights — never both
+**And** the assets fetched are the ones the selected backend needs — the ~1.56 GB CPU set (runtime + Q4 weights), or a GPU backend's provider libraries plus FP16 weights — never both, and nothing at all for a remote backend
 **And** the model-weight download — the largest asset, 354 MB (Q4) to 1.04 GB (FP16) — reports progress and survives being resumed rather than appearing frozen
 **And** a failure during provisioning shows a clear, specific message naming what went wrong
 **And** a dependency that isn't automatable shows a short manual-steps link instead of an Install button
 
-### Story 3.3: Be Honest When the Build and the Hardware Disagree
+### Story 3.3: Be Honest When the Selected Backend Can't Run Here
 
 As Erdem,
-I want the app to tell me plainly when the build I downloaded can't use this machine's hardware,
+I want the app to tell me plainly when the backend I selected can't run on this machine,
 So that I'm never left wondering why it's slow, or staring at an inference error I can't interpret.
 
 **Acceptance Criteria:**
 
-**Given** a GPU variant is running on a machine with no device it can drive — a `cuda` build with no supported NVIDIA GPU, or a `local-webgpu` build with no usable Vulkan/D3D12 adapter
+**Given** the selected backend cannot run here — a CUDA backend with no supported NVIDIA GPU, a WebGPU backend with no usable Vulkan/D3D12 adapter, or a remote backend with no API key
 **When** the Dependency Check runs
-**Then** Settings → Dependencies says so in words, names which variant would fit this machine, and links to where to download it (UX-DR18) — rather than failing at the first Speak Action with an engine error
-**And** the app does **not** silently fall back to CPU inside a GPU build: what the UI reports as the active backend is what was actually acquired, never what was requested (AD-9)
-**And** a `cpu` variant on a machine with a perfectly good GPU is a normal, non-error state — it is simply a different download
-**And** capability detection flows from `voice-me-deps` to `voice-me-core` via `AppEvent` only, never a direct call to `voice-me-tts` (AD-9)
-**And** only the weight variant this build needs is downloaded — a `cpu` build never fetches the FP16 backbone
+**Then** Settings → Dependencies says so in words, names what selecting the CPU backend would do, and offers that selection (UX-DR18) — rather than failing at the first Speak Action with an engine error
+**And** the app does **not** silently substitute another backend: what the UI reports as the active backend is what was actually acquired at session build, never what was selected (AD-9)
+**And** the CPU backend selected on a machine with a perfectly good GPU is a normal, non-error state — it is simply a selection
+**And** capability detection flows from `voice-me-deps` to `voice-me-core` via `AppEvent` only, never a direct call to a TTS adapter (AD-9)
+**And** only the weight variant the selected backend needs is downloaded — the CPU backend never fetches the FP16 backbone
 
 ### Story 3.4: Block the Overlay Gracefully on a Missing Dependency
 
@@ -431,13 +432,73 @@ So that I'm never confused about why speaking isn't working.
 
 **Acceptance Criteria:**
 
-**Given** a required dependency is still missing
+**Given** a dependency the selected backend requires is still missing
 **When** I press the hotkey
 **Then** Settings → Dependencies auto-opens naming the specific blocker (UX-DR17)
 **And** the Prompt Overlay still opens on hotkey press but shows an inline notice instead of accepting input until the dependency is resolved
 **And** once resolved, the Prompt Overlay returns to normal behavior without an app restart (NFR6)
 
-### Story 3.5: Choose Which GPU Runs Generation
+### Story 3.5: Choose Which Backend Generates Speech
+
+As Erdem,
+I want to choose which backend generates my speech,
+So that one download works whether I'm on a CPU-only laptop, a machine with a real GPU, or happy to use an API.
+
+**Acceptance Criteria:**
+
+**Given** Settings → Dependencies is open
+**When** I select a backend — CPU, CUDA, WebGPU, or a configured remote provider
+**Then** the selection persists through `SettingsStore` (AD-6) and applies to the next Speak Action with no app restart (AD-7's single runtime makes a local switch a session rebuild, not a relaunch)
+**And** the Dependency rows re-derive from the newly selected backend immediately
+**And** an unset selection means the CPU backend with no device preference — the safe floor, never a guess (AD-9)
+**And** selecting a backend that cannot run here is allowed but honestly reported by Story 3.3's rules, never silently redirected to another backend
+
+### Story 3.6: Generate Through a Remote Provider
+
+As Erdem,
+I want to generate speech through a speech API with my own key,
+So that I get fast, high-quality generation on a machine that would take 20 seconds to do it locally.
+
+**Acceptance Criteria:**
+
+**Given** I select the DeepInfra (`ensembleAI/chatterbox-multilingual`) backend and enter my API key
+**When** I perform a Speak Action
+**Then** `voice-me-tts-remote` generates through the provider behind the same `TtsPort` as the local backend, and playback through the Virtual Microphone is unchanged (AD-13)
+**And** before the first byte leaves the machine, the app states exactly what is sent — the typed text, the language tag, and the Reference Voice Sample — names the provider, and takes a one-time confirmation that `voice-me-core` enforces, not the adapter (FR-10)
+**And** the Reference Voice Sample is uploaded once and referenced by id afterwards, keyed so that re-recording invalidates it; the UI shows the sample is held on the provider's infrastructure and offers a way to delete it there
+**And** the key is stored in the settings file in plaintext, the UI says so where the key is entered, and the key never appears in logs (AD-13)
+**And** a provider failure — no key, rejected key, timeout, provider error — is one clear notification naming the provider and the reason, and never re-sends audio automatically
+
+### Story 3.7: Add fal.ai as a Second Provider
+
+As Erdem,
+I want a second provider available,
+So that I'm not stuck if one is down, expensive, or drops the model I use.
+
+**Acceptance Criteria:**
+
+**Given** the `SpeechProvider` abstraction from Story 3.6
+**When** fal.ai is added
+**Then** it is a new `SpeechProvider` implementation only — no change above `TtsPort`, and no provider-specific type reaches `voice-me-core` or `voice-me-ui` (AD-13)
+**And** each provider carries its own key and its own uploaded-sample id, independently
+**And** switching providers is the same backend-selection act as Story 3.5, with its own one-time disclosure confirmation
+
+### Story 3.8: Build and Mirror the All-Provider ONNX Runtime
+
+As Erdem,
+I want CI to build the ONNX Runtime the GPU backends need,
+So that selecting CUDA or WebGPU is a real choice rather than a menu entry that cannot work.
+
+**Acceptance Criteria:**
+
+**Given** AD-7's one-runtime rule
+**When** CI builds ONNX Runtime from source with `--use_cuda --use_webgpu --build_shared_lib`
+**Then** the resulting distribution is mirrored as a versioned, resumable asset that `voice-me-deps` provisions like any other (AD-7)
+**And** a single process can select CPU, CUDA or WebGPU without a restart, since one library carries all three providers
+**And** `voice-me-tts-onnx`'s `webgpu-probe` feature and its build-time download are removed — that path is now the shipped runtime, not an AD-8 violation
+**And** the CPU backend remains fully usable while this story is unstarted; only the GPU backends depend on it
+
+### Story 3.9: Choose Which GPU Runs Generation
 
 As Erdem,
 I want to pick which of my machine's GPUs voice-me uses,
@@ -445,13 +506,13 @@ So that a laptop with both integrated and discrete graphics doesn't guess wrong 
 
 **Acceptance Criteria:**
 
-**Given** a GPU variant is running and the Dependency Check found more than one candidate device
+**Given** a GPU backend is selected and the Dependency Check found more than one candidate device
 **When** I open Settings → Dependencies
 **Then** the detected devices are listed by name and I can select which one generation uses
 **And** the selection persists across restarts through `SettingsStore` (AD-6), and an unset selection means "let the backend decide"
 **And** a previously selected device that is no longer present is reported as such and falls back to the default, rather than failing silently
 **And** a device that loses its context mid-generation surfaces as an error rather than playing the corrupted audio it produced — Story 2.5 measured exactly this on a Maxwell GPU under NVK
-**And** the selection reaches `voice-me-tts` through `AppState` only, never by querying `voice-me-deps` directly (AD-9)
+**And** the selection reaches `voice-me-tts-onnx` through `AppState` only, never by querying `voice-me-deps` directly (AD-9)
 
 ## Epic 4: Use It In Your Language
 
