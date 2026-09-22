@@ -14,26 +14,57 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::VoiceMeError;
 use crate::ports::SettingsStore;
-use crate::state::AppState;
+use crate::state::{AppState, SpeechBackend};
 
 const SETTINGS_FILE_NAME: &str = "settings.toml";
 const REFERENCE_VOICE_SAMPLE_FILE_NAME: &str = "reference_voice_sample.wav";
 
 fn default_ui_language() -> String {
-    "en".to_string()
+    crate::state::DEFAULT_UI_LANGUAGE.to_string()
+}
+
+/// The language generated speech is produced in, when the settings file
+/// does not say (spec-2-6 Decision 2).
+///
+/// Turkish, not the UI-language default of English: this is the language the
+/// user actually speaks into their voice chats, and FR5 wants a *selected*
+/// language rather than a constant. There is no Settings control for it yet
+/// — Epic 4 builds that alongside the UI-language selector — so until then
+/// the file is the only way to change it, and it round-trips through every
+/// other save.
+fn default_speech_language() -> String {
+    crate::state::DEFAULT_SPEECH_LANGUAGE.to_string()
 }
 
 /// The subset of `AppState` that is actually serialized to TOML. The active
 /// Reference Voice Sample is intentionally excluded — it's derived from file
 /// presence in `data_dir`, per AD-6.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SettingsFile {
     #[serde(default)]
     hotkey: Option<String>,
     #[serde(default = "default_ui_language")]
     ui_language: String,
+    #[serde(default = "default_speech_language")]
+    speech_language: String,
     #[serde(default)]
     selected_mic_device: Option<String>,
+}
+
+/// Hand-written rather than derived: `Default` is what a *missing* settings
+/// file loads as, and a derived one would hand back empty strings for the
+/// two language fields — which is not what `#[serde(default = ..)]` gives a
+/// file that merely omits them. An empty speech language is not a harmless
+/// blank either: it becomes an empty `[]` tag in the model prompt.
+impl Default for SettingsFile {
+    fn default() -> Self {
+        Self {
+            hotkey: None,
+            ui_language: default_ui_language(),
+            speech_language: default_speech_language(),
+            selected_mic_device: None,
+        }
+    }
 }
 
 /// Concrete `SettingsStore` adapter backed by the local filesystem.
@@ -96,7 +127,11 @@ impl FileSettingsStore {
             hotkey: settings.hotkey,
             reference_voice_sample: existing_path(&sample_path),
             ui_language: settings.ui_language,
+            speech_language: settings.speech_language,
             selected_mic_device: settings.selected_mic_device,
+            // Not persisted: the composition root overwrites it with the
+            // backend this build and this machine resolved to (AD-9).
+            speech_backend: SpeechBackend::default(),
         }
     }
 }
@@ -287,6 +322,50 @@ mod tests {
     }
 
     #[test]
+    fn the_speech_language_defaults_to_turkish_and_survives_an_unrelated_save() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = FileSettingsStore::with_dirs(
+            config_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        // No settings file at all yet (first run).
+        assert_eq!(store.load().unwrap().speech_language, "tr");
+
+        // Any save writes the whole file, so the default becomes explicit
+        // and stays put — this is how the setting is "persisted" with no UI
+        // control to set it (spec-2-6 Decision 2).
+        store.save_hotkey(Some("Ctrl+Alt+KeyV")).unwrap();
+        let written = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
+        assert!(
+            written.contains("speech_language = \"tr\""),
+            "the setting has to reach the file, or it cannot be edited: {written}"
+        );
+    }
+
+    #[test]
+    fn a_speech_language_in_the_file_is_what_generation_gets() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_dir.path().join(SETTINGS_FILE_NAME),
+            "speech_language = \"en\"\n",
+        )
+        .unwrap();
+
+        let store = FileSettingsStore::with_dirs(
+            config_dir.path().to_path_buf(),
+            data_dir.path().to_path_buf(),
+        );
+
+        assert_eq!(store.load().unwrap().speech_language, "en");
+        // A file that omits the other fields still gets their defaults
+        // rather than empty strings.
+        assert_eq!(store.load().unwrap().ui_language, "en");
+    }
+
+    #[test]
     fn save_hotkey_leaves_the_other_settings_intact() {
         let config_dir = tempfile::tempdir().unwrap();
         let data_dir = tempfile::tempdir().unwrap();
@@ -295,10 +374,21 @@ mod tests {
             data_dir.path().to_path_buf(),
         );
 
+        // A speech language the user chose by hand — the only way to set it
+        // until Epic 4 builds the selector, so an unrelated save silently
+        // resetting it to the default would be invisible until they next
+        // heard the wrong language.
+        fs::write(
+            config_dir.path().join(SETTINGS_FILE_NAME),
+            "speech_language = \"en\"\n",
+        )
+        .unwrap();
+
         store.save_selected_mic_device(Some("USB Mic")).unwrap();
         let state = store.save_hotkey(Some("Ctrl+Alt+KeyV")).unwrap();
 
         assert_eq!(state.selected_mic_device, Some("USB Mic".to_string()));
         assert_eq!(state.hotkey, Some("Ctrl+Alt+KeyV".to_string()));
+        assert_eq!(state.speech_language, "en");
     }
 }

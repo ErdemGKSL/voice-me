@@ -62,7 +62,37 @@ pub trait TrayPort {
 /// Driven adapter port: generates speech with Chatterbox-Multilingual,
 /// in-process, on ONNX Runtime (AD-12 — there is no sidecar process and no
 /// Python anywhere in the pipeline; spec-2-5 verified this).
-pub trait TtsPort {
+///
+/// `Send + Sync` because every call is driven through
+/// [`crate::tokio_bridge::spawn_blocking`] (AD-5): the adapter is shared
+/// across GPUI's main thread and Tokio's blocking pool, so the port itself
+/// has to say so rather than each composition root discovering it.
+pub trait TtsPort: Send + Sync {
+    /// Build and hold whatever generation needs, ahead of the first Speak
+    /// Action.
+    ///
+    /// Session construction measured 86–110 s in spec-2-5, against a ~20 s
+    /// utterance — far too much to hide inside the first call and call it a
+    /// lazy cost (AD-10). The composition root calls this once at startup,
+    /// on the blocking pool, and only when there is an active Reference
+    /// Voice Sample: a first-run user who has not set one up pays nothing.
+    ///
+    /// Idempotent, and safe to race with [`TtsPort::generate`] — whichever
+    /// arrives second waits for the first to finish rather than building a
+    /// second set of sessions.
+    fn warm_up(&self) -> Result<(), VoiceMeError>;
+
+    /// Whether [`TtsPort::generate`] can start generating immediately, i.e.
+    /// whether warm-up has already completed.
+    ///
+    /// This is what distinguishes "this will take the usual ~20 s" from
+    /// "this will take a minute and a half first", which is the only wait
+    /// unusual enough to be worth a notification (spec-2-6 Decision 4). It
+    /// must never block — in particular it must not wait on whatever lock
+    /// serializes generation, or a perfectly normal in-flight utterance
+    /// would report "not ready" and notify for nothing.
+    fn is_ready(&self) -> bool;
+
     /// Generate speech for `text` in `language`, cloning the voice in the
     /// Reference Voice Sample at `reference_clip`.
     ///
@@ -77,12 +107,42 @@ pub trait TtsPort {
     /// This call blocks for as long as generation takes (seconds), so it is
     /// always driven through [`crate::tokio_bridge::spawn_blocking`] (AD-5)
     /// and never on GPUI's main thread.
+    ///
+    /// Exactly one generation runs at a time (AD-10). A second call arriving
+    /// while one is in flight waits for it and then runs on the same
+    /// sessions; it never builds a second set and never runs concurrently.
     fn generate(
         &self,
         text: &str,
         reference_clip: &Path,
         language: &str,
     ) -> Result<AudioBuffer, VoiceMeError>;
+}
+
+/// Driven adapter port: delivers an OS-native desktop notification.
+///
+/// The same driven shape as [`TrayPort`] — one trait in the hexagon, one
+/// per-OS adapter crate behind it — but with no `gpui_kit::App` context:
+/// every notification this application sends originates from a background
+/// job that has already left the main thread (a failed generation, a slow
+/// session build), and requiring a context would mean hopping back just to
+/// say something went wrong.
+///
+/// It is the *only* surface the Speak Action has for failure or unusual
+/// slowness in this story (UX-DR14/15). The Prompt Overlay is fire-and-forget
+/// — it is already closed by the time generation starts — and its inline
+/// notice belongs to Story 3.4.
+///
+/// `Send + Sync` for the same reason [`TtsPort`] is: the adapter is shared
+/// with Tokio's blocking pool.
+pub trait NotificationPort: Send + Sync {
+    /// Show one notification with `summary` as its title and `body` beneath.
+    ///
+    /// Returning `Err` means the notification could not be *delivered* —
+    /// there is no notification daemon, or the bus call failed. Callers
+    /// treat that as unreportable rather than as a second failure to report:
+    /// notifying about a failed notification has nowhere to go.
+    fn notify(&self, summary: &str, body: &str) -> Result<(), VoiceMeError>;
 }
 
 /// Driven adapter port: detects and provisions runtime dependencies.

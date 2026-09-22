@@ -60,6 +60,15 @@ pub enum VoiceMeError {
     #[error("nothing to speak: the text is empty")]
     EmptyText,
 
+    /// There is no active Reference Voice Sample, so there is no voice to
+    /// clone. Its own variant rather than a `MissingRuntimeAsset` because
+    /// the fix is not "fetch this file" — nothing can be downloaded to
+    /// satisfy it. The user has to record or import a clip in Settings →
+    /// Voice, and the message has to say that rather than naming a path
+    /// they were never supposed to create by hand.
+    #[error("no Reference Voice Sample yet — record or import one in Settings → Voice")]
+    NoReferenceVoiceSample,
+
     #[error("{0}")]
     Other(String),
 }

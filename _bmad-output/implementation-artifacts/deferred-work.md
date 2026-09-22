@@ -64,3 +64,15 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-5-spike-in-process-chatterbox-inference-on-onnx-runtime.md`
   summary: Three WebGPU runs left core dumps on exit (Dawn cleanup after `VK_ERROR_DEVICE_LOST`), and `tests/reference_containers.rs` only covers the mp3/flac/ogg matrix row when `VOICE_ME_TEST_CLIPS` is set, so `cargo test --workspace` does not exercise it on its own.
   evidence: The core dumps affect only the off-by-default `webgpu-probe` build and not anything CI compiles. The container test was run manually against ffmpeg re-encodes of the user's own clip and passed; making it unconditional needs committed binary fixtures, which the crate deliberately avoids.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-6-generate-speech-from-the-prompt-overlay-text.md`
+  summary: A permanently failed session build re-shows the "still getting ready, your line will be spoken" notice on every Speak Action, promising something that will not happen.
+  evidence: `is_ready()` stays false when the build fails, and `speak_inner` notifies on `!is_ready()`. The failure notification does follow it, so the user is not left misled — but the smallest honest fix needs a "a build has already failed" signal on `TtsPort`, which is new public surface rather than a patch.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-6-generate-speech-from-the-prompt-overlay-text.md`
+  summary: The Speak Action queue is unordered and unbounded — rapid hotkey presses can be generated out of the order typed, and each waiter parks a Tokio blocking-pool thread.
+  evidence: `SessionSlot` serializes on a `std::sync::Mutex`, which makes no FIFO guarantee. Neither the spec's matrix nor the epic AC promises ordering (both say "queued, not concurrent"), so this is a quality gap rather than a deviation; settling it means a FIFO ticket queue and an in-flight cap.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-6-generate-speech-from-the-prompt-overlay-text.md`
+  summary: `voice-me-notify-linux`'s only test sets `DBUS_SESSION_BUS_ADDRESS` process-wide through `unsafe { set_var }`, which becomes racy the moment that crate gains a second test.
+  evidence: The SAFETY comment asserts a single-threaded body; cargo's harness is multi-threaded, and the assertion holds today only because the crate has exactly one test. Settling it means a scoped env guard or serialized execution.

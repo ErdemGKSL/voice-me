@@ -1,0 +1,14 @@
+[package]
+name = "voice-me-notify-linux"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+voice-me-core = { path = "../voice-me-core" }
+# The freedesktop `org.freedesktop.Notifications` D-Bus client. Default
+# features mean the pure-Rust `zbus` backend rather than the `libdbus` FFI
+# one, so this adds no C dependency — and `zbus` is already in the lock file
+# via gpui, so the edge costs nothing new. It is a *client*: it sends a
+# method call to whatever notification daemon the desktop runs, and
+# downloads nothing (AD-8).
+notify-rust = "4.18"

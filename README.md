@@ -16,10 +16,27 @@ with a single focused field. Type a line and press `Enter` to send it;
 `Escape`, or clicking away, closes it and discards what you typed. Dismissing
 the overlay never quits the app — it stays in the tray either way.
 
-**Nothing is spoken yet.** A confirmed line is currently only printed to
-stdout. Speech generation and playback arrive in later stories — but the
-speech engine itself already exists and can be driven on its own; see
-"Speech generation" below.
+A confirmed line is now actually generated (Story 2.6), in the speech
+language from `settings.toml` (`speech_language`, default `tr`), in the voice
+of the saved Reference Voice Sample. That needs the runtime assets below to
+be provisioned; without them the app starts normally and a desktop
+notification names the exact missing file the first time you press the
+hotkey.
+
+Generation runs on Tokio's blocking pool, never on the UI thread, and exactly
+one runs at a time — press the hotkey again mid-generation and the second
+line is queued. The sessions take ~90 s to build and are built once, eagerly
+at startup when a Reference Voice Sample already exists; a Speak Action that
+lands while that is still happening gets one "still getting ready"
+notification and its audio afterwards.
+
+**Nothing is played yet.** `VirtualMicPort::play` arrives in Story 2.9. Until
+then, set `VOICE_ME_DEBUG_WAV_DIR` to a directory and every generated
+utterance is written there as a wav to listen to:
+
+```bash
+VOICE_ME_DEBUG_WAV_DIR=/tmp/voice-me cargo run -p voice-me-app
+```
 
 ## Speech generation (spec-2-5 spike)
 

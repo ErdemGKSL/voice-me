@@ -11,6 +11,12 @@ path = "src/main.rs"
 gpui-kit = "0.6.4"
 voice-me-core = { path = "../voice-me-core" }
 voice-me-ui = { path = "../voice-me-ui" }
+# Story 2.6: the Speak Action now actually generates. The composition root
+# is the only place allowed to know both the port and its adapter.
+voice-me-tts = { path = "../voice-me-tts" }
+# Writing the generated buffer out under `VOICE_ME_DEBUG_WAV_DIR` so the
+# end-to-end path is listenable before Story 2.9 wires playback.
+hound = "3.5"
 # For the `AppEvent` channel (AD-3) — already resolved to 0.3.34 in
 # Cargo.lock via gpui's own dependency graph.
 futures = "0.3"
@@ -18,7 +24,13 @@ futures = "0.3"
 [target.'cfg(target_os = "linux")'.dependencies]
 voice-me-tray-linux = { path = "../voice-me-tray-linux" }
 voice-me-hotkey-linux = { path = "../voice-me-hotkey-linux" }
+voice-me-notify-linux = { path = "../voice-me-notify-linux" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 voice-me-tray-windows = { path = "../voice-me-tray-windows" }
 voice-me-hotkey-windows = { path = "../voice-me-hotkey-windows" }
+voice-me-notify-windows = { path = "../voice-me-notify-windows" }
+
+[dev-dependencies]
+# The composition-root tests write a debug wav into a throwaway directory.
+tempfile = "3.14"

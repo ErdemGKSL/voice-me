@@ -11,6 +11,8 @@ members = [
   "crates/voice-me-audio-windows",
   "crates/voice-me-tray-linux",
   "crates/voice-me-tray-windows",
+  "crates/voice-me-notify-linux",
+  "crates/voice-me-notify-windows",
   "crates/voice-me-tts",
   "crates/voice-me-deps",
   "crates/voice-me-tests",

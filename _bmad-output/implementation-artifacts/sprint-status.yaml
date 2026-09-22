@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-20-2026 19:26
-last_updated: 09-21-2026 16:30
+last_updated: 09-22-2026 00:00
 project: voice-me
 project_key: NOKEY
 tracking_system: file-system
@@ -49,7 +49,7 @@ development_status:
   2-3-configure-a-global-hotkey: review
   2-4-summon-type-and-dismiss-the-prompt-overlay: review
   2-5-spike-in-process-chatterbox-inference-on-onnx-runtime: review
-  2-6-generate-speech-from-the-prompt-overlay-text: backlog
+  2-6-generate-speech-from-the-prompt-overlay-text: review
   2-7-spike-linux-virtual-microphone-via-pipewire: backlog
   2-8-spike-windows-virtual-microphone-control-surface: backlog
   2-9-play-generated-audio-through-the-virtual-microphone: backlog

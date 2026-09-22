@@ -8538,11 +8538,16 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "gpui-kit",
+ "hound",
+ "tempfile",
  "voice-me-core",
  "voice-me-hotkey-linux",
  "voice-me-hotkey-windows",
+ "voice-me-notify-linux",
+ "voice-me-notify-windows",
  "voice-me-tray-linux",
  "voice-me-tray-windows",
+ "voice-me-tts",
  "voice-me-ui",
 ]
 
@@ -8600,6 +8605,21 @@ dependencies = [
 
 [[package]]
 name = "voice-me-i18n"
+version = "0.1.0"
+dependencies = [
+ "voice-me-core",
+]
+
+[[package]]
+name = "voice-me-notify-linux"
+version = "0.1.0"
+dependencies = [
+ "notify-rust",
+ "voice-me-core",
+]
+
+[[package]]
+name = "voice-me-notify-windows"
 version = "0.1.0"
 dependencies = [
  "voice-me-core",
