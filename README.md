@@ -30,13 +30,37 @@ at startup when a Reference Voice Sample already exists; a Speak Action that
 lands while that is still happening gets one "still getting ready"
 notification and its audio afterwards.
 
-**Nothing is played yet.** `VirtualMicPort::play` arrives in Story 2.9. Until
-then, set `VOICE_ME_DEBUG_WAV_DIR` to a directory and every generated
-utterance is written there as a wav to listen to:
+## The Virtual Microphone
+
+The generated line is played into a virtual microphone called `voice-me`
+(Story 2.9), not through your speakers. Select it as the input device in
+Discord, a browser mic test, or Sound settings, and what you type is what
+that application hears.
+
+On **Linux** the device is a PipeWire/PulseAudio null-sink published as a
+virtual source — no kernel driver, no `sudo`. The app installs it for you the
+first time it starts without it, in the background; it persists across
+reboots, because installing also writes one drop-in at
+`~/.config/pipewire/pipewire-pulse.conf.d/voice-me.conf`. Check it with:
 
 ```bash
-VOICE_ME_DEBUG_WAV_DIR=/tmp/voice-me cargo run -p voice-me-app
+pactl list short sources | grep voice-me   # expect exactly one entry
 ```
+
+Removing it is manual for now (a dependency row in Settings comes in Epic 3):
+
+```bash
+cargo run -p voice-me-audio-linux --bin mic-spike -- --uninstall
+```
+
+If the device is missing, duplicated, or there is no audio server, nothing is
+played — deliberately, since PulseAudio answers an unresolvable device by
+falling back to your speakers — and a desktop notification says which of
+those it was.
+
+On **Windows** the virtual microphone is not implemented yet (Story 2.8): the
+app runs and generates, and a Speak Action notifies that it has nowhere to
+play the result.
 
 ## Speech generation (spec-2-5 spike)
 

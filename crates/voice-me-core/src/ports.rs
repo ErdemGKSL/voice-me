@@ -32,7 +32,15 @@ pub trait HotkeyPort {
 }
 
 /// Driven adapter port: plays generated audio through the OS virtual microphone.
-pub trait VirtualMicPort {
+///
+/// `Send + Sync` for the same reason [`TtsPort`] and [`NotificationPort`]
+/// are: the Speak Action hands the generated buffer straight to `play`, and
+/// the whole action runs on Tokio's blocking pool through
+/// [`crate::tokio_bridge::spawn_blocking`] (AD-5). The adapter is therefore
+/// held as an `Arc<dyn VirtualMicPort>` shared between GPUI's main thread
+/// and that pool, and the port says so rather than leaving each composition
+/// root to discover it.
+pub trait VirtualMicPort: Send + Sync {
     /// Play a buffer of generated speech through the virtual microphone device.
     ///
     /// Takes the core-owned [`AudioBuffer`] (AD-11), not bytes: the format

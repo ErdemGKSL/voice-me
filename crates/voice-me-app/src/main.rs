@@ -20,6 +20,12 @@
 //! UI never freezes, and failures — plus the one genuinely unusual wait, a
 //! Speak Action that lands while the sessions are still being built — reach
 //! the user as OS-native notifications.
+//!
+//! Story 2.9 closes the loop: the per-OS `VirtualMicPort` adapter is built
+//! here and handed to `speak`, which plays the generated buffer through the
+//! Virtual Microphone instead of dropping it. The device itself is ensured
+//! once at startup, in the background, so a fresh machine needs no manual
+//! setup step (spec-2-9 Decision 1).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -32,13 +38,19 @@ use gpui_kit::{
     App, AppContext as _, QuitMode, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
     WindowHandle, WindowKind, WindowOptions, px, size,
 };
+#[cfg(target_os = "linux")]
+use voice_me_core::VoiceMeError;
 use voice_me_core::{
-    AppEvent, AppState, AudioBuffer, FileSettingsStore, HotkeyPort, NotificationPort,
-    SettingsStore, SpeechBackend, TtsPort, tokio_bridge,
+    AppEvent, AppState, FileSettingsStore, HotkeyPort, NotificationPort, SettingsStore,
+    SpeechBackend, TtsPort, VirtualMicPort, tokio_bridge,
 };
 use voice_me_tts::TtsAdapter;
 use voice_me_ui::{PromptOverlayView, SettingsView};
 
+#[cfg(target_os = "linux")]
+use voice_me_audio_linux::LinuxVirtualMicAdapter;
+#[cfg(target_os = "windows")]
+use voice_me_audio_windows::WindowsVirtualMicAdapter;
 #[cfg(target_os = "linux")]
 use voice_me_hotkey_linux::LinuxHotkeyAdapter;
 #[cfg(target_os = "windows")]
@@ -92,15 +104,6 @@ fn overlay_window_kind_for(session: voice_me_hotkey_linux::SessionKind) -> Windo
 fn overlay_window_kind() -> WindowKind {
     WindowKind::PopUp
 }
-
-/// Set on a directory path, every generated utterance is also written there
-/// as a wav.
-///
-/// The temporary seam Story 2.9 removes. `VirtualMicPort::play` is still
-/// `todo!()`, so handing it the buffer would panic — this story stops at a
-/// produced `AudioBuffer`, and this gate is what makes the end-to-end path
-/// listenable in the meantime.
-const DEBUG_WAV_DIR_VAR: &str = "VOICE_ME_DEBUG_WAV_DIR";
 
 /// The AD-9 resolved speech backend for this run.
 ///
@@ -158,58 +161,110 @@ fn notify_engine_unavailable(notifications: &dyn NotificationPort, reason: Optio
     }
 }
 
-/// What this story does with a finished utterance, in place of playback.
-fn report_generated(audio: &AudioBuffer) {
-    println!(
-        "generated {:.2} s of speech ({} samples @ {} Hz)",
-        audio.duration().as_secs_f64(),
-        audio.len(),
-        audio.sample_rate()
-    );
+/// The `VirtualMicPort` used when the per-OS adapter could not even be
+/// constructed — on Linux, a config directory that will not resolve.
+///
+/// A stand-in rather than an `Option<Arc<dyn VirtualMicPort>>` on purpose:
+/// `speak` already owns the promise that a failed Speak Action tells the
+/// user exactly once, in words, and a `None` here would mean re-implementing
+/// that promise in the event loop for one rare cause. Instead the failure
+/// becomes the same domain error every other virtual-mic failure is, carries
+/// its original reason, and travels the one path that is already tested.
+///
+/// Linux-only because it is the only OS whose adapter has a fallible
+/// constructor; `WindowsVirtualMicAdapter` says the same thing itself.
+#[cfg(target_os = "linux")]
+struct UnavailableVirtualMic(String);
 
-    let Some(dir) = std::env::var_os(DEBUG_WAV_DIR_VAR) else {
-        return;
-    };
-    let path = std::path::PathBuf::from(dir).join(format!(
-        "voice-me-{}.wav",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_millis())
-            .unwrap_or_default()
-    ));
-    if let Err(error) = write_wav(&path, audio) {
-        eprintln!("could not write the debug wav: {error}");
-    } else {
-        println!("wrote {}", path.display());
+#[cfg(target_os = "linux")]
+impl VirtualMicPort for UnavailableVirtualMic {
+    fn play(&self, _audio: &voice_me_core::AudioBuffer) -> Result<(), VoiceMeError> {
+        Err(VoiceMeError::VirtualMicUnavailable(self.0.clone()))
     }
 }
 
-/// 16-bit PCM, because that is what every audio player opens without
-/// comment. The engine's own buffer stays f32 (AD-11) — this conversion
-/// exists only so a human can listen to the result.
-fn write_wav(path: &std::path::Path, audio: &AudioBuffer) -> Result<(), String> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate: audio.sample_rate(),
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-    // The directory is whatever the user put in the environment variable,
-    // so it routinely does not exist yet — including for the README's own
-    // `/tmp/voice-me` example on a freshly booted machine. Creating it is
-    // the difference between a listenable wav and a line in the log nobody
-    // reads.
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| format!("{parent:?}: {error}"))?;
+/// What a startup ensure did, so the caller can say so and a test can
+/// assert it without a running audio server.
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum EnsureOutcome {
+    /// The machine was already set up: nothing loaded, nothing written.
+    AlreadyPresent,
+    /// The device was absent and is now installed; the drop-in is at this path.
+    Installed(std::path::PathBuf),
+    /// Nothing could be done, and this is why. Never fatal — the Speak
+    /// Action's own notification is what reaches the user.
+    Failed(String),
+}
+
+/// The two adapter calls the startup ensure makes, named so the sequence
+/// between them is testable.
+///
+/// A private trait in the composition root rather than new public surface in
+/// `voice-me-audio-linux`: the ordering decision — check first, install only
+/// if absent, never propagate — belongs to this file, and it is the only
+/// part of Decision 1 that a live-device test cannot already reach.
+#[cfg(target_os = "linux")]
+trait VirtualMicInstaller {
+    fn is_present(&self) -> Result<bool, VoiceMeError>;
+    fn install(&self) -> Result<std::path::PathBuf, VoiceMeError>;
+}
+
+#[cfg(target_os = "linux")]
+impl VirtualMicInstaller for LinuxVirtualMicAdapter {
+    fn is_present(&self) -> Result<bool, VoiceMeError> {
+        LinuxVirtualMicAdapter::is_present(self)
     }
-    let mut writer =
-        hound::WavWriter::create(path, spec).map_err(|error| format!("{path:?}: {error}"))?;
-    for &sample in audio.samples() {
-        writer
-            .write_sample((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
-            .map_err(|error| error.to_string())?;
+
+    fn install(&self) -> Result<std::path::PathBuf, VoiceMeError> {
+        LinuxVirtualMicAdapter::install(self)
     }
-    writer.finalize().map_err(|error| error.to_string())
+}
+
+/// Decision 1, as a decision: check, install only if absent, and turn every
+/// failure into a description rather than a propagated error.
+///
+/// [`LinuxVirtualMicAdapter::install`] is idempotent and already refuses to
+/// leave two devices behind, so "ensure" is the whole contract — the
+/// presence check in front of it exists only so a machine that is already
+/// set up loads no module and writes no file. A failed check is not followed
+/// by an install attempt: no audio server to ask is also no audio server to
+/// install into.
+#[cfg(target_os = "linux")]
+fn ensure_device(installer: &dyn VirtualMicInstaller) -> EnsureOutcome {
+    match installer.is_present() {
+        Ok(true) => return EnsureOutcome::AlreadyPresent,
+        Ok(false) => {}
+        Err(error) => {
+            return EnsureOutcome::Failed(format!(
+                "could not check for the virtual microphone: {error}"
+            ));
+        }
+    }
+
+    match installer.install() {
+        Ok(conf) => EnsureOutcome::Installed(conf),
+        Err(error) => {
+            EnsureOutcome::Failed(format!("could not install the virtual microphone: {error}"))
+        }
+    }
+}
+
+/// Say what the startup ensure did, and nothing more.
+///
+/// Every failure is logged and swallowed: an app that will not launch
+/// because an audio server is missing would be worse than one whose first
+/// Speak Action says so in a notification.
+#[cfg(target_os = "linux")]
+fn report_ensure(outcome: EnsureOutcome) {
+    match outcome {
+        EnsureOutcome::AlreadyPresent => {}
+        EnsureOutcome::Installed(conf) => println!(
+            "installed the virtual microphone; drop-in at {}",
+            conf.display()
+        ),
+        EnsureOutcome::Failed(reason) => eprintln!("{reason}"),
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -323,19 +378,136 @@ mod tests {
         assert_eq!(notifier.shown.lock().unwrap().len(), 1);
     }
 
+    /// A stand-in for the two adapter calls the startup ensure makes, so
+    /// Decision 1's sequencing is checked without an audio server.
+    struct FakeInstaller {
+        /// The presence answer, or the `VirtualMicUnavailable` reason this
+        /// device is unreachable for. Reasons are held as `String`s rather
+        /// than `VoiceMeError`s only because the latter is not `Clone`; each
+        /// is returned verbatim, so the test sees the error shape the real
+        /// adapter produces rather than one wrapped a second time.
+        present: Result<bool, String>,
+        install_fails_with: Option<String>,
+        installs: Mutex<usize>,
+    }
+
+    impl FakeInstaller {
+        fn present(present: bool) -> Self {
+            Self {
+                present: Ok(present),
+                install_fails_with: None,
+                installs: Mutex::new(0),
+            }
+        }
+
+        fn unreachable() -> Self {
+            Self {
+                present: Err("no audio server to connect to".to_string()),
+                install_fails_with: None,
+                installs: Mutex::new(0),
+            }
+        }
+
+        fn install_fails(reason: &str) -> Self {
+            Self {
+                install_fails_with: Some(reason.to_string()),
+                ..Self::present(false)
+            }
+        }
+    }
+
+    impl VirtualMicInstaller for FakeInstaller {
+        fn is_present(&self) -> Result<bool, VoiceMeError> {
+            match &self.present {
+                Ok(present) => Ok(*present),
+                Err(reason) => Err(VoiceMeError::VirtualMicUnavailable(reason.clone())),
+            }
+        }
+
+        fn install(&self) -> Result<std::path::PathBuf, VoiceMeError> {
+            *self.installs.lock().unwrap() += 1;
+            match self.install_fails_with.as_ref() {
+                Some(reason) => Err(VoiceMeError::VirtualMicUnavailable(reason.clone())),
+                None => Ok(std::path::PathBuf::from("/tmp/voice-me.conf")),
+            }
+        }
+    }
+
+    /// A machine that is already set up must load no module and write no
+    /// file — that is the only reason the presence check exists.
     #[test]
-    fn the_debug_wav_lands_in_a_directory_that_did_not_exist_yet() {
-        let root = tempfile::tempdir().unwrap();
-        // The README's own example points at a path that does not exist on a
-        // freshly booted machine.
-        let path = root.path().join("voice-me").join("utterance.wav");
+    fn a_device_that_is_already_there_is_left_alone() {
+        let installer = FakeInstaller::present(true);
 
-        write_wav(&path, &AudioBuffer::new(vec![0.5; 240])).unwrap();
+        assert_eq!(ensure_device(&installer), EnsureOutcome::AlreadyPresent);
+        assert_eq!(*installer.installs.lock().unwrap(), 0);
+    }
 
-        let reader = hound::WavReader::open(&path).unwrap();
-        assert_eq!(reader.spec().sample_rate, voice_me_core::SAMPLE_RATE);
-        assert_eq!(reader.spec().channels, 1);
-        assert_eq!(reader.len(), 240);
+    /// Decision 1's whole point: a fresh machine ends up with a device
+    /// without the user running anything by hand.
+    #[test]
+    fn an_absent_device_is_installed_once() {
+        let installer = FakeInstaller::present(false);
+
+        assert_eq!(
+            ensure_device(&installer),
+            EnsureOutcome::Installed(std::path::PathBuf::from("/tmp/voice-me.conf"))
+        );
+        assert_eq!(*installer.installs.lock().unwrap(), 1);
+    }
+
+    /// No audio server to ask is also no audio server to install into, and
+    /// neither is a reason to refuse to launch: the first Speak Action is
+    /// what tells the user, through its own notification.
+    #[test]
+    fn an_unreachable_audio_server_is_described_and_never_installed_into() {
+        let installer = FakeInstaller::unreachable();
+
+        let outcome = ensure_device(&installer);
+
+        assert!(
+            matches!(&outcome, EnsureOutcome::Failed(reason) if reason.contains("audio server")),
+            "the reason has to survive for the log: {outcome:?}"
+        );
+        assert_eq!(*installer.installs.lock().unwrap(), 0);
+    }
+
+    /// The other half of the non-fatal promise: the check succeeded and the
+    /// install itself is what failed. The app still launches; the reason is
+    /// carried out for the log rather than propagated.
+    #[test]
+    fn an_install_that_fails_is_described_and_never_propagated() {
+        let installer = FakeInstaller::install_fails("the config directory is read-only");
+
+        let outcome = ensure_device(&installer);
+
+        assert!(
+            matches!(&outcome, EnsureOutcome::Failed(reason) if reason.contains("read-only")),
+            "the reason has to survive for the log: {outcome:?}"
+        );
+        assert_eq!(
+            *installer.installs.lock().unwrap(),
+            1,
+            "the install was attempted — it is the failing step, not a skipped one"
+        );
+    }
+
+    /// An adapter that could not be constructed still has to fail the way
+    /// every other virtual-mic failure does, carrying its reason, so `speak`
+    /// notifies once and names the right half of the app.
+    #[test]
+    fn a_virtual_microphone_that_could_not_be_built_fails_as_a_domain_error() {
+        let mic = UnavailableVirtualMic("no config directory".to_string());
+
+        let error = mic
+            .play(&voice_me_core::AudioBuffer::new(vec![0.1; 24]))
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, VoiceMeError::VirtualMicUnavailable(reason)
+                if reason.contains("no config directory")),
+            "the startup reason has to survive to the notification: {error}"
+        );
     }
 
     #[test]
@@ -434,6 +606,46 @@ fn main() {
         let notification_port: Arc<dyn NotificationPort> = Arc::new(LinuxNotificationAdapter);
         #[cfg(target_os = "windows")]
         let notification_port: Arc<dyn NotificationPort> = Arc::new(WindowsNotificationAdapter);
+
+        // Story 2.9: where the generated line actually goes. Built beside
+        // the notification port because `speak` needs both — the second is
+        // how the user hears about the first not working.
+        //
+        // Built exactly once and shared with the startup ensure below: two
+        // constructions of the same adapter would report one unresolvable
+        // config directory twice, in two different sentences, and could in
+        // principle disagree about it.
+        #[cfg(target_os = "linux")]
+        let (virtual_mic_port, mic_adapter): (
+            Arc<dyn VirtualMicPort>,
+            Option<Arc<LinuxVirtualMicAdapter>>,
+        ) = match LinuxVirtualMicAdapter::new() {
+            Ok(adapter) => {
+                let adapter = Arc::new(adapter);
+                (adapter.clone(), Some(adapter))
+            }
+            Err(error) => {
+                eprintln!("could not set up the virtual microphone: {error}");
+                (Arc::new(UnavailableVirtualMic(error.to_string())), None)
+            }
+        };
+        // Story 2.8 implements this; until then `play` returns a domain
+        // error naming itself rather than panicking on the first Speak
+        // Action (spec-2-9 Decision 2).
+        #[cfg(target_os = "windows")]
+        let virtual_mic_port: Arc<dyn VirtualMicPort> = Arc::new(WindowsVirtualMicAdapter);
+
+        // Decision 1: the device is ensured at launch, off the main thread —
+        // `cx.background_spawn` rather than the Tokio bridge, because this
+        // must happen even on a run where the runtime would not start, and
+        // it is the only thing standing between a fresh machine and a Speak
+        // Action nobody hears. An adapter that could not be built has
+        // already said so; there is nothing to ensure with.
+        #[cfg(target_os = "linux")]
+        if let Some(adapter) = mic_adapter {
+            cx.background_spawn(async move { report_ensure(ensure_device(adapter.as_ref())) })
+                .detach();
+        }
 
         // The hotkey adapter is built here, with the shared `AppEvent`
         // sender, but binds nothing until there is a combination to bind —
@@ -642,6 +854,7 @@ fn main() {
                     AppEvent::SpeakRequested { text } => {
                         let settings_store = settings_store.clone();
                         let notifications = notification_port.clone();
+                        let virtual_mic = virtual_mic_port.clone();
                         let Some(tts) = tts_port.clone() else {
                             // The engine never came up at startup. Say so
                             // rather than dropping the line silently — this
@@ -667,13 +880,24 @@ fn main() {
                         cx.update(|cx| {
                             let state = current_state(&settings_store);
                             let work = tokio_bridge::spawn_blocking(cx, move || {
+                                // Generation *and* playback, on the blocking
+                                // pool: `play` blocks until the audio server
+                                // has drained the buffer (AD-5).
                                 let audio = voice_me_core::speak(
                                     &text,
                                     &state,
                                     tts.as_ref(),
+                                    virtual_mic.as_ref(),
                                     notifications.as_ref(),
                                 )?;
-                                report_generated(&audio);
+                                // A working run is otherwise indistinguishable
+                                // from a broken one: nothing is written, and
+                                // the audio went somewhere only another
+                                // application can hear.
+                                println!(
+                                    "spoke {:.2} s of generated speech",
+                                    audio.duration().as_secs_f64()
+                                );
                                 Ok(())
                             });
 

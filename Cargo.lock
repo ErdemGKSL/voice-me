@@ -8586,8 +8586,8 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "gpui-kit",
- "hound",
- "tempfile",
+ "voice-me-audio-linux",
+ "voice-me-audio-windows",
  "voice-me-core",
  "voice-me-hotkey-linux",
  "voice-me-hotkey-windows",

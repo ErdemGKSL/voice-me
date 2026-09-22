@@ -36,20 +36,43 @@ fn fixture() -> (tempfile::TempDir, LinuxVirtualMicAdapter) {
     (temp, adapter)
 }
 
-/// The acceptance criterion itself: another application selecting
-/// the Virtual Microphone receives what voice-me played.
+/// Run `mic-spike` with `args` while an independent `parecord` client is
+/// attached to the Virtual Microphone, and return the child's result
+/// alongside what that client heard.
 ///
-/// Both halves are separate processes on purpose — `parecord`
-/// captures exactly as Discord would, and the playing side is the
-/// `mic-spike` binary rather than this test, because a playback
-/// stream opened from the cargo test binary is routed to the
-/// default sink despite carrying the right `target.object` (see
-/// `src/bin/mic-spike.rs`).
-#[test]
-#[ignore = "needs a running audio server and `parecord`"]
-fn audio_played_into_the_device_reaches_a_capture_client() {
-    let (temp, adapter) = fixture();
+/// Nothing is asserted here: the caller has a device to uninstall first, and
+/// a `mic-spike` that failed — precisely the run being debugged — must not
+/// leave a null-sink module loaded on the developer's machine because a
+/// helper panicked on the way out.
+///
+/// Both halves are separate processes on purpose — `parecord` captures
+/// exactly as Discord would, and the playing side is the `mic-spike` binary
+/// rather than this test, because a playback stream opened from the cargo
+/// test binary is routed to the default sink despite carrying the right
+/// `target.object` (see `src/bin/mic-spike.rs`).
+fn capture_while_mic_spike_runs(
+    temp: &tempfile::TempDir,
+    args: &[&str],
+) -> (std::process::Output, Vec<u8>) {
     let capture = temp.path().join("capture.raw");
+
+    // The device has to exist *before* `parecord` is told to attach to it:
+    // a recorder pointed at a name that is not there yet captures nothing
+    // and reports no error, which reads exactly like a routing failure —
+    // and with each of these tests uninstalling on its way out, the second
+    // one to run would always find nothing there. The playing child below
+    // still installs for itself, because only the process that loaded the
+    // module can address it by name; pipewire-pulse moves the attached
+    // recorder onto the replacement node.
+    let installed = std::process::Command::new(env!("CARGO_BIN_EXE_mic-spike"))
+        .arg("--install-only")
+        .env("XDG_CONFIG_HOME", temp.path())
+        .output()
+        .expect("run mic-spike --install-only");
+    assert!(
+        installed.status.success(),
+        "mic-spike --install-only failed: {installed:?}"
+    );
 
     let mut recorder = std::process::Command::new("parecord")
         .args([
@@ -67,26 +90,31 @@ fn audio_played_into_the_device_reaches_a_capture_client() {
     // joins late hears only the tail.
     std::thread::sleep(std::time::Duration::from_millis(700));
 
-    // The child installs rather than using `--play-only`: a device created
-    // by *this* process is one the child cannot address by name, the same
-    // unexplained routing asymmetry that made `mic-spike` a bin in the
-    // first place. `XDG_CONFIG_HOME` points its drop-in at the temp
-    // directory, so the developer's real config is still never touched.
+    // `XDG_CONFIG_HOME` points the drop-in at the temp directory, so the
+    // developer's real config is never touched by either child.
     let played = std::process::Command::new(env!("CARGO_BIN_EXE_mic-spike"))
+        .args(args)
         .env("XDG_CONFIG_HOME", temp.path())
         .output();
 
     recorder.kill().expect("stop parecord");
     recorder.wait().expect("reap parecord");
-    adapter.uninstall().expect("uninstall");
 
-    let played = played.expect("run mic-spike");
-    assert!(played.status.success(), "mic-spike failed: {played:?}");
+    (
+        played.expect("run mic-spike"),
+        std::fs::read(&capture).expect("capture file"),
+    )
+}
 
-    let captured = std::fs::read(&capture).expect("capture file");
-    // Distinguish "the recorder never captured anything" from "it captured
-    // silence" — otherwise a broken `parecord` invocation reports itself as
-    // a routing failure and sends the reader hunting in the wrong place.
+/// The loudest sample in a raw `float32le` capture.
+///
+/// Asserts first that the capture holds at least a second of audio: a
+/// `parecord` that never attached yields an empty file whose peak folds to
+/// `0.0`, indistinguishable from a device that received silence. Failing on
+/// the length here is what keeps "the recorder was broken" from being
+/// reported as "the audio was routed to the speakers" and sending the reader
+/// hunting in the wrong place.
+fn peak_of(captured: &[u8]) -> f32 {
     assert!(
         captured.len() > SAMPLE_RATE as usize,
         "parecord captured {} bytes, far less than a second — it did not \
@@ -95,15 +123,56 @@ fn audio_played_into_the_device_reaches_a_capture_client() {
     );
 
     let (samples, _) = captured.as_chunks::<{ size_of::<f32>() }>();
-    let peak = samples
+    samples
         .iter()
         .map(|chunk| f32::from_le_bytes(*chunk).abs())
-        .fold(0.0f32, f32::max);
+        .fold(0.0f32, f32::max)
+}
 
+/// The acceptance criterion itself: another application selecting
+/// the Virtual Microphone receives what voice-me played.
+#[test]
+#[ignore = "needs a running audio server and `parecord`"]
+fn audio_played_into_the_device_reaches_a_capture_client() {
+    let (temp, adapter) = fixture();
+
+    let (played, captured) = capture_while_mic_spike_runs(&temp, &[]);
+
+    adapter.uninstall().expect("uninstall");
+    assert!(played.status.success(), "mic-spike failed: {played:?}");
+
+    let peak = peak_of(&captured);
     assert!(
         peak > 0.05,
         "the capture client heard {peak}, i.e. silence — the audio was routed \
              somewhere other than the Virtual Microphone"
+    );
+}
+
+/// Story 2.9's own row: not `play` called directly, but the whole Speak
+/// Action — `voice_me_core::speak` handing what the `TtsPort` returned
+/// straight to `VirtualMicPort::play` — landing on a capture client.
+///
+/// The four rows above prove the *device*; this one proves the *path*, which
+/// is the thing this story added and the thing a future refactor of `speak`
+/// could silently break. The child's `TtsPort` is a stub returning an
+/// utterance-shaped buffer: the real engine would add 1.56 GB of model files
+/// to a check about routing.
+#[test]
+#[ignore = "needs a running audio server and `parecord`"]
+fn a_speak_action_reaches_a_capture_client() {
+    let (temp, adapter) = fixture();
+
+    let (played, captured) = capture_while_mic_spike_runs(&temp, &["--speak"]);
+
+    adapter.uninstall().expect("uninstall");
+    assert!(played.status.success(), "mic-spike failed: {played:?}");
+
+    let peak = peak_of(&captured);
+    assert!(
+        peak > 0.05,
+        "the capture client heard {peak}, i.e. silence — the generated line \
+         never reached the Virtual Microphone"
     );
 }
 

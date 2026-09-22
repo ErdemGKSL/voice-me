@@ -18,7 +18,10 @@ pub use ports::{
     VirtualMicPort,
 };
 pub use settings_store::FileSettingsStore;
-pub use speak::{GENERATION_FAILED_SUMMARY, STILL_WORKING_BODY, STILL_WORKING_SUMMARY, speak};
+pub use speak::{
+    GENERATION_FAILED_SUMMARY, PLAYBACK_FAILED_SUMMARY, STILL_WORKING_BODY, STILL_WORKING_SUMMARY,
+    speak,
+};
 pub use state::{
     AppState, DEFAULT_SPEECH_LANGUAGE, DEFAULT_UI_LANGUAGE, SpeechBackend, SpeechExecutionTarget,
     SpeechWeights,

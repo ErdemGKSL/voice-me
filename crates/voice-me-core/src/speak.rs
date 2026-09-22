@@ -1,20 +1,36 @@
 //! The Speak Action, as a use-case function.
 //!
 //! The Prompt Overlay sends `AppEvent::SpeakRequested` and closes (AD-10);
-//! everything after that is this function. It lives in the hexagon rather
-//! than in `voice-me-app` for one reason: it is the place that decides *what
-//! the user is told when generation goes wrong*, and that decision is domain
+//! everything after that is this function: generate the utterance, then play
+//! it through the Virtual Microphone. It lives in the hexagon rather than in
+//! `voice-me-app` for one reason: it is the place that decides *what the
+//! user is told when the action goes wrong*, and that decision is domain
 //! policy, not composition. Put in `main.rs` it would only be testable
-//! through a running GPUI app; here it is a plain function over two port
-//! trait objects.
+//! through a running GPUI app; here it is a plain function over port trait
+//! objects.
 //!
 //! It is written to be called from Tokio's blocking pool — it blocks for the
-//! whole generation — never from GPUI's main thread.
+//! whole generation and for the whole of playback — never from GPUI's main
+//! thread.
+
+use std::sync::Mutex;
 
 use crate::audio::AudioBuffer;
 use crate::error::VoiceMeError;
-use crate::ports::{NotificationPort, TtsPort};
+use crate::ports::{NotificationPort, TtsPort, VirtualMicPort};
 use crate::state::AppState;
+
+/// Held across [`VirtualMicPort::play`], so one utterance finishes draining
+/// before the next one starts.
+///
+/// The TTS adapter's own session mutex does not cover this: it is released
+/// the moment `generate` returns, which is *before* playback begins. Two
+/// Speak Actions therefore overlap here whenever generation is faster than
+/// the previous utterance takes to play — sub-realtime generation is the
+/// normal case on the `cuda` build — and two streams into one device mix
+/// rather than queue. The matrix promises "queued behind the first, both
+/// heard in full", and this is what keeps that promise.
+static PLAYBACK: Mutex<()> = Mutex::new(());
 
 /// The speech languages v1 generates in (AD-12): the ones that need no
 /// Python-only text normalization. Chinese, Japanese, Hebrew and Korean are
@@ -28,6 +44,14 @@ const SUPPORTED_SPEECH_LANGUAGES: [&str; 2] = ["tr", "en"];
 /// was not spoken" — while what went wrong differs every time.
 pub const GENERATION_FAILED_SUMMARY: &str = "Couldn't generate speech.";
 
+/// The title a *playback* failure carries instead.
+///
+/// The speech was generated: what is missing is its way out. Telling the
+/// user "couldn't generate speech" there would send them after the model
+/// cache when the fix is the Virtual Microphone device, which is exactly the
+/// distinction [`VoiceMeError::VirtualMicUnavailable`] exists to keep.
+pub const PLAYBACK_FAILED_SUMMARY: &str = "Couldn't reach the virtual microphone.";
+
 /// The title of the one "this is taking a while" notification.
 pub const STILL_WORKING_SUMMARY: &str = "voice-me is still getting ready.";
 
@@ -37,31 +61,39 @@ pub const STILL_WORKING_BODY: &str = "Loading the speech engine — this happens
      Your line will be spoken as soon as it's done.";
 
 /// Run one Speak Action: generate `text` in the configured speech language,
-/// in the voice of the active Reference Voice Sample.
+/// in the voice of the active Reference Voice Sample, and play it through
+/// the Virtual Microphone.
 ///
 /// Notifies on failure — exactly once, whatever failed — and, when the
 /// sessions are not built yet, notifies once up front that the wait is the
 /// engine starting rather than the utterance being slow (spec-2-6 Decision
 /// 4). A normal generation notifies nothing at all.
 ///
-/// Returns the generated audio. This story stops there: `VirtualMicPort::play`
-/// is still `todo!()` until Story 2.9, so handing the buffer to it would
-/// panic. The caller logs it (and optionally writes it as a wav) instead.
+/// The generated audio is played through `virtual_mic` before this returns,
+/// so a `Ok` means the line was actually spoken and drained by the audio
+/// server — not merely generated. The buffer is returned as well, unchanged,
+/// for callers that want to log or measure it.
 pub fn speak(
     text: &str,
     state: &AppState,
     tts: &dyn TtsPort,
+    virtual_mic: &dyn VirtualMicPort,
     notifications: &dyn NotificationPort,
 ) -> Result<AudioBuffer, VoiceMeError> {
-    match speak_inner(text, state, tts, notifications) {
+    match speak_inner(text, state, tts, virtual_mic, notifications) {
         Ok(audio) => Ok(audio),
         Err(error) => {
+            // A missing device and a failed generation have different fixes,
+            // so they get different titles. Everything else — the body, the
+            // exactly-once promise — is the same.
+            let summary = match error {
+                VoiceMeError::VirtualMicUnavailable(_) => PLAYBACK_FAILED_SUMMARY,
+                _ => GENERATION_FAILED_SUMMARY,
+            };
             // A notification that cannot be delivered has nowhere to be
             // reported to, so it is logged and the original failure — the
             // one the caller actually asked about — is returned intact.
-            if let Err(delivery) =
-                notifications.notify(GENERATION_FAILED_SUMMARY, &error.to_string())
-            {
+            if let Err(delivery) = notifications.notify(summary, &error.to_string()) {
                 eprintln!("could not show the failure notification: {delivery}");
             }
             Err(error)
@@ -73,6 +105,7 @@ fn speak_inner(
     text: &str,
     state: &AppState,
     tts: &dyn TtsPort,
+    virtual_mic: &dyn VirtualMicPort,
     notifications: &dyn NotificationPort,
 ) -> Result<AudioBuffer, VoiceMeError> {
     // The overlay already drops a whitespace-only line, so this is a
@@ -112,7 +145,19 @@ fn speak_inner(
         eprintln!("could not show the still-working notification: {delivery}");
     }
 
-    tts.generate(text, reference_clip, &language)
+    let audio = tts.generate(text, reference_clip, &language)?;
+
+    // The AD-11 buffer crosses straight from one port to the other,
+    // unconverted: 24 kHz mono f32 is what the decoder emits and what the
+    // adapter declares to the audio server. `play` blocks until the server
+    // has drained it, which is why this whole function belongs on the AD-5
+    // blocking pool — and why the wait for the lock is the queue the matrix
+    // describes. A poisoned lock means a previous `play` panicked; the next
+    // utterance is still better off spoken than refused.
+    let _playing = PLAYBACK.lock().unwrap_or_else(|poison| poison.into_inner());
+    virtual_mic.play(&audio)?;
+
+    Ok(audio)
 }
 
 #[cfg(test)]
@@ -156,6 +201,62 @@ mod tests {
                 .iter()
                 .map(|(_, body)| body.clone())
                 .collect()
+        }
+    }
+
+    /// A `VirtualMicPort` that records the buffers it played and can be told
+    /// to be unavailable. No audio server, no device.
+    ///
+    /// Like `ExclusiveTts`, it also notices overlap: a device that two
+    /// utterances reach at once is the failure `PLAYBACK` exists to prevent,
+    /// and counting calls cannot tell a queue from a collision.
+    #[derive(Default)]
+    struct FakeMic {
+        played: Mutex<Vec<Vec<f32>>>,
+        /// The `VirtualMicUnavailable` reason, if this device is missing. A
+        /// `String` rather than a `VoiceMeError` because the failure is a
+        /// standing condition — a missing device does not become present
+        /// because it was asked twice — and `VoiceMeError` is not `Clone`.
+        unavailable: Option<String>,
+        in_flight: AtomicUsize,
+        overlapped: AtomicBool,
+    }
+
+    impl FakeMic {
+        fn unavailable(reason: &str) -> Self {
+            Self {
+                unavailable: Some(reason.to_string()),
+                ..Self::default()
+            }
+        }
+
+        fn played(&self) -> Vec<Vec<f32>> {
+            self.played.lock().unwrap().clone()
+        }
+    }
+
+    impl VirtualMicPort for FakeMic {
+        fn play(&self, audio: &AudioBuffer) -> Result<(), VoiceMeError> {
+            // Before anything is recorded: audio handed to a device that is
+            // not there was never played.
+            if let Some(reason) = self.unavailable.as_ref() {
+                return Err(VoiceMeError::VirtualMicUnavailable(reason.clone()));
+            }
+
+            if self.in_flight.fetch_add(1, Ordering::SeqCst) != 0 {
+                self.overlapped.store(true, Ordering::SeqCst);
+            }
+            // Deliberately longer than `ExclusiveTts`'s own 20 ms: the
+            // second action cannot start playing until it has generated, so
+            // a playback shorter than a generation would drain before the
+            // next one arrives and the overlap this guards would never be
+            // reachable — which is the real shape of the bug, an utterance
+            // that takes longer to play than the next takes to generate.
+            std::thread::sleep(Duration::from_millis(60));
+            self.played.lock().unwrap().push(audio.samples().to_vec());
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+
+            Ok(())
         }
     }
 
@@ -231,8 +332,9 @@ mod tests {
     fn a_normal_generation_notifies_nothing() {
         let tts = FakeTts::default();
         let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
 
-        let audio = speak("Merhaba", &state_with_a_sample(), &tts, &notifier).unwrap();
+        let audio = speak("Merhaba", &state_with_a_sample(), &tts, &mic, &notifier).unwrap();
 
         assert!(!audio.is_empty());
         assert!(
@@ -254,12 +356,13 @@ mod tests {
     fn no_reference_voice_sample_notifies_and_never_touches_the_engine() {
         let tts = FakeTts::default();
         let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
         let state = AppState {
             speech_language: "tr".to_string(),
             ..AppState::default()
         };
 
-        let error = speak("Merhaba", &state, &tts, &notifier).unwrap_err();
+        let error = speak("Merhaba", &state, &tts, &mic, &notifier).unwrap_err();
 
         assert!(matches!(error, VoiceMeError::NoReferenceVoiceSample));
         assert!(
@@ -281,8 +384,9 @@ mod tests {
             path: missing.clone(),
         });
         let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
 
-        let error = speak("Merhaba", &state_with_a_sample(), &tts, &notifier).unwrap_err();
+        let error = speak("Merhaba", &state_with_a_sample(), &tts, &mic, &notifier).unwrap_err();
 
         assert!(matches!(error, VoiceMeError::MissingRuntimeAsset { .. }));
         assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
@@ -299,8 +403,9 @@ mod tests {
             "conditional_decoder: device lost".to_string(),
         ));
         let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
 
-        let result = speak("Merhaba", &state_with_a_sample(), &tts, &notifier);
+        let result = speak("Merhaba", &state_with_a_sample(), &tts, &mic, &notifier);
 
         assert!(
             result.is_err(),
@@ -318,8 +423,9 @@ mod tests {
     fn a_cold_engine_notifies_once_and_still_produces_the_audio() {
         let tts = FakeTts::cold();
         let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
 
-        let audio = speak("Merhaba", &state_with_a_sample(), &tts, &notifier).unwrap();
+        let audio = speak("Merhaba", &state_with_a_sample(), &tts, &mic, &notifier).unwrap();
 
         assert!(!audio.is_empty(), "the audio still arrives afterwards");
         assert_eq!(
@@ -333,12 +439,13 @@ mod tests {
     fn an_unsupported_speech_language_is_refused_by_name_before_the_engine() {
         let tts = FakeTts::default();
         let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
         let state = AppState {
             speech_language: "turkish".to_string(),
             ..state_with_a_sample()
         };
 
-        let error = speak("Merhaba", &state, &tts, &notifier).unwrap_err();
+        let error = speak("Merhaba", &state, &tts, &mic, &notifier).unwrap_err();
 
         assert!(
             tts.calls.lock().unwrap().is_empty(),
@@ -356,12 +463,13 @@ mod tests {
     fn the_speech_language_is_normalised_before_it_becomes_a_tag() {
         let tts = FakeTts::default();
         let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
         let state = AppState {
             speech_language: "  EN \n".to_string(),
             ..state_with_a_sample()
         };
 
-        speak("Hello", &state, &tts, &notifier).unwrap();
+        speak("Hello", &state, &tts, &mic, &notifier).unwrap();
 
         assert_eq!(
             tts.calls.lock().unwrap()[0].2,
@@ -374,8 +482,9 @@ mod tests {
     fn empty_text_is_rejected_before_the_engine_and_before_the_sample_check() {
         let tts = FakeTts::default();
         let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
 
-        let error = speak("   ", &AppState::default(), &tts, &notifier).unwrap_err();
+        let error = speak("   ", &AppState::default(), &tts, &mic, &notifier).unwrap_err();
 
         assert!(matches!(error, VoiceMeError::EmptyText));
         assert!(tts.calls.lock().unwrap().is_empty());
@@ -431,6 +540,7 @@ mod tests {
             overlapped: AtomicBool::new(false),
         });
         let notifier = Arc::new(FakeNotifier::default());
+        let mic = Arc::new(FakeMic::default());
         let start = Arc::new(Barrier::new(2));
         let state = state_with_a_sample();
 
@@ -439,11 +549,12 @@ mod tests {
             .map(|line| {
                 let tts = tts.clone();
                 let notifier = notifier.clone();
+                let mic = mic.clone();
                 let start = start.clone();
                 let state = state.clone();
                 std::thread::spawn(move || {
                     start.wait();
-                    speak(line, &state, tts.as_ref(), notifier.as_ref())
+                    speak(line, &state, tts.as_ref(), mic.as_ref(), notifier.as_ref())
                 })
             })
             .collect();
@@ -453,5 +564,74 @@ mod tests {
         }
         assert!(!tts.overlapped.load(Ordering::SeqCst));
         assert!(notifier.summaries().is_empty());
+        assert_eq!(
+            mic.played().len(),
+            2,
+            "both lines are heard in full, not just the first"
+        );
+        assert!(
+            !mic.overlapped.load(Ordering::SeqCst),
+            "two streams into one device mix rather than queue — the second \
+             utterance has to wait for the first to drain"
+        );
+    }
+
+    /// The matrix's happy path at this level: what the engine produced is
+    /// what the Virtual Microphone is handed — no resampling, no trimming,
+    /// no conversion in the hexagon (AD-11).
+    #[test]
+    fn the_generated_buffer_reaches_the_virtual_microphone_unchanged() {
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+
+        let audio = speak("Merhaba", &state_with_a_sample(), &tts, &mic, &notifier).unwrap();
+
+        assert_eq!(
+            mic.played(),
+            vec![audio.samples().to_vec()],
+            "the buffer crosses TtsPort → VirtualMicPort as-is, exactly once"
+        );
+    }
+
+    /// A missing device and a failed generation have different fixes, so the
+    /// user must not be sent after the wrong one.
+    #[test]
+    fn an_unavailable_virtual_microphone_is_notified_as_playback_not_generation() {
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::unavailable("there is no `voice-me` device");
+
+        let error = speak("Merhaba", &state_with_a_sample(), &tts, &mic, &notifier).unwrap_err();
+
+        assert!(matches!(error, VoiceMeError::VirtualMicUnavailable(_)));
+        assert_eq!(
+            notifier.summaries(),
+            vec![PLAYBACK_FAILED_SUMMARY],
+            "exactly one notification, and not the generation one — the speech was fine"
+        );
+        assert!(
+            notifier.bodies()[0].contains("voice-me"),
+            "the reason from the adapter has to reach the user: {:?}",
+            notifier.bodies()
+        );
+    }
+
+    /// Nothing to play means nothing may be played: a failed generation must
+    /// not reach the device at all, or the user would get two failures for
+    /// one action.
+    #[test]
+    fn a_generation_failure_never_reaches_the_virtual_microphone() {
+        let tts = FakeTts::failing(VoiceMeError::SpeechEngine("decoder exploded".to_string()));
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+
+        speak("Merhaba", &state_with_a_sample(), &tts, &mic, &notifier).unwrap_err();
+
+        assert!(
+            mic.played().is_empty(),
+            "play is never called without audio"
+        );
+        assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
     }
 }
