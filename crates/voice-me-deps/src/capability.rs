@@ -21,7 +21,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use voice_me_core::{
-    BackendSelection, CheckRequest, Dependency, DependencyKind, SpeechExecutionTarget,
+    BackendSelection, CheckRequest, Dependency, DependencyKind, RemoteProvider,
+    SpeechExecutionTarget,
 };
 
 /// Decision 5: CUDA's floor is compute capability 6.0 (spec-2-5 Decision 1
@@ -303,24 +304,31 @@ pub fn capability_row(request: &CheckRequest, probe: &dyn GpuProbe) -> Option<De
             )),
             SpeechExecutionTarget::WebGpu => Some(webgpu_row(selection, probe.vulkan())),
         },
-        BackendSelection::Remote(provider) => Some(if request.has_api_key {
-            // Story 3.6 replaces this sentence with real generation.
-            cannot_run(
-                selection,
-                &format!(
-                    "Remote generation through {} arrives in a later voice-me release.",
-                    provider.label()
-                ),
-            )
-        } else {
-            cannot_run(
-                selection,
-                &format!(
-                    "{} has no API key — add one under API keys.",
-                    provider.label()
-                ),
-            )
-        }),
+        BackendSelection::Remote(provider) => {
+            if !request.has_api_key {
+                return Some(cannot_run(
+                    selection,
+                    &format!(
+                        "{} has no API key — add one under API keys.",
+                        provider.label()
+                    ),
+                ));
+            }
+            match provider {
+                // Story 3.6: a key is all DeepInfra needs here. Nothing is
+                // probed — no byte goes to the provider before the user
+                // has confirmed what is sent.
+                RemoteProvider::DeepInfra => None,
+                // Story 3.7 brings fal.ai generation.
+                RemoteProvider::FalAi => Some(cannot_run(
+                    selection,
+                    &format!(
+                        "Remote generation through {} arrives in a later voice-me release.",
+                        provider.label()
+                    ),
+                )),
+            }
+        }
     }
 }
 
@@ -427,7 +435,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use voice_me_core::{DependencyStatus, RemoteProvider, SpeechBackend};
+    use voice_me_core::{DependencyStatus, SpeechBackend};
 
     use super::*;
 
@@ -567,7 +575,10 @@ mod tests {
         );
 
         let row = capability_row(&local(SpeechExecutionTarget::Cuda), &probe).unwrap();
-        assert_blocks(&row, "Quadro M1200 has compute capability 5.0 < 6.0 required");
+        assert_blocks(
+            &row,
+            "Quadro M1200 has compute capability 5.0 < 6.0 required",
+        );
         assert!(!row.detail.contains("RTX 3060"), "{}", row.detail);
 
         let mut on_device_one = local(SpeechExecutionTarget::Cuda);
@@ -638,12 +649,21 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_provider_with_a_key_is_still_honest_that_it_cannot_generate_yet() {
-        let row = capability_row(&remote(true), &good_gpu()).unwrap();
+    fn deepinfra_with_a_key_can_run_and_nothing_is_probed() {
+        assert_eq!(capability_row(&remote(true), &good_gpu()), None);
+    }
+
+    #[test]
+    fn fal_ai_with_a_key_is_still_honest_that_it_cannot_generate_yet() {
+        let request = CheckRequest {
+            selection: BackendSelection::Remote(RemoteProvider::FalAi),
+            ..remote(true)
+        };
+        let row = capability_row(&request, &good_gpu()).unwrap();
 
         assert_blocks(
             &row,
-            "Remote generation through DeepInfra arrives in a later voice-me release",
+            "Remote generation through fal.ai arrives in a later voice-me release",
         );
     }
 

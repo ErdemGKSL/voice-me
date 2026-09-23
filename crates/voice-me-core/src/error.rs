@@ -80,6 +80,56 @@ pub enum VoiceMeError {
     #[error("virtual microphone unavailable: {0}")]
     VirtualMicUnavailable(String),
 
+    /// A remote speech provider failed (Story 3.6): a rejected key, a
+    /// deadline that passed, an error the provider reported. `provider` is
+    /// the name the user knows it by and `reason` is already shortened —
+    /// never a raw response body, never the key.
+    ///
+    /// A reason that already opens with the provider's name ("DeepInfra
+    /// rejected the API key.") is a whole sentence and is shown as it is;
+    /// anything else is prefixed ("DeepInfra: <detail>"), so the
+    /// notification always names the provider exactly once.
+    #[error("{}", provider_message(provider, reason))]
+    Provider { provider: String, reason: String },
+
+    /// A remote provider is selected, but what it would be sent has not
+    /// been confirmed yet (Story 3.6). Core refuses before any request is
+    /// made; carries the provider's name.
+    #[error(
+        "nothing was sent: confirm what voice-me sends to {0} first — press the hotkey to see it"
+    )]
+    DisclosureNotConfirmed(String),
+
     #[error("{0}")]
     Other(String),
+}
+
+/// How [`VoiceMeError::Provider`] reads: the reason as it is when it
+/// already names the provider, otherwise "<provider>: <reason>".
+fn provider_message(provider: &str, reason: &str) -> String {
+    if reason.starts_with(provider) {
+        reason.to_string()
+    } else {
+        format!("{provider}: {reason}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_provider_error_names_the_provider_exactly_once() {
+        let detail = VoiceMeError::Provider {
+            provider: "DeepInfra".to_string(),
+            reason: "Model is overloaded".to_string(),
+        };
+        assert_eq!(detail.to_string(), "DeepInfra: Model is overloaded");
+
+        let sentence = VoiceMeError::Provider {
+            provider: "DeepInfra".to_string(),
+            reason: "DeepInfra rejected the API key.".to_string(),
+        };
+        assert_eq!(sentence.to_string(), "DeepInfra rejected the API key.");
+    }
 }

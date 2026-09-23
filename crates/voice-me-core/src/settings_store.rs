@@ -16,7 +16,7 @@ use crate::error::VoiceMeError;
 use crate::ports::SettingsStore;
 use crate::state::{
     ActiveBackend, ApiKeys, AppState, BackendSelection, DependencyOutcome, LocalRuntime,
-    RemoteProvider, SpeechBackend, SpeechExecutionTarget,
+    RemoteProvider, RemoteSample, SpeechBackend, SpeechExecutionTarget,
 };
 
 const SETTINGS_FILE_NAME: &str = "settings.toml";
@@ -72,6 +72,22 @@ struct SettingsFile {
     /// the fields above: a malformed table loses the keys, not the file.
     #[serde(default, deserialize_with = "lenient_keys")]
     api_keys: ApiKeys,
+    /// Story 3.6: the providers whose disclosure the user confirmed. An
+    /// unreadable entry drops out — at worst the user is asked again.
+    #[serde(
+        default,
+        deserialize_with = "lenient_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    confirmed_disclosures: Vec<RemoteProvider>,
+    /// Story 3.6: the Reference Voice Sample as each provider holds it. An
+    /// unreadable entry drops out — at worst the sample is uploaded again.
+    #[serde(
+        default,
+        deserialize_with = "lenient_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    remote_samples: Vec<RemoteSample>,
 }
 
 /// How a [`BackendSelection`] is written to TOML:
@@ -172,6 +188,8 @@ impl Default for SettingsFile {
             backend_selection: None,
             local_runtimes: Vec::new(),
             api_keys: ApiKeys::default(),
+            confirmed_disclosures: Vec::new(),
+            remote_samples: Vec::new(),
         }
     }
 }
@@ -255,6 +273,8 @@ impl FileSettingsStore {
                 .unwrap_or_default(),
             local_runtimes: settings.local_runtimes,
             api_keys: settings.api_keys,
+            confirmed_disclosures: settings.confirmed_disclosures,
+            remote_samples: settings.remote_samples,
             // A fact about this process, never read from a file.
             active_backend: ActiveBackend::default(),
             // Not persisted either, and for a stronger reason: a dependency
@@ -345,6 +365,36 @@ impl SettingsStore for FileSettingsStore {
     ) -> Result<AppState, VoiceMeError> {
         let mut settings = self.read_settings_file()?;
         settings.api_keys.set(provider, key.map(str::to_string));
+        self.write_settings_file(&settings)?;
+        Ok(self.build_state(settings))
+    }
+
+    fn save_disclosure_confirmed(
+        &self,
+        provider: RemoteProvider,
+    ) -> Result<AppState, VoiceMeError> {
+        let mut settings = self.read_settings_file()?;
+        if !settings.confirmed_disclosures.contains(&provider) {
+            settings.confirmed_disclosures.push(provider);
+        }
+        self.write_settings_file(&settings)?;
+        Ok(self.build_state(settings))
+    }
+
+    fn save_remote_sample(
+        &self,
+        provider: RemoteProvider,
+        sample: Option<RemoteSample>,
+    ) -> Result<AppState, VoiceMeError> {
+        let mut settings = self.read_settings_file()?;
+        settings
+            .remote_samples
+            .retain(|held| held.provider != provider);
+        if let Some(sample) = sample {
+            settings
+                .remote_samples
+                .push(RemoteSample { provider, ..sample });
+        }
         self.write_settings_file(&settings)?;
         Ok(self.build_state(settings))
     }
@@ -705,6 +755,96 @@ mod tests {
 
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "{mode:o}");
+    }
+
+    #[test]
+    fn a_confirmed_disclosure_round_trips_once_per_provider() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = store_in(config_dir.path(), data_dir.path());
+        assert!(store.load().unwrap().confirmed_disclosures.is_empty());
+
+        store
+            .save_disclosure_confirmed(RemoteProvider::DeepInfra)
+            .unwrap();
+        let state = store
+            .save_disclosure_confirmed(RemoteProvider::DeepInfra)
+            .unwrap();
+        assert_eq!(state.confirmed_disclosures, vec![RemoteProvider::DeepInfra]);
+
+        let reloaded = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+        assert!(reloaded.disclosure_confirmed(RemoteProvider::DeepInfra));
+        assert!(!reloaded.disclosure_confirmed(RemoteProvider::FalAi));
+    }
+
+    #[test]
+    fn a_remote_sample_round_trips_is_replaced_and_is_forgotten() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = store_in(config_dir.path(), data_dir.path());
+        store
+            .save_api_key(RemoteProvider::DeepInfra, Some("di-key"))
+            .unwrap();
+        let sample = |hash: &str, id: &str| RemoteSample {
+            provider: RemoteProvider::DeepInfra,
+            sample_sha256: hash.to_string(),
+            voice_id: id.to_string(),
+        };
+
+        store
+            .save_remote_sample(RemoteProvider::DeepInfra, Some(sample("aa", "v1")))
+            .unwrap();
+        store
+            .save_remote_sample(RemoteProvider::DeepInfra, Some(sample("bb", "v2")))
+            .unwrap();
+        store
+            .save_disclosure_confirmed(RemoteProvider::DeepInfra)
+            .unwrap();
+
+        let reloaded = store_in(config_dir.path(), data_dir.path());
+        assert_eq!(
+            reloaded
+                .load_remote_sample(RemoteProvider::DeepInfra)
+                .unwrap(),
+            Some(sample("bb", "v2")),
+            "one sample per provider: the newer one replaces the older"
+        );
+        assert_eq!(reloaded.load().unwrap().remote_samples.len(), 1);
+        assert_eq!(
+            reloaded
+                .load()
+                .unwrap()
+                .api_keys
+                .get(RemoteProvider::DeepInfra),
+            Some("di-key")
+        );
+        let written = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
+        assert!(written.contains("voice_id = \"v2\""), "{written}");
+
+        let state = store
+            .save_remote_sample(RemoteProvider::DeepInfra, None)
+            .unwrap();
+        assert!(state.remote_samples.is_empty());
+        assert!(state.disclosure_confirmed(RemoteProvider::DeepInfra));
+    }
+
+    #[test]
+    fn unreadable_remote_entries_drop_out_without_losing_the_file() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_dir.path().join(SETTINGS_FILE_NAME),
+            "hotkey = \"Ctrl+Alt+KeyV\"\nconfirmed_disclosures = [\"deepinfra\", \"nowhere\"]\n\n\
+             [[remote_samples]]\nprovider = \"deepinfra\"\nsample_sha256 = \"aa\"\nvoice_id = \"v1\"\n\n\
+             [[remote_samples]]\nprovider = \"deepinfra\"\n",
+        )
+        .unwrap();
+
+        let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+
+        assert_eq!(state.confirmed_disclosures, vec![RemoteProvider::DeepInfra]);
+        assert_eq!(state.remote_samples.len(), 1);
+        assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
     }
 
     #[test]

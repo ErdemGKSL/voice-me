@@ -461,7 +461,7 @@ So that I get fast, high-quality generation on a machine that would take 20 seco
 
 **Acceptance Criteria:**
 
-**Given** I select the DeepInfra (`ensembleAI/chatterbox-multilingual`) backend and enter my API key
+**Given** I select the DeepInfra (`ResembleAI/chatterbox-multilingual`) backend and enter my API key
 **When** I perform a Speak Action
 **Then** `voice-me-tts-remote` generates through the provider behind the same `TtsPort` as the local backend, and playback through the Virtual Microphone is unchanged (AD-13)
 **And** before the first byte leaves the machine, the app states exactly what is sent — the typed text, the language tag, and the Reference Voice Sample — names the provider, and takes a one-time confirmation that `voice-me-core` enforces, not the adapter (FR-10)

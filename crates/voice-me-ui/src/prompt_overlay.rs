@@ -18,13 +18,27 @@
 //! is nothing to type and nothing to send. The composition root decides
 //! which shape to open; the view is told, and never asks `voice-me-deps`
 //! anything itself.
+//!
+//! Story 3.6 adds a *confirm-first* shape (Decision 1). The first time a
+//! remote provider is about to be used, the overlay opens naming the
+//! provider and the three things that would be sent to it, with **Send to
+//! <provider>** (`Enter`) and **Cancel** (`Escape`). Confirming asks the
+//! composition root to record the confirmation, and the same overlay then
+//! becomes the ordinary text input; cancelling dismisses it and records
+//! nothing. Core's own gate stays the enforcement — this is only where the
+//! user sees and answers the question.
 
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
-use gpui_kit::component::{ActiveTheme as _, ThemeStyled as _, v_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Sizable as _, ThemeStyled as _,
+    button::{Button, ButtonVariants as _},
+    h_flex, v_flex,
+};
 use gpui_kit::{
-    Animation, AnimationExt as _, AnyElement, AppContext as _, Context, Entity, FocusHandle,
+    Animation, AnimationExt as _, AnyElement, App, AppContext as _, Context, Entity, FocusHandle,
     Focusable, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, ParentElement as _, Render, SharedString, Styled as _, Subscription,
     TestSupportExt as _, Window, div, ease_out_quint, px,
@@ -59,6 +73,24 @@ const BLOCKED_HEADLINE: &str = "voice-me can't speak yet";
 /// The second line, pointing at the one place the whole gap is explained.
 const BLOCKED_HINT: &str = "Settings → Dependencies has the details.";
 
+/// What the confirm-first shape says leaves the machine — exactly the
+/// three things the adapter sends, and nothing else.
+pub const DISCLOSURE_ITEMS: [&str; 3] = [
+    "the text you type",
+    "the language tag of your speech language",
+    "your Reference Voice Sample (uploaded once, then kept on their servers until you delete it \
+     in Settings → Dependencies or record a new sample)",
+];
+
+/// Called once when the user confirms the disclosure (Story 3.6).
+pub type ConfirmDisclosure = Rc<dyn Fn(&mut App)>;
+
+/// The confirm-first state: which provider, and who records the answer.
+struct Disclosure {
+    provider: SharedString,
+    on_confirm: ConfirmDisclosure,
+}
+
 /// The borderless prompt window's contents.
 pub struct PromptOverlayView {
     input: Entity<InputState>,
@@ -67,6 +99,8 @@ pub struct PromptOverlayView {
     /// The missing dependency this overlay opened blocked on, if any
     /// (Story 3.4). `None` is the ordinary typeable overlay.
     blocker: Option<SharedString>,
+    /// The confirm-first state (Story 3.6), until it is answered.
+    disclosure: Option<Disclosure>,
     /// Set once a dismissal route has fired. The window is still up for
     /// [`DISMISS_MS`] while the fade-out renders, so this both drives that
     /// frame and makes every dismissal route idempotent.
@@ -94,6 +128,42 @@ impl PromptOverlayView {
         cx: &mut Context<Self>,
     ) -> Self {
         Self::build(events, Some(blocker.into()), window, cx)
+    }
+
+    /// Build the confirm-first shape (Story 3.6, Decision 1): name
+    /// `provider` and what would be sent to it. **Send to <provider>** /
+    /// `Enter` calls `on_confirm` once and turns this into the ordinary
+    /// overlay; **Cancel** / `Escape` dismisses it and records nothing.
+    pub fn confirm_disclosure(
+        events: AppEventSender,
+        provider: impl Into<SharedString>,
+        on_confirm: ConfirmDisclosure,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::build(events, None, window, cx);
+        view.disclosure = Some(Disclosure {
+            provider: provider.into(),
+            on_confirm,
+        });
+        // As in the blocked shape: no `Input` is rendered yet, so the frame
+        // holds focus and sees `Enter` and `Escape` itself.
+        window.focus(&view.focus_handle, cx);
+        view
+    }
+
+    /// The user confirmed: record it through the root, once, and become
+    /// the ordinary overlay.
+    fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dismissing {
+            return;
+        }
+        let Some(disclosure) = self.disclosure.take() else {
+            return;
+        };
+        (disclosure.on_confirm)(cx);
+        self.input.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
     }
 
     fn build(
@@ -142,6 +212,7 @@ impl PromptOverlayView {
             focus_handle,
             events,
             blocker,
+            disclosure: None,
             dismissing: false,
             _subscriptions: subscriptions,
         }
@@ -159,7 +230,7 @@ impl PromptOverlayView {
         // belt-and-braces — but it is the promise the story makes, and it
         // is cheaper to state it than to rely on the view tree to enforce
         // it: nothing is sent while a speech-engine dependency is missing.
-        if self.blocker.is_some() {
+        if self.blocker.is_some() || self.disclosure.is_some() {
             return;
         }
 
@@ -202,6 +273,9 @@ impl PromptOverlayView {
     /// dependency the speech engine needs is missing — the inline notice
     /// that replaces it (Story 3.4).
     fn body(&self, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(disclosure) = self.disclosure.as_ref() {
+            return self.disclosure_body(&disclosure.provider, cx);
+        }
         let Some(blocker) = self.blocker.clone() else {
             return Input::new(&self.input)
                 .appearance(false)
@@ -236,6 +310,56 @@ impl PromptOverlayView {
                     .text_size(px(12.))
                     .text_color(cx.theme().muted_foreground)
                     .child(BLOCKED_HINT),
+            )
+            .into_any_element()
+    }
+}
+
+impl PromptOverlayView {
+    /// The confirm-first body: who, exactly what, and the two answers.
+    fn disclosure_body(&self, provider: &SharedString, cx: &mut Context<Self>) -> AnyElement {
+        let items = DISCLOSURE_ITEMS.map(|item| {
+            div()
+                .text_size(px(12.))
+                .text_color(cx.theme().popover_foreground)
+                .child(format!("• {item}"))
+        });
+        v_flex()
+            .id("prompt-overlay-disclosure")
+            .test_support()
+            .gap_1()
+            .child(
+                div()
+                    .text_size(px(14.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(cx.theme().popover_foreground)
+                    .child(format!("Speech will be generated by {provider}.")),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("voice-me sends {provider} only:")),
+            )
+            .children(items)
+            .child(
+                h_flex()
+                    .pt_1()
+                    .gap_2()
+                    .child(
+                        Button::new("prompt-overlay-disclosure-confirm")
+                            .primary()
+                            .small()
+                            .label(format!("Send to {provider}"))
+                            .on_click(cx.listener(|this, _, window, cx| this.confirm(window, cx))),
+                    )
+                    .child(
+                        Button::new("prompt-overlay-disclosure-cancel")
+                            .ghost()
+                            .small()
+                            .label("Cancel")
+                            .on_click(cx.listener(|this, _, window, cx| this.dismiss(window, cx))),
+                    ),
             )
             .into_any_element()
     }
@@ -280,8 +404,11 @@ impl Render for PromptOverlayView {
             // raw key itself, so Escape dismisses exactly as it does in an
             // unblocked overlay.
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if this.blocker.is_some() && event.keystroke.key == "escape" {
+                let key = event.keystroke.key.as_str();
+                if (this.blocker.is_some() || this.disclosure.is_some()) && key == "escape" {
                     this.dismiss(window, cx);
+                } else if this.disclosure.is_some() && key == "enter" {
+                    this.confirm(window, cx);
                 }
             }))
             // `track_focus` makes the frame focusable, and GPUI then
@@ -295,7 +422,7 @@ impl Render for PromptOverlayView {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
                     window.prevent_default();
-                    if this.blocker.is_some() {
+                    if this.blocker.is_some() || this.disclosure.is_some() {
                         // Keep focus on the frame, which is what `Escape`
                         // is reaching this view through.
                         return;
@@ -417,6 +544,37 @@ mod tests {
             handle,
             events: event_rx,
         }
+    }
+
+    /// The Story 3.6 shape, with a counter standing in for the root's
+    /// "record the confirmation" callback.
+    fn open_disclosure(cx: &mut TestAppContext) -> (Harness, Rc<std::cell::Cell<usize>>) {
+        cx.update(gpui_kit::init);
+        let (event_tx, event_rx) = mpsc::unbounded::<AppEvent>();
+        let confirmed = Rc::new(std::cell::Cell::new(0));
+        let on_confirm: ConfirmDisclosure = {
+            let confirmed = confirmed.clone();
+            Rc::new(move |_cx| confirmed.set(confirmed.get() + 1))
+        };
+        let handle = cx.open_window(size(px(560.), px(176.)), |window, cx| {
+            let view = cx.new(|cx| {
+                PromptOverlayView::confirm_disclosure(
+                    event_tx.clone(),
+                    "DeepInfra",
+                    on_confirm.clone(),
+                    window,
+                    cx,
+                )
+            });
+            Root::new(view, window, cx)
+        });
+        (
+            Harness {
+                handle,
+                events: event_rx,
+            },
+            confirmed,
+        )
     }
 
     /// Let the fade-out timer elapse so the window is actually removed.
@@ -638,6 +796,100 @@ mod tests {
             assert!(window.try_find("prompt-overlay-blocked").is_none());
         })
         .unwrap();
+    }
+
+    /// Decision 1: the provider and what is sent are named before
+    /// anything else; Enter confirms exactly once, and the same overlay
+    /// then takes the line.
+    #[gpui_kit::test]
+    fn enter_confirms_the_disclosure_once_then_the_overlay_takes_the_line(cx: &mut TestAppContext) {
+        let (mut harness, confirmed) = open_disclosure(cx);
+
+        cx.update_window(harness.handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("prompt-overlay-disclosure").is_some());
+            assert!(
+                window
+                    .try_find("prompt-overlay-disclosure-confirm")
+                    .is_some()
+            );
+            // Typed before confirming: there is no Input to receive it.
+            window.input("too early", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        assert_eq!(confirmed.get(), 1);
+        assert!(harness.drain().is_empty(), "confirming speaks nothing");
+
+        cx.update_window(harness.handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("prompt-overlay-disclosure").is_none());
+            window.input("merhaba", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+
+        assert_eq!(confirmed.get(), 1, "confirmed once, not per Enter");
+        assert_eq!(
+            harness.drain(),
+            vec![AppEvent::SpeakRequested {
+                text: "merhaba".to_string()
+            }]
+        );
+    }
+
+    #[gpui_kit::test]
+    fn the_send_button_confirms_once(cx: &mut TestAppContext) {
+        let (mut harness, confirmed) = open_disclosure(cx);
+
+        cx.update_window(harness.handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("prompt-overlay-disclosure-confirm", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(confirmed.get(), 1);
+        assert!(
+            !harness.is_dismissing(cx),
+            "it becomes the input, not closed"
+        );
+        assert!(harness.drain().is_empty());
+    }
+
+    /// Cancel records nothing and closes, like any other dismissal.
+    #[gpui_kit::test]
+    fn escape_cancels_the_disclosure_and_records_nothing(cx: &mut TestAppContext) {
+        let (mut harness, confirmed) = open_disclosure(cx);
+
+        cx.update_window(harness.handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("escape", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+
+        assert!(harness.is_dismissing(cx));
+        assert_eq!(confirmed.get(), 0, "a dismissed overlay confirms nothing");
+        assert!(harness.drain().is_empty());
+
+        settle(cx);
+        assert!(harness.window_is_gone(cx));
+    }
+
+    #[gpui_kit::test]
+    fn the_cancel_button_records_nothing(cx: &mut TestAppContext) {
+        let (harness, confirmed) = open_disclosure(cx);
+
+        cx.update_window(harness.handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("prompt-overlay-disclosure-cancel", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        assert!(harness.is_dismissing(cx));
+        assert_eq!(confirmed.get(), 0);
     }
 
     #[gpui_kit::test]

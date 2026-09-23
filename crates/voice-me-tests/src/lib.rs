@@ -6,6 +6,117 @@ fn placeholder() {
 }
 
 #[cfg(test)]
+mod network_egress_allowlist {
+    //! Story 3.6 / AD-8: network egress is confined to exactly two crates,
+    //! `voice-me-deps` and `voice-me-tts-remote`. This stands in for the CI
+    //! egress check the epic assumes and that does not exist yet: a third
+    //! crate declaring `reqwest` — in any dependency table, under any name —
+    //! fails here.
+
+    use std::path::{Path, PathBuf};
+
+    const ALLOWED: [&str; 2] = ["voice-me-deps", "voice-me-tts-remote"];
+    const DEPENDENCY_TABLES: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+
+    fn crates_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("voice-me-tests lives in crates/")
+            .to_path_buf()
+    }
+
+    /// Whether `table` declares `reqwest`, directly or renamed through
+    /// `package = "reqwest"`.
+    fn declares_reqwest(table: &toml::Table) -> bool {
+        table.iter().any(|(name, spec)| {
+            name == "reqwest"
+                || spec
+                    .get("package")
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|package| package == "reqwest")
+        })
+    }
+
+    /// Every dependency table in a manifest, including
+    /// `[target.'cfg(..)'.dependencies]` and `[workspace.dependencies]`.
+    fn dependency_tables(value: &toml::Table, out: &mut Vec<toml::Table>) {
+        for (key, inner) in value {
+            let Some(inner) = inner.as_table() else {
+                continue;
+            };
+            if DEPENDENCY_TABLES.contains(&key.as_str()) {
+                out.push(inner.clone());
+            } else {
+                dependency_tables(inner, out);
+            }
+        }
+    }
+
+    fn crates_declaring_reqwest() -> Vec<String> {
+        let mut manifests: Vec<(String, PathBuf)> = std::fs::read_dir(crates_dir())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|dir| dir.join("Cargo.toml").exists())
+            .map(|dir| {
+                let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+                (name, dir.join("Cargo.toml"))
+            })
+            .collect();
+        manifests.push((
+            "workspace root".to_string(),
+            crates_dir().parent().unwrap().join("Cargo.toml"),
+        ));
+
+        let mut found: Vec<String> = manifests
+            .into_iter()
+            .filter(|(_, manifest)| {
+                let text = std::fs::read_to_string(manifest).unwrap();
+                let parsed: toml::Table = text
+                    .parse()
+                    .unwrap_or_else(|error| panic!("{}: {error}", manifest.display()));
+                let mut tables = Vec::new();
+                dependency_tables(&parsed, &mut tables);
+                tables.iter().any(declares_reqwest)
+            })
+            .map(|(name, _)| name)
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn only_the_two_allowed_crates_declare_an_http_client() {
+        let found = crates_declaring_reqwest();
+        let intruders: Vec<_> = found
+            .iter()
+            .filter(|name| !ALLOWED.contains(&name.as_str()))
+            .collect();
+        assert!(
+            intruders.is_empty(),
+            "network egress is confined to {ALLOWED:?} (AD-8); also declaring reqwest: {intruders:?}"
+        );
+        assert_eq!(
+            found, ALLOWED,
+            "both allowed crates are expected to be the ones that declare it"
+        );
+    }
+
+    #[test]
+    fn a_renamed_or_target_specific_reqwest_is_still_caught() {
+        let manifest: toml::Table = r#"
+            [target.'cfg(unix)'.dependencies]
+            http = { package = "reqwest", version = "0.12" }
+        "#
+        .parse()
+        .unwrap();
+        let mut tables = Vec::new();
+        dependency_tables(&manifest, &mut tables);
+        assert!(tables.iter().any(declares_reqwest));
+    }
+}
+
+#[cfg(test)]
 mod file_settings_store_reference_voice_sample {
     //! Story 1.2 acceptance: "Given no Reference Voice Sample exists, when I
     //! Record, speak, Stop, and Accept, then the clip is saved via

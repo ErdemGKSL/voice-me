@@ -1,0 +1,44 @@
+[package]
+name = "voice-me-tts-remote"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+voice-me-core = { path = "../voice-me-core" }
+# Story 3.6: the second — and last — crate allowed to open a socket (AD-8;
+# `voice-me-tests` holds the allowlist). rustls with bundled webpki roots,
+# like `voice-me-deps`; `json` for the inference body, `multipart` for the
+# one-time sample upload.
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "json",
+  "multipart",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# The inference response carries the WAV as a base64 data URL.
+base64 = "0.22"
+# The provider's WAV is decoded here, and brought to AD-11's 24 kHz mono
+# f32 when its rate differs.
+hound = "3.5"
+rubato = "5.0.0"
+# The uploaded voice is keyed by the sample's SHA-256, so a re-recorded
+# sample is uploaded afresh.
+sha2 = "0.10"
+# Only to find the AD-5 runtime the blocking job runs on (or build a small
+# one when there is none, as in tests). reqwest enables the I/O and timer
+# drivers it needs itself.
+tokio = { version = "1.53", default-features = false, features = ["rt"] }
+
+[dev-dependencies]
+tempfile = "3.14"
+# Drives the AD-5 bridge future in the multi-thread runtime test.
+futures = "0.3"
+# The loopback mock provider the tests talk to — no mock crate.
+tokio = { version = "1.53", default-features = false, features = [
+  "rt",
+  "rt-multi-thread",
+  "net",
+  "io-util",
+  "time",
+] }

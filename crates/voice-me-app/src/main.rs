@@ -50,6 +50,12 @@
 //! any other switch rebuilds the adapter for the next Speak Action. Added
 //! runtime libraries are probed in a helper process (`--probe-runtime`),
 //! never loaded here.
+//!
+//! Story 3.6 puts a remote engine in the same slot: selecting DeepInfra
+//! builds `voice-me-tts-remote`'s adapter, and the Speak Action path does
+//! not change. The first hotkey press after that opens the overlay in its
+//! confirm-first shape, whose answer is recorded here; Settings' **Delete
+//! from DeepInfra** is carried out here too.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -70,14 +76,15 @@ use voice_me_core::VoiceMeError;
 use voice_me_core::{
     ActiveBackend, AppEvent, AppState, BackendSelection, CheckRequest, DependencyKind,
     DependencyOutcome, DependencyProvisioningPort, DependencyReport, FileSettingsStore, HotkeyPort,
-    LocalRuntime, NotificationPort, SettingsStore, SpeechBackend, SpeechExecutionTarget, TtsPort,
-    VirtualMicPort, tokio_bridge,
+    LocalRuntime, NotificationPort, RemoteProvider, SettingsStore, SpeechBackend,
+    SpeechExecutionTarget, TtsPort, VirtualMicPort, tokio_bridge,
 };
 use voice_me_deps::DepsAdapter;
 use voice_me_tts::TtsAdapter;
+use voice_me_tts_remote::{DeepInfra, RemoteTtsAdapter, SharedSettingsStore};
 use voice_me_ui::{
-    BackendAction, BackendActions, BackendArea, BackendPanel, DependenciesTab, PromptOverlayView,
-    RowProvisioning, SettingsView, blocker_notice,
+    BackendAction, BackendActions, BackendArea, BackendPanel, ConfirmDisclosure, DependenciesTab,
+    PromptOverlayView, RowProvisioning, SettingsView, blocker_notice,
 };
 
 #[cfg(target_os = "linux")]
@@ -103,6 +110,10 @@ use voice_me_core::TrayPort as _;
 /// input plus the surface's padding (spec-2-4 Design Notes).
 const OVERLAY_WIDTH: f32 = 560.;
 const OVERLAY_HEIGHT: f32 = 84.;
+
+/// The confirm-first overlay's height (Story 3.6): the provider, the three
+/// things sent, and the two buttons. It keeps this height after confirming.
+const OVERLAY_DISCLOSURE_HEIGHT: f32 = 196.;
 
 /// Always-on-top is a two-tier capability, mirroring Story 2.3's two hotkey
 /// backends. `WindowKind::PopUp` is a real override-redirect, taskbar-less,
@@ -397,15 +408,20 @@ struct Engine {
 
 /// The source of engine generations: each `build_engine` call takes the
 /// next one.
-static NEXT_ENGINE_GENERATION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static NEXT_ENGINE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Build the engine `state` selects. Never falls back: a remote selection
-/// gets no engine and a sentence saying why, rather than a CPU one.
+/// Build the engine `state` selects. Never falls back: a selection that
+/// cannot generate gets no engine and a sentence saying why, rather than a
+/// CPU one.
+///
+/// DeepInfra gets the remote adapter (Story 3.6), which keeps its voice-id
+/// cache through `store` and reads the key per request, so a key changed
+/// in Settings needs no rebuild. fal.ai arrives with Story 3.7.
 fn build_engine(
     state: &AppState,
     runtime_error: Option<&str>,
     events: &mpsc::UnboundedSender<AppEvent>,
+    store: &SharedSettingsStore,
 ) -> Engine {
     let generation = NEXT_ENGINE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let unavailable = |reason: String| Engine {
@@ -415,6 +431,16 @@ fn build_engine(
     };
     if let Some(error) = runtime_error {
         return unavailable(error.to_string());
+    }
+    if let BackendSelection::Remote(RemoteProvider::DeepInfra) = &state.backend_selection {
+        return Engine {
+            port: Some(Arc::new(RemoteTtsAdapter::new(
+                DeepInfra::new(),
+                store.clone(),
+            ))),
+            unavailable: None,
+            generation,
+        };
     }
     if let BackendSelection::Remote(provider) = &state.backend_selection {
         return unavailable(format!(
@@ -433,6 +459,22 @@ fn build_engine(
             eprintln!("could not set up the speech engine: {error}");
             unavailable(error.to_string())
         }
+    }
+}
+
+/// The remote provider whose disclosure the hotkey press has to ask about
+/// first (Story 3.6, Decision 1): DeepInfra, when it is selected, has a key
+/// and has not been confirmed. With no key the capability row blocks
+/// instead. Only DeepInfra can generate yet, so fal.ai is never asked
+/// about — Story 3.7 widens this.
+fn disclosure_needed(state: &AppState) -> Option<RemoteProvider> {
+    match &state.backend_selection {
+        BackendSelection::Remote(provider @ RemoteProvider::DeepInfra)
+            if state.api_keys.has(*provider) && !state.disclosure_confirmed(*provider) =>
+        {
+            Some(*provider)
+        }
+        _ => None,
     }
 }
 
@@ -846,6 +888,21 @@ mod tests {
             &self,
             _provider: voice_me_core::RemoteProvider,
             _key: Option<&str>,
+        ) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        fn save_disclosure_confirmed(
+            &self,
+            _provider: voice_me_core::RemoteProvider,
+        ) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        fn save_remote_sample(
+            &self,
+            _provider: voice_me_core::RemoteProvider,
+            _sample: Option<voice_me_core::RemoteSample>,
         ) -> Result<AppState, VoiceMeError> {
             unimplemented!("not exercised by these tests")
         }
@@ -1289,21 +1346,49 @@ mod tests {
             assert!(!should_warm_up(true, true, true, true), "already warmed");
         }
 
-        /// No silent fallback: a remote selection gets no engine at all —
-        /// never a CPU one — and a sentence naming the provider.
+        /// A store `build_engine` can hold; it is never touched by
+        /// building, so the directories need not exist.
+        fn unused_store() -> voice_me_tts_remote::SharedSettingsStore {
+            let root = std::env::temp_dir().join("voice-me-build-engine-test-unused");
+            Arc::new(FileSettingsStore::with_dirs(
+                root.join("config"),
+                root.join("data"),
+            ))
+        }
+
+        /// Story 3.6: DeepInfra gets the remote engine — ready at once,
+        /// nothing to warm — rather than the "later release" sentence.
         #[test]
-        fn a_remote_selection_gets_no_engine() {
+        fn deepinfra_gets_the_remote_engine() {
             let (tx, _rx) = mpsc::unbounded();
             let state = AppState {
                 backend_selection: BackendSelection::Remote(RemoteProvider::DeepInfra),
                 ..AppState::default()
             };
 
-            let engine = build_engine(&state, None, &tx);
+            let engine = build_engine(&state, None, &tx, &unused_store());
+
+            assert!(engine.unavailable.is_none());
+            let port = engine.port.expect("an engine in the slot");
+            assert!(port.is_ready(), "a remote engine has no sessions to build");
+        }
+
+        /// No silent fallback: fal.ai (Story 3.7) gets no engine at all —
+        /// never a CPU one — and a sentence naming the provider.
+        #[test]
+        fn fal_ai_gets_no_engine_yet() {
+            let (tx, _rx) = mpsc::unbounded();
+            let state = AppState {
+                backend_selection: BackendSelection::Remote(RemoteProvider::FalAi),
+                ..AppState::default()
+            };
+
+            let engine = build_engine(&state, None, &tx, &unused_store());
 
             assert!(engine.port.is_none());
             let reason = engine.unavailable.expect("the user is told why");
-            assert!(reason.contains("DeepInfra"), "{reason}");
+            assert!(reason.contains("fal.ai"), "{reason}");
+            assert!(reason.contains("later voice-me release"), "{reason}");
         }
 
         #[test]
@@ -1314,10 +1399,59 @@ mod tests {
                 ..AppState::default()
             };
 
-            let first = build_engine(&state, None, &tx).generation;
-            let second = build_engine(&state, None, &tx).generation;
+            let first = build_engine(&state, None, &tx, &unused_store()).generation;
+            let second = build_engine(&state, None, &tx, &unused_store()).generation;
 
             assert_ne!(first, second);
+        }
+
+        /// Decision 1: the confirm-first overlay is asked for exactly when
+        /// a remote provider with a key has not been confirmed.
+        #[test]
+        fn the_disclosure_is_asked_once_per_provider_and_only_with_a_key() {
+            let mut keys = ApiKeys::default();
+            keys.set(RemoteProvider::DeepInfra, Some("secret".to_string()));
+            let state = AppState {
+                backend_selection: BackendSelection::Remote(RemoteProvider::DeepInfra),
+                api_keys: keys,
+                ..AppState::default()
+            };
+            assert_eq!(disclosure_needed(&state), Some(RemoteProvider::DeepInfra));
+
+            let confirmed = AppState {
+                confirmed_disclosures: vec![RemoteProvider::DeepInfra],
+                ..state.clone()
+            };
+            assert_eq!(disclosure_needed(&confirmed), None);
+
+            let no_key = AppState {
+                api_keys: ApiKeys::default(),
+                ..state.clone()
+            };
+            assert_eq!(
+                disclosure_needed(&no_key),
+                None,
+                "the capability row blocks instead"
+            );
+
+            assert_eq!(
+                disclosure_needed(&AppState::default()),
+                None,
+                "local: nothing to ask"
+            );
+
+            let mut fal_keys = ApiKeys::default();
+            fal_keys.set(RemoteProvider::FalAi, Some("secret".to_string()));
+            let fal_ai = AppState {
+                backend_selection: BackendSelection::Remote(RemoteProvider::FalAi),
+                api_keys: fal_keys,
+                ..AppState::default()
+            };
+            assert_eq!(
+                disclosure_needed(&fal_ai),
+                None,
+                "fal.ai cannot generate yet, so nothing is confirmed for it"
+            );
         }
 
         #[test]
@@ -1414,8 +1548,13 @@ fn main() {
     // hotkey before this one claims them.
     wait_for_previous_instance();
 
-    let settings_store: Arc<dyn SettingsStore> =
+    let file_store =
         Arc::new(FileSettingsStore::new().expect("failed to resolve settings/data directories"));
+    // The same store, twice typed: every main-thread reader takes the plain
+    // port; the remote engine and the sample delete run on other threads
+    // and need it `Send + Sync` (Story 3.6).
+    let settings_store: Arc<dyn SettingsStore> = file_store.clone();
+    let remote_store: SharedSettingsStore = file_store;
 
     // Story 1.5: determine whether an active Reference Voice Sample already
     // exists before deciding whether to auto-open the window at startup
@@ -1479,6 +1618,7 @@ fn main() {
             &current_state(&settings_store, &DependencyOutcome::Pending),
             runtime_error.as_deref(),
             &event_tx,
+            &remote_store,
         )));
 
         // Stories 3.1/3.2: detection, and one-click provisioning. One
@@ -1595,6 +1735,9 @@ fn main() {
         // runnable, so a selection that cannot run here never commits its
         // runtime library by trying.
         let warmed_up = Rc::new(Cell::new(false));
+        // Story 3.6: providers whose held sample is being deleted now, so a
+        // second click does not send a second DELETE.
+        let deleting_samples: Rc<RefCell<Vec<RemoteProvider>>> = Rc::new(RefCell::new(Vec::new()));
 
         // What the backend section shows, from the settings file and the
         // state above.
@@ -1604,6 +1747,7 @@ fn main() {
             let restart_pending = restart_pending.clone();
             let probing = probing.clone();
             let backend_errors = backend_errors.clone();
+            let deleting_samples = deleting_samples.clone();
             move || {
                 let state = settings_store.load().unwrap_or_default();
                 BackendPanel {
@@ -1615,6 +1759,8 @@ fn main() {
                     restart_pending: restart_pending.get(),
                     probing: probing.borrow().clone(),
                     errors: backend_errors.borrow().clone(),
+                    remote_samples: state.remote_samples,
+                    deleting_samples: deleting_samples.borrow().clone(),
                 }
             }
         });
@@ -1695,6 +1841,7 @@ fn main() {
             let push_panel = push_panel.clone();
             let runtime_error = runtime_error.clone();
             let warmed_up = warmed_up.clone();
+            let remote_store = remote_store.clone();
             move |selection: BackendSelection, area: BackendArea, cx: &mut App| {
                 match settings_store.save_backend_selection(&selection) {
                     Err(error) => {
@@ -1715,8 +1862,12 @@ fn main() {
                             restart_pending.set(false);
                             let state =
                                 current_state(&settings_store, &dependency_outcome.borrow());
-                            *engine.borrow_mut() =
-                                build_engine(&state, runtime_error.as_deref(), &event_tx);
+                            *engine.borrow_mut() = build_engine(
+                                &state,
+                                runtime_error.as_deref(),
+                                &event_tx,
+                                &remote_store,
+                            );
                             // A fresh adapter has built nothing yet, and
                             // is warmed up by the next runnable check.
                             *active_backend.borrow_mut() = ActiveBackend::NotStarted;
@@ -1738,6 +1889,8 @@ fn main() {
             let run_check = run_check.clone();
             let push_panel = push_panel.clone();
             let apply_selection = apply_selection.clone();
+            let remote_store = remote_store.clone();
+            let deleting_samples = deleting_samples.clone();
             move |action: BackendAction, cx: &mut App| match action {
                 BackendAction::Select(selection) => {
                     (*apply_selection)(selection, BackendArea::Selection, cx)
@@ -1837,6 +1990,45 @@ fn main() {
                     }
                     (*run_check)(cx);
                     (*push_panel)(cx);
+                }
+                BackendAction::DeleteRemoteSample(provider) => {
+                    if deleting_samples.borrow().contains(&provider) {
+                        return;
+                    }
+                    deleting_samples.borrow_mut().push(provider);
+                    backend_errors
+                        .borrow_mut()
+                        .remove(&BackendArea::RemoteSample(provider));
+                    (*push_panel)(cx);
+
+                    // Off the main thread — a DELETE may take up to its 30 s
+                    // deadline — and on GPUI's background executor rather
+                    // than the Tokio bridge, so it works even on a run whose
+                    // runtime would not start.
+                    let delete = {
+                        let store = remote_store.clone();
+                        cx.background_spawn(async move {
+                            voice_me_tts_remote::delete_held_sample(provider, store.as_ref())
+                        })
+                    };
+                    let deleting_samples = deleting_samples.clone();
+                    let backend_errors = backend_errors.clone();
+                    let push_panel = push_panel.clone();
+                    cx.spawn(async move |cx| {
+                        let result = delete.await;
+                        deleting_samples
+                            .borrow_mut()
+                            .retain(|deleting| *deleting != provider);
+                        if let Err(error) = result {
+                            eprintln!("deleting the voice sample failed: {error}");
+                            backend_errors.borrow_mut().insert(
+                                BackendArea::RemoteSample(provider),
+                                format!("Couldn't delete the sample: {error}"),
+                            );
+                        }
+                        cx.update(|cx| (*push_panel)(cx));
+                    })
+                    .detach();
                 }
                 BackendAction::Restart => match relaunch() {
                     Ok(()) => cx.quit(),
@@ -1953,11 +2145,36 @@ fn main() {
             let overlay_slot = overlay_slot.clone();
             let event_tx = event_tx.clone();
             let dependency_outcome = dependency_outcome.clone();
+            let settings_store = settings_store.clone();
             move |cx: &mut App| {
                 // Story 3.4: the same summon, a different shape. The gate
                 // is read here rather than inside the view, so the overlay
                 // never has to know `voice-me-deps` exists.
                 let blocker = overlay_blocker(&dependency_outcome.borrow());
+                // Story 3.6: an unconfirmed remote provider opens the
+                // confirm-first shape. A blocker wins — there is nothing to
+                // confirm for a selection that cannot run.
+                let disclosure = if blocker.is_none() {
+                    disclosure_needed(&current_state(
+                        &settings_store,
+                        &dependency_outcome.borrow(),
+                    ))
+                } else {
+                    None
+                };
+                let on_confirm: Option<ConfirmDisclosure> = disclosure.map(|provider| {
+                    let settings_store = settings_store.clone();
+                    Rc::new(move |_cx: &mut App| {
+                        // Core refuses the line anyway if this did not
+                        // land, and says so in its one notification.
+                        if let Err(error) = settings_store.save_disclosure_confirmed(provider) {
+                            eprintln!(
+                                "could not record the {} confirmation: {error}",
+                                provider.label()
+                            );
+                        }
+                    }) as ConfirmDisclosure
+                });
                 // Re-summon while one is open: activate it, keeping whatever
                 // is already typed. The view closes itself with
                 // `remove_window`, which never runs `on_window_should_close`,
@@ -1984,7 +2201,14 @@ fn main() {
                     window_decorations: Some(WindowDecorations::Client),
                     window_background: WindowBackgroundAppearance::Transparent,
                     window_bounds: Some(WindowBounds::centered(
-                        size(px(OVERLAY_WIDTH), px(OVERLAY_HEIGHT)),
+                        size(
+                            px(OVERLAY_WIDTH),
+                            px(if disclosure.is_some() {
+                                OVERLAY_DISCLOSURE_HEIGHT
+                            } else {
+                                OVERLAY_HEIGHT
+                            }),
+                        ),
                         cx,
                     )),
                     kind: overlay_window_kind(),
@@ -1996,12 +2220,27 @@ fn main() {
                 };
 
                 let handle = match cx.open_window(options, move |window, cx| {
-                    let view = cx.new(|cx| match blocker.clone() {
-                        Some(blocker) => {
-                            PromptOverlayView::blocked(event_tx.clone(), blocker, window, cx)
-                        }
-                        None => PromptOverlayView::new(event_tx.clone(), window, cx),
-                    });
+                    let view =
+                        cx.new(
+                            |cx| match (blocker.clone(), disclosure, on_confirm.clone()) {
+                                (Some(blocker), _, _) => PromptOverlayView::blocked(
+                                    event_tx.clone(),
+                                    blocker,
+                                    window,
+                                    cx,
+                                ),
+                                (None, Some(provider), Some(on_confirm)) => {
+                                    PromptOverlayView::confirm_disclosure(
+                                        event_tx.clone(),
+                                        provider.label(),
+                                        on_confirm,
+                                        window,
+                                        cx,
+                                    )
+                                }
+                                _ => PromptOverlayView::new(event_tx.clone(), window, cx),
+                            },
+                        );
                     window.on_window_should_close(cx, move |_window, _cx| {
                         *overlay_slot_on_close.borrow_mut() = None;
                         true
@@ -2327,10 +2566,15 @@ fn main() {
                             // leave the tray and the hotkey unresponsive for
                             // its whole duration. `speak` has already told
                             // the user about any failure; this only logs.
-                            cx.spawn(async move |_| {
+                            let push_panel = push_panel.clone();
+                            cx.spawn(async move |cx| {
                                 if let Err(error) = work.await {
                                     eprintln!("speak failed: {error}");
                                 }
+                                // A remote line can have uploaded (or
+                                // dropped) the held sample; an open
+                                // Settings window shows it (Story 3.6).
+                                cx.update(|cx| (*push_panel)(cx));
                             })
                             .detach();
                         });

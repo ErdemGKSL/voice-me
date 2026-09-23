@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use crate::audio::AudioBuffer;
 use crate::error::VoiceMeError;
 use crate::ports::{NotificationPort, TtsPort, VirtualMicPort};
-use crate::state::AppState;
+use crate::state::{AppState, BackendSelection};
 
 /// Held across [`VirtualMicPort::play`], so one utterance finishes draining
 /// before the next one starts.
@@ -130,6 +130,18 @@ fn speak_inner(
             state.speech_language,
             SUPPORTED_SPEECH_LANGUAGES.join(" and ")
         )));
+    }
+
+    // Story 3.6: nothing leaves the machine for a provider whose disclosure
+    // the user has not confirmed. Enforced here, in the use case, rather
+    // than trusted to the adapter — and before the sample check, so not
+    // even the "is there a voice to send" question is asked first.
+    if let BackendSelection::Remote(provider) = &state.backend_selection
+        && !state.disclosure_confirmed(*provider)
+    {
+        return Err(VoiceMeError::DisclosureNotConfirmed(
+            provider.label().to_string(),
+        ));
     }
 
     let Some(reference_clip) = state.reference_voice_sample.as_ref() else {
@@ -592,6 +604,64 @@ mod tests {
             vec![audio.samples().to_vec()],
             "the buffer crosses TtsPort → VirtualMicPort as-is, exactly once"
         );
+    }
+
+    /// Story 3.6: core, not the adapter, refuses an unconfirmed remote
+    /// provider — before `generate` is ever reached.
+    #[test]
+    fn an_unconfirmed_remote_provider_is_refused_before_generate() {
+        use crate::state::RemoteProvider;
+
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+        let state = AppState {
+            backend_selection: BackendSelection::Remote(RemoteProvider::DeepInfra),
+            ..state_with_a_sample()
+        };
+
+        let error = speak("Merhaba", &state, &tts, &mic, &notifier).unwrap_err();
+
+        assert!(matches!(error, VoiceMeError::DisclosureNotConfirmed(_)));
+        assert!(
+            tts.calls.lock().unwrap().is_empty(),
+            "no byte may reach the provider before the disclosure is confirmed"
+        );
+        assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
+        assert!(notifier.bodies()[0].contains("DeepInfra"));
+
+        // Confirming another provider does not count.
+        let other = AppState {
+            confirmed_disclosures: vec![RemoteProvider::FalAi],
+            ..state.clone()
+        };
+        speak("Merhaba", &other, &tts, &mic, &notifier).unwrap_err();
+        assert!(tts.calls.lock().unwrap().is_empty());
+
+        let confirmed = AppState {
+            confirmed_disclosures: vec![RemoteProvider::DeepInfra],
+            ..state
+        };
+        speak("Merhaba", &confirmed, &tts, &mic, &notifier).unwrap();
+        assert_eq!(tts.calls.lock().unwrap().len(), 1);
+    }
+
+    /// A provider failure is the one generation notification, naming the
+    /// provider and the reason.
+    #[test]
+    fn a_provider_failure_is_one_notification_naming_the_provider() {
+        let tts = FakeTts::failing(VoiceMeError::Provider {
+            provider: "DeepInfra".to_string(),
+            reason: "DeepInfra rejected the API key.".to_string(),
+        });
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+
+        speak("Merhaba", &state_with_a_sample(), &tts, &mic, &notifier).unwrap_err();
+
+        assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
+        assert_eq!(notifier.bodies(), vec!["DeepInfra rejected the API key."]);
+        assert!(mic.played().is_empty());
     }
 
     /// A missing device and a failed generation have different fixes, so the

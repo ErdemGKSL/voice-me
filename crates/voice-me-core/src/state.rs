@@ -128,8 +128,8 @@ impl SpeechBackend {
 
 /// A remote speech provider the user can select (Stories 3.5–3.7).
 ///
-/// Selectable now so the choice and its key can be made; generation through
-/// it arrives with Story 3.6.
+/// DeepInfra generates since Story 3.6; fal.ai is selectable, and generates
+/// with Story 3.7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteProvider {
@@ -346,6 +346,21 @@ impl std::fmt::Debug for ApiKeys {
             .field("fal_ai", &redact(&self.fal_ai))
             .finish()
     }
+}
+
+/// The Reference Voice Sample as a remote provider holds it (Story 3.6):
+/// uploaded once, then referenced by `voice_id`.
+///
+/// Keyed by the SHA-256 of the sample file, so a re-recorded sample no
+/// longer matches and is uploaded afresh. Persisted; the id is not a
+/// secret — it is useless without the key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteSample {
+    pub provider: RemoteProvider,
+    /// Lowercase hex SHA-256 of the sample file that was uploaded.
+    pub sample_sha256: String,
+    /// The provider's id for the uploaded voice.
+    pub voice_id: String,
 }
 
 /// What the speech engine actually acquired when it built its session —
@@ -623,6 +638,13 @@ pub struct AppState {
     /// The remote providers' API keys. Persisted, in plaintext; redacted
     /// from `Debug`.
     pub api_keys: ApiKeys,
+    /// The remote providers whose disclosure — what is sent, and to whom —
+    /// the user has confirmed (Story 3.6). Persisted. Core refuses to call
+    /// a remote provider that is not in here.
+    pub confirmed_disclosures: Vec<RemoteProvider>,
+    /// The Reference Voice Sample as each remote provider holds it, at
+    /// most one per provider. Persisted.
+    pub remote_samples: Vec<RemoteSample>,
     /// What the engine actually acquired at its last session build. Not
     /// persisted — it is a fact about this process.
     pub active_backend: ActiveBackend,
@@ -650,9 +672,25 @@ impl Default for AppState {
             backend_selection: BackendSelection::default(),
             local_runtimes: Vec::new(),
             api_keys: ApiKeys::default(),
+            confirmed_disclosures: Vec::new(),
+            remote_samples: Vec::new(),
             active_backend: ActiveBackend::default(),
             dependencies: DependencyOutcome::default(),
         }
+    }
+}
+
+impl AppState {
+    /// Whether `provider`'s disclosure has been confirmed.
+    pub fn disclosure_confirmed(&self, provider: RemoteProvider) -> bool {
+        self.confirmed_disclosures.contains(&provider)
+    }
+
+    /// The sample `provider` holds, if any.
+    pub fn remote_sample(&self, provider: RemoteProvider) -> Option<&RemoteSample> {
+        self.remote_samples
+            .iter()
+            .find(|sample| sample.provider == provider)
     }
 }
 

@@ -4,7 +4,9 @@ use crate::AppEventSender;
 use crate::audio::AudioBuffer;
 use crate::error::VoiceMeError;
 use crate::state::LocalRuntime;
-use crate::state::{AppState, BackendSelection, DependencyKind, RemoteProvider, SpeechBackend};
+use crate::state::{
+    AppState, BackendSelection, DependencyKind, RemoteProvider, RemoteSample, SpeechBackend,
+};
 
 /// What one Dependency Check is asked about (Story 3.3).
 ///
@@ -285,4 +287,27 @@ pub trait SettingsStore {
         provider: RemoteProvider,
         key: Option<&str>,
     ) -> Result<AppState, VoiceMeError>;
+
+    /// Record that the user confirmed `provider`'s disclosure — what is
+    /// sent, and to whom (Story 3.6). Idempotent. Returns the resulting
+    /// `AppState`.
+    fn save_disclosure_confirmed(&self, provider: RemoteProvider)
+    -> Result<AppState, VoiceMeError>;
+
+    /// Replace (or with `None`, forget) the Reference Voice Sample
+    /// `provider` holds. `sample.provider` is ignored in favour of
+    /// `provider`. Returns the resulting `AppState`.
+    fn save_remote_sample(
+        &self,
+        provider: RemoteProvider,
+        sample: Option<RemoteSample>,
+    ) -> Result<AppState, VoiceMeError>;
+
+    /// The Reference Voice Sample `provider` holds, if any.
+    fn load_remote_sample(
+        &self,
+        provider: RemoteProvider,
+    ) -> Result<Option<RemoteSample>, VoiceMeError> {
+        Ok(self.load()?.remote_sample(provider).cloned())
+    }
 }

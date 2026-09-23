@@ -227,6 +227,21 @@ mod tests {
             unimplemented!("not exercised by these tests")
         }
 
+        fn save_disclosure_confirmed(
+            &self,
+            _provider: voice_me_core::RemoteProvider,
+        ) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        fn save_remote_sample(
+            &self,
+            _provider: voice_me_core::RemoteProvider,
+            _sample: Option<voice_me_core::RemoteSample>,
+        ) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
         fn load(&self) -> Result<AppState, VoiceMeError> {
             Ok(AppState::default())
         }

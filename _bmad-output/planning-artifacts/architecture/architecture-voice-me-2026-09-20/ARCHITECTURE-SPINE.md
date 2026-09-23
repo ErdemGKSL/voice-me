@@ -162,7 +162,7 @@ graph TD
 
 - **Binds:** FR-5 (TTS generation), FR-10 (backend selection and remote disclosure)
 - **Prevents:** provider-specific HTTP details leaking into `voice-me-core` or `voice-me-ui`; a second provider forcing a redesign; and a request leaving the machine before the user has seen what it contains
-- **Rule:** `voice-me-tts-remote` implements the same `TtsPort` as the local backend, so the Speak Action path never branches on which backend is active. Inside it, one `SpeechProvider` trait per vendor (DeepInfra `ensembleAI/chatterbox-multilingual` first, fal.ai second) owns endpoint, auth header, request/response shape and error mapping; everything above it sees only `TtsPort` and `VoiceMeError` (AD-4).
+- **Rule:** `voice-me-tts-remote` implements the same `TtsPort` as the local backend, so the Speak Action path never branches on which backend is active. Inside it, one `SpeechProvider` trait per vendor (DeepInfra `ResembleAI/chatterbox-multilingual` first, fal.ai second) owns endpoint, auth header, request/response shape and error mapping; everything above it sees only `TtsPort` and `VoiceMeError` (AD-4).
 - **The Reference Voice Sample is uploaded once per provider and referenced by id** thereafter, keyed by (provider, sample hash) so re-recording invalidates the cached id. That the sample is held on the provider's infrastructure is user-visible state, with a delete path (FR-10) — not an implementation detail.
 - **Credentials:** the API key is stored in the settings TOML in plaintext, behind `SettingsStore` like any other setting (product-owner decision, 2026-09-22). **Stated consequence:** any process running as the user, any backup, and any config pasted into an issue carries that key — so the UI says so at the point of entry, and the key is redacted at the `tracing` boundary and never written to logs. Moving to the OS keyring later is a change behind the same port, not a redesign.
 - **Disclosure is core's gate, not the adapter's courtesy:** the use-case refuses to call a remote provider until a one-time confirmation for that provider is recorded in settings.
@@ -194,7 +194,7 @@ graph TD
 | ONNX Runtime | one CI-built distribution matching the pinned `ort` rc, carrying the CPU, CUDA and WebGPU execution providers, built from source and mirrored per AD-7 |
 | reqwest | latest stable — HTTP client with `rustls`; permitted only in `voice-me-deps` and `voice-me-tts-remote` (AD-8) |
 | serde_json | latest stable — remote provider request/response bodies (AD-13) |
-| Speech providers (external) | DeepInfra `ensembleAI/chatterbox-multilingual` (default), fal.ai — user-supplied keys, AD-13 |
+| Speech providers (external) | DeepInfra `ResembleAI/chatterbox-multilingual` (default), fal.ai — user-supplied keys, AD-13 |
 | tokenizers (HF) | latest stable — pin at implementation time; loads the model's `tokenizer.json` |
 | ndarray | latest stable — tensor plumbing for the AD-12 generation loop |
 | symphonia + rubato | latest stable — decode the Reference Voice Sample (wav/mp3/flac/ogg) and resample it to 24 kHz mono f32 for `speech_encoder.onnx` |

@@ -13,3 +13,5 @@ tempfile = "3.14"
 # real `PromptOverlayView` and a real `AppEvent` channel.
 gpui-kit = { version = "0.6.4", features = ["test-support"] }
 futures = "0.3"
+# Story 3.6: the egress allowlist reads every crate's manifest.
+toml = "1.1"

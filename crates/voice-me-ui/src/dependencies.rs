@@ -54,7 +54,7 @@ use gpui_kit::{
 use voice_me_core::{
     ActiveBackend, ApiKeys, AppEvent, AppEventSender, BackendSelection, CheckRequest, Dependency,
     DependencyKind, DependencyOutcome, DependencyProvisioningPort, LocalRuntime, RemoteProvider,
-    backend_choices, format_bytes,
+    RemoteSample, backend_choices, format_bytes,
     tokio_bridge::{self, TokioRuntime},
 };
 
@@ -77,6 +77,8 @@ pub enum BackendAction {
     /// Relaunch voice-me so a selection that needs another runtime library
     /// takes effect.
     Restart,
+    /// Delete the Reference Voice Sample this provider holds (Story 3.6).
+    DeleteRemoteSample(RemoteProvider),
 }
 
 /// Written by hand so a key typed into the API keys section can never reach
@@ -96,6 +98,9 @@ impl std::fmt::Debug for BackendAction {
                 .finish(),
             BackendAction::UseCpu => f.write_str("UseCpu"),
             BackendAction::Restart => f.write_str("Restart"),
+            BackendAction::DeleteRemoteSample(provider) => {
+                f.debug_tuple("DeleteRemoteSample").field(provider).finish()
+            }
         }
     }
 }
@@ -112,6 +117,8 @@ pub enum BackendArea {
     ApiKey(RemoteProvider),
     Capability,
     Restart,
+    /// The voice sample a provider holds (Story 3.6).
+    RemoteSample(RemoteProvider),
 }
 
 /// Everything the backend section shows, as the composition root last
@@ -131,6 +138,10 @@ pub struct BackendPanel {
     /// What "Check again" and Install ask about.
     pub check_request: CheckRequest,
     pub errors: HashMap<BackendArea, String>,
+    /// The Reference Voice Sample as each provider holds it (Story 3.6).
+    pub remote_samples: Vec<RemoteSample>,
+    /// Providers whose held sample is being deleted right now.
+    pub deleting_samples: Vec<RemoteProvider>,
 }
 
 impl Default for BackendPanel {
@@ -144,6 +155,8 @@ impl Default for BackendPanel {
             probing: None,
             check_request: CheckRequest::cpu(),
             errors: HashMap::new(),
+            remote_samples: Vec::new(),
+            deleting_samples: Vec::new(),
         }
     }
 }
@@ -938,7 +951,86 @@ impl DependenciesView {
             .children(fields)
             .into_any_element()
     }
+
+    /// Story 3.6: whether a provider holds the Reference Voice Sample, and
+    /// the way to take it back. Only providers that can hold one are
+    /// listed.
+    fn remote_samples_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut lines = Vec::new();
+        for provider in SAMPLE_HOLDING_PROVIDERS {
+            let slug = provider_slug(provider);
+            let label = provider.label();
+            let held = self
+                .panel
+                .remote_samples
+                .iter()
+                .any(|sample| sample.provider == provider);
+            let deleting = self.panel.deleting_samples.contains(&provider);
+            let state = if held {
+                format!("Held on {label}'s servers")
+            } else {
+                format!("Not held on {label}")
+            };
+            lines.push(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(format!("Voice sample on {label}")),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("remote-sample-state-{slug}")))
+                                    .test_support()
+                                    .child(state),
+                            )
+                            .when(held, |el| {
+                                el.child(
+                                    Button::new(SharedString::from(format!(
+                                        "remote-sample-delete-{slug}"
+                                    )))
+                                    .small()
+                                    .label(if deleting {
+                                        "Deleting…".to_string()
+                                    } else {
+                                        format!("Delete from {label}")
+                                    })
+                                    .disabled(deleting)
+                                    .on_click(cx.listener(move |this, _, _window, cx| {
+                                        this.act(BackendAction::DeleteRemoteSample(provider), cx)
+                                    })),
+                                )
+                            }),
+                    )
+                    .when_some(
+                        self.panel
+                            .errors
+                            .get(&BackendArea::RemoteSample(provider))
+                            .cloned(),
+                        |el, error| {
+                            el.child(error_line(format!("remote-sample-error-{slug}"), error, cx))
+                        },
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        v_flex()
+            .id("backend-remote-samples")
+            .gap_2()
+            .children(lines)
+            .into_any_element()
+    }
 }
+
+/// The providers that can hold an uploaded Reference Voice Sample in this
+/// release. fal.ai joins with Story 3.7.
+const SAMPLE_HOLDING_PROVIDERS: [RemoteProvider; 1] = [RemoteProvider::DeepInfra];
 
 /// An inline error next to the control it belongs to.
 fn error_line(id: impl Into<SharedString>, error: String, cx: &App) -> AnyElement {
@@ -1013,6 +1105,7 @@ impl Render for DependenciesView {
             )
             .child(self.runtimes_section(cx))
             .child(self.api_keys_section(cx))
+            .child(self.remote_samples_section(cx))
     }
 }
 
@@ -1799,6 +1892,74 @@ mod tests {
             });
             window.render_frame(cx);
             assert_eq!(input.read(cx).value().as_ref(), "");
+        })
+        .unwrap();
+    }
+
+    /// Story 3.6: a held sample says so and offers Delete, which asks the
+    /// root exactly once; nothing held says that instead, with no button.
+    #[gpui_kit::test]
+    fn a_held_sample_offers_delete_through_the_root(cx: &mut TestAppContext) {
+        let panel = BackendPanel {
+            remote_samples: vec![RemoteSample {
+                provider: RemoteProvider::DeepInfra,
+                sample_sha256: "aa".to_string(),
+                voice_id: "v1".to_string(),
+            }],
+            ..BackendPanel::default()
+        };
+        let (window, view, recorded) = open_backend_tab(cx, panel, DependencyOutcome::Pending);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("remote-sample-state-deepinfra").is_some());
+            assert!(
+                window.try_find("remote-sample-state-fal-ai").is_none(),
+                "fal.ai holds no samples in this release"
+            );
+            window.click("remote-sample-delete-deepinfra", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            *recorded.borrow(),
+            vec![BackendAction::DeleteRemoteSample(RemoteProvider::DeepInfra)]
+        );
+
+        // The root says it is gone: the button goes with it.
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_backend_panel(BackendPanel::default(), cx)
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("remote-sample-delete-deepinfra").is_none());
+            assert!(window.try_find("remote-sample-state-deepinfra").is_some());
+        })
+        .unwrap();
+    }
+
+    /// A failed delete is shown inline, next to the sample line.
+    #[gpui_kit::test]
+    fn a_failed_delete_is_shown_inline(cx: &mut TestAppContext) {
+        let mut panel = BackendPanel {
+            remote_samples: vec![RemoteSample {
+                provider: RemoteProvider::DeepInfra,
+                sample_sha256: "aa".to_string(),
+                voice_id: "v1".to_string(),
+            }],
+            ..BackendPanel::default()
+        };
+        panel.errors.insert(
+            BackendArea::RemoteSample(RemoteProvider::DeepInfra),
+            "DeepInfra: internal".to_string(),
+        );
+        let (window, _view, _recorded) = open_backend_tab(cx, panel, DependencyOutcome::Pending);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("remote-sample-error-deepinfra").is_some());
+            assert!(window.try_find("remote-sample-delete-deepinfra").is_some());
         })
         .unwrap();
     }

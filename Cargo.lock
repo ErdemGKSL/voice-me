@@ -6407,6 +6407,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -6415,6 +6416,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log",
+ "mime_guess",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -8667,6 +8669,7 @@ dependencies = [
  "voice-me-tray-linux",
  "voice-me-tray-windows",
  "voice-me-tts",
+ "voice-me-tts-remote",
  "voice-me-ui",
 ]
 
@@ -8765,6 +8768,7 @@ dependencies = [
  "futures",
  "gpui-kit",
  "tempfile",
+ "toml 1.1.6+spec-1.1.0",
  "voice-me-core",
  "voice-me-ui",
 ]
@@ -8801,6 +8805,23 @@ dependencies = [
  "symphonia 0.6.1",
  "tempfile",
  "tokenizers",
+ "tokio",
+ "voice-me-core",
+]
+
+[[package]]
+name = "voice-me-tts-remote"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "futures",
+ "hound",
+ "reqwest",
+ "rubato",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "voice-me-core",
 ]
