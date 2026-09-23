@@ -332,9 +332,11 @@ fn remove_part(part: &Path, dir: &Path) -> Result<(), VoiceMeError> {
 /// Pull the one real runtime library out of the verified archive and give
 /// it its final name — `.part` then rename, like every download.
 ///
-/// Only a regular-file entry counts: the archive's `libonnxruntime.so` is a
-/// symlink chain, and extracting a symlink into the cache would leave the
-/// engine loading whatever it points at.
+/// The format follows the archive's extension: `.zip` (the Windows
+/// release) is read as a zip, anything else as a `.tgz` (the Linux one).
+/// Only a regular-file entry counts: the Linux archive's
+/// `libonnxruntime.so` is a symlink chain, and extracting a symlink into
+/// the cache would leave the engine loading whatever it points at.
 pub fn extract_runtime_library(
     archive: &Path,
     entry_name: &str,
@@ -361,6 +363,29 @@ pub fn extract_runtime_library(
         .map_err(|error| failed(format!("could not create {}: {error}", dir.display())))?;
 
     let file = File::open(archive).map_err(|error| failed(error.to_string()))?;
+    let is_zip = archive
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"));
+    let found = if is_zip {
+        extract_zip_entry(file, entry_name, destination, dir, &failed)?
+    } else {
+        extract_tar_entry(file, entry_name, destination, dir, &failed)?
+    };
+    if found {
+        Ok(())
+    } else {
+        Err(failed(format!("the archive has no {entry_name}")))
+    }
+}
+
+/// The `.tgz` reader: `Ok(false)` when no regular file has that name.
+fn extract_tar_entry(
+    file: File,
+    entry_name: &str,
+    destination: &Path,
+    dir: &Path,
+    failed: &dyn Fn(String) -> VoiceMeError,
+) -> Result<bool, VoiceMeError> {
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
     let entries = tar.entries().map_err(|error| failed(error.to_string()))?;
     for entry in entries {
@@ -372,31 +397,66 @@ pub fn extract_runtime_library(
         if !is_library || !entry.header().entry_type().is_file() {
             continue;
         }
-
-        let part = part_path(destination);
-        let mut out = File::create(&part)
-            .map_err(|error| failed(format!("could not write to {}: {error}", dir.display())))?;
-        std::io::copy(&mut entry, &mut out)
-            .and_then(|_| out.sync_all())
-            .map_err(|error| {
-                let _ = std::fs::remove_file(&part);
-                failed(format!("could not write to {}: {error}", dir.display()))
-            })?;
-        drop(out);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let _ = std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755));
-        }
-        return std::fs::rename(&part, destination).map_err(|error| {
-            failed(format!(
-                "could not move it into place in {}: {error}",
-                dir.display()
-            ))
-        });
+        write_entry(&mut entry, destination, dir, failed)?;
+        return Ok(true);
     }
+    Ok(false)
+}
 
-    Err(failed(format!("the archive has no {entry_name}")))
+/// The `.zip` reader: the entry is taken by its exact name and must be a
+/// regular file — not a directory, not a symlink. `Ok(false)` when there is
+/// no such file.
+fn extract_zip_entry(
+    file: File,
+    entry_name: &str,
+    destination: &Path,
+    dir: &Path,
+    failed: &dyn Fn(String) -> VoiceMeError,
+) -> Result<bool, VoiceMeError> {
+    let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
+        .map_err(|error| failed(error.to_string()))?;
+    let mut entry = match zip.by_name(entry_name) {
+        Ok(entry) => entry,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(false),
+        Err(error) => return Err(failed(error.to_string())),
+    };
+    if !entry.is_file() || entry.is_symlink() {
+        return Ok(false);
+    }
+    write_entry(&mut entry, destination, dir, failed)?;
+    Ok(true)
+}
+
+/// Write one archive entry to `destination` through its `.part` (made
+/// executable on unix), then give it its final name by rename.
+fn write_entry(
+    entry: &mut dyn std::io::Read,
+    destination: &Path,
+    dir: &Path,
+    failed: &dyn Fn(String) -> VoiceMeError,
+) -> Result<(), VoiceMeError> {
+    let part = part_path(destination);
+    let mut out = File::create(&part)
+        .map_err(|error| failed(format!("could not write to {}: {error}", dir.display())))?;
+    std::io::copy(entry, &mut out)
+        .and_then(|_| out.sync_all())
+        .map_err(|error| {
+            let _ = std::fs::remove_file(&part);
+            failed(format!("could not write to {}: {error}", dir.display()))
+        })?;
+    drop(out);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755));
+    }
+    std::fs::rename(&part, destination).map_err(|error| {
+        let _ = std::fs::remove_file(&part);
+        failed(format!(
+            "could not move it into place in {}: {error}",
+            dir.display()
+        ))
+    })
 }
 
 fn kept_sentence(kept: u64, size: u64) -> String {

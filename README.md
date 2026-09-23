@@ -81,9 +81,11 @@ open **Settings → Dependencies** and press **Install** on each missing row.
   1.56 GB, with progress shown on the row. An interrupted download resumes
   from the bytes already on disk the next time Install is pressed, and every
   file is checked against a pinned SHA-256 before it is used.
-- **ONNX Runtime** (Linux x64) — the core library from Microsoft's
-  `onnxruntime-linux-x64-1.28.2.tgz` release, extracted to
-  `<cache>/runtime/libonnxruntime.so`. No execution-provider libraries are
+- **ONNX Runtime** (Linux x64, Windows x64) — the core library from
+  Microsoft's `onnxruntime-linux-x64-1.28.2.tgz` release, extracted to
+  `<cache>/runtime/libonnxruntime.so`, or on Windows from
+  `onnxruntime-win-x64-1.28.2.zip`, extracted to
+  `<cache>/runtime/onnxruntime.dll`. No execution-provider libraries are
   fetched for the CPU backend. On other systems, or when `ORT_DYLIB_PATH`
   points somewhere that does not exist, the row shows short manual steps
   instead of an Install button.

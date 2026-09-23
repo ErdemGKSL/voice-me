@@ -151,8 +151,9 @@ impl DepsAdapter {
         }
     }
 
-    /// Decision 1: the runtime installs automatically on Linux x64 only,
-    /// and only into the cache — never over a path `ORT_DYLIB_PATH` names.
+    /// Decision 1: the runtime installs automatically on Linux x64 and
+    /// Windows x64 only, and only into the cache — never over a path
+    /// `ORT_DYLIB_PATH` names.
     fn provision_runtime(
         &self,
         backend: SpeechBackend,
@@ -448,7 +449,8 @@ fn runtime_row(
     if installable {
         Dependency::missing(DependencyKind::OnnxRuntime, RUNTIME_LABEL, detail)
     } else {
-        // Decision 1: only Linux x64 has an automatic runtime install.
+        // Decision 1: only Linux x64 and Windows x64 have an automatic
+        // runtime install.
         Dependency::missing(DependencyKind::OnnxRuntime, RUNTIME_LABEL, detail).manual([
             format!(
                 "Download ONNX Runtime {} for this system from Microsoft's onnxruntime releases.",

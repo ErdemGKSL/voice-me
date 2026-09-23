@@ -21,7 +21,8 @@ use voice_me_core::{SpeechWeights, VoiceMeError, assets};
 /// each other before, so the revision is part of the source, not a detail.
 pub const MODEL_REVISION: &str = "452d3f434aa592098f1eedac9099f33642ab2da5";
 
-/// The ONNX Runtime release the Linux x64 runtime comes from.
+/// The ONNX Runtime release the Linux x64 and Windows x64 runtimes come
+/// from.
 pub const RUNTIME_VERSION: &str = "1.28.2";
 
 /// The repository's resolve root; the revision is appended from
@@ -159,7 +160,8 @@ pub struct PlannedDownload {
 pub struct Sources {
     pub model_files: Vec<Asset>,
     /// `None` where no runtime can be installed automatically — every
-    /// target but Linux x64 (Decision 1).
+    /// target but Linux x64 and Windows x64 (Decision 1, extended by
+    /// spec 3-2 for Windows).
     pub runtime: Option<RuntimeArchive>,
 }
 
@@ -245,7 +247,30 @@ fn pinned_runtime() -> Option<RuntimeArchive> {
     })
 }
 
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn pinned_runtime() -> Option<RuntimeArchive> {
+    Some(RuntimeArchive {
+        archive: Asset {
+            relative_path: format!(
+                "{}/onnxruntime-win-x64-{RUNTIME_VERSION}.zip",
+                assets::RUNTIME_DIR
+            ),
+            url: format!(
+                "https://github.com/microsoft/onnxruntime/releases/download/v{RUNTIME_VERSION}/onnxruntime-win-x64-{RUNTIME_VERSION}.zip"
+            ),
+            size: 78_620_837,
+            // GitHub's own digest for the release asset (the same API
+            // returns the Linux pin above).
+            sha256: "c4eedd29489d5feca21866d054638416f3655bf6b18851b3b6b85c8313e95c35".to_string(),
+        },
+        library_entry: format!("onnxruntime-win-x64-{RUNTIME_VERSION}/lib/onnxruntime.dll"),
+    })
+}
+
+#[cfg(not(any(
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "windows", target_arch = "x86_64")
+)))]
 fn pinned_runtime() -> Option<RuntimeArchive> {
     None
 }
@@ -304,6 +329,30 @@ mod tests {
                 "the FP32 graph is not part of the Q4 set: {name}"
             );
         }
+    }
+
+    /// Windows x64 installs its runtime from Microsoft's `.zip`, and takes
+    /// only `onnxruntime.dll` out of it.
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[test]
+    fn windows_x64_pins_the_zip_runtime_and_its_dll() {
+        let runtime = Sources::pinned()
+            .runtime
+            .expect("Windows x64 has an automatic runtime install");
+
+        assert!(
+            runtime.archive.relative_path.ends_with(".zip"),
+            "{}",
+            runtime.archive.relative_path
+        );
+        assert!(runtime.archive.url.starts_with("https://"));
+        assert!(runtime.archive.url.contains(RUNTIME_VERSION));
+        assert_eq!(runtime.archive.sha256.len(), 64);
+        assert!(
+            runtime.library_entry.ends_with("/lib/onnxruntime.dll"),
+            "{}",
+            runtime.library_entry
+        );
     }
 
     #[test]

@@ -19,9 +19,13 @@ tokio = { version = "1.53", default-features = false, features = ["rt"] }
 # before it takes its final name.
 sha2 = "0.10"
 # The Linux ONNX Runtime ships as a `.tgz`; only its real shared library is
-# extracted.
+# extracted. (Windows ships a `.zip`, below.)
 flate2 = "1.1"
 tar = { version = "0.4", default-features = false }
+# The Windows ONNX Runtime ships as a `.zip`; the same single-entry
+# extraction. Unconditional, so the zip path is tested on every OS; only
+# deflate, the method Microsoft's archive uses.
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 # Story 3.3: the CUDA capability probe opens the NVIDIA driver library
 # (`libcuda.so.1` / `nvcuda.dll`) at run time — a missing driver is a
 # "not found" answer, never a link error. The version `ash` already uses.

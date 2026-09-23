@@ -161,3 +161,6 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-2-2-3-windows-tray-and-global-hotkey.md`
   summary: Unverified: the Windows-only real-registration hotkey tests may fail if the `windows-latest` CI runner refuses `RegisterHotKey` (medium if true).
   evidence: They pass on an interactive Windows 10 desktop. The first `build-windows` CI run settles it. If they fail, gate them behind an env var or `#[ignore]`.
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-2-install-the-onnx-runtime-on-windows.md`
+  summary: The ONNX Runtime row reports "ready" once the library file exists, without checking that it loads; on Windows `onnxruntime.dll` also needs the Visual C++ Redistributable (MSVC runtime).
+  evidence: `runtime_row` in `crates/voice-me-deps/src/lib.rs` checks only `resolved.path.exists()`. On a clean Windows machine without the VC++ runtime, Install succeeds and the row turns ready, but the engine then fails to load the DLL. The fix is a load probe (the capability `--probe-runtime` helper may already cover it; check) or a VC++ Redistributable dependency row with steps. It was pre-existing for manually copied runtimes; the Windows auto-install makes it easier to reach.

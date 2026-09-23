@@ -681,6 +681,125 @@ fn an_archive_without_the_library_names_the_extraction_failure() {
     assert!(!assets::bundled_runtime_dylib(fixture.root()).exists());
 }
 
+/// A small `.zip` shaped like the Windows release: the real library, the
+/// provider bridge the CPU path never loads, a header, and the directory
+/// entries a real zip carries.
+fn fake_runtime_zip(library: &[u8]) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    writer.add_directory("ort-9.9.9/", options).unwrap();
+    writer.add_directory("ort-9.9.9/lib/", options).unwrap();
+    let mut add_file = |path: &str, bytes: &[u8]| {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    };
+    add_file("ort-9.9.9/include/onnxruntime_c_api.h", b"/* header */");
+    add_file(
+        "ort-9.9.9/lib/onnxruntime_providers_shared.dll",
+        b"provider bridge",
+    );
+    add_file("ort-9.9.9/lib/onnxruntime.dll", library);
+    writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn a_zip_runtime_install_extracts_only_the_real_library_into_the_cache() {
+    let library = b"MZ pretend this is onnxruntime".to_vec();
+    let archive = fake_runtime_zip(&library);
+    let fixture = Fixture::with_extra_files(
+        vec![("runtime/ort-9.9.9.zip".to_string(), archive)],
+        Some("ort-9.9.9/lib/onnxruntime.dll".to_string()),
+    );
+
+    let (result, events) = fixture.provision(DependencyKind::OnnxRuntime);
+
+    assert_eq!(result, Ok(()));
+    let installed = assets::bundled_runtime_dylib(fixture.root());
+    assert_eq!(std::fs::read(&installed).unwrap(), library);
+    let runtime_dir: Vec<_> = walk(installed.parent().unwrap())
+        .into_iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        runtime_dir,
+        vec![assets::runtime_dylib_file_name().to_string()],
+        "no provider library, no header, no archive, no .part"
+    );
+    assert_eq!(finished(&events), vec![Ok(())]);
+}
+
+#[test]
+fn a_zip_without_the_library_names_the_extraction_failure() {
+    let archive = fake_runtime_zip(b"lib");
+    let fixture = Fixture::with_extra_files(
+        vec![("runtime/ort-9.9.9.zip".to_string(), archive)],
+        Some("ort-9.9.9/lib/not-here.dll".to_string()),
+    );
+
+    let (result, _) = fixture.provision(DependencyKind::OnnxRuntime);
+
+    let message = result.expect_err("nothing to extract");
+    assert!(
+        message.starts_with("Extraction of ")
+            && message.contains(
+                "from ort-9.9.9.zip failed: the archive has no ort-9.9.9/lib/not-here.dll"
+            ),
+        "{message}"
+    );
+    assert!(!assets::bundled_runtime_dylib(fixture.root()).exists());
+}
+
+/// A directory entry with the library's name is not the library.
+#[test]
+fn a_zip_directory_entry_is_not_taken_for_the_library() {
+    let archive = fake_runtime_zip(b"lib");
+    let fixture = Fixture::with_extra_files(
+        vec![("runtime/ort-9.9.9.zip".to_string(), archive)],
+        Some("ort-9.9.9/lib/".to_string()),
+    );
+
+    let (result, _) = fixture.provision(DependencyKind::OnnxRuntime);
+
+    let message = result.expect_err("a directory is not a library");
+    assert!(
+        message.contains("the archive has no ort-9.9.9/lib/"),
+        "{message}"
+    );
+    assert!(!assets::bundled_runtime_dylib(fixture.root()).exists());
+}
+
+/// A symlink entry with the library's name is not the library: extracting
+/// it would leave the engine loading whatever it points at.
+#[test]
+fn a_zip_symlink_entry_is_not_taken_for_the_library() {
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    writer
+        .start_file("ort-9.9.9/lib/onnxruntime_real.dll", options)
+        .unwrap();
+    writer.write_all(b"lib").unwrap();
+    writer
+        .add_symlink(
+            "ort-9.9.9/lib/onnxruntime.dll",
+            "onnxruntime_real.dll",
+            options,
+        )
+        .unwrap();
+    let archive = writer.finish().unwrap().into_inner();
+    let fixture = Fixture::with_extra_files(
+        vec![("runtime/ort-9.9.9.zip".to_string(), archive)],
+        Some("ort-9.9.9/lib/onnxruntime.dll".to_string()),
+    );
+
+    let (result, _) = fixture.provision(DependencyKind::OnnxRuntime);
+
+    let message = result.expect_err("a symlink is not a library");
+    assert!(message.contains("the archive has no"), "{message}");
+    assert!(!assets::bundled_runtime_dylib(fixture.root()).exists());
+}
+
 /// Never delete — or write over — a runtime the user configured.
 #[test]
 fn a_configured_runtime_path_is_never_provisioned_over() {
