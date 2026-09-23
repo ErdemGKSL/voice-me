@@ -15,8 +15,8 @@ pub use audio::{AudioBuffer, SAMPLE_RATE};
 pub use error::VoiceMeError;
 pub use event::AppEvent;
 pub use ports::{
-    DependencyProvisioningPort, HotkeyPort, NotificationPort, SettingsStore, TrayPort, TtsPort,
-    VirtualMicPort,
+    CheckRequest, DependencyProvisioningPort, HotkeyPort, NotificationPort, SettingsStore,
+    TrayPort, TtsPort, VirtualMicPort,
 };
 pub use settings_store::FileSettingsStore;
 pub use speak::{
@@ -24,9 +24,10 @@ pub use speak::{
     speak,
 };
 pub use state::{
-    AppState, DEFAULT_SPEECH_LANGUAGE, DEFAULT_UI_LANGUAGE, Dependency, DependencyKind,
-    DependencyOutcome, DependencyReport, DependencyStatus, SpeechBackend, SpeechExecutionTarget,
-    SpeechWeights, format_bytes,
+    ActiveBackend, ApiKeys, AppState, BackendSelection, DEFAULT_SPEECH_LANGUAGE,
+    DEFAULT_UI_LANGUAGE, Dependency, DependencyKind, DependencyOutcome, DependencyReport,
+    DependencyStatus, LocalRuntime, RemoteProvider, SpeechBackend, SpeechExecutionTarget,
+    SpeechWeights, backend_choices, format_bytes,
 };
 
 /// Sender half of the shared `AppEvent` channel (AD-3). Adapters hold only

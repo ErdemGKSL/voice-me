@@ -40,11 +40,23 @@
 //! Virtual Microphone instead of dropping it. The device itself is ensured
 //! once at startup, in the background, so a fresh machine needs no manual
 //! setup step (spec-2-9 Decision 1).
+//!
+//! Story 3.3 makes the backend a choice. The selection is persisted through
+//! `SettingsStore` and resolved here into the AD-9 backend on every read;
+//! the Dependency Check says whether it can run on this machine; the TTS
+//! adapter reports what it actually built (`SpeechSessionBuilt`), which is
+//! the only source of "Active". A switch that needs another runtime library
+//! than the one this process committed is saved and waits for a restart;
+//! any other switch rebuilds the adapter for the next Speak Action. Added
+//! runtime libraries are probed in a helper process (`--probe-runtime`),
+//! never loaded here.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt as _;
 use futures::channel::mpsc;
@@ -56,14 +68,16 @@ use gpui_kit::{
 #[cfg(target_os = "linux")]
 use voice_me_core::VoiceMeError;
 use voice_me_core::{
-    AppEvent, AppState, DependencyKind, DependencyOutcome, DependencyProvisioningPort,
-    DependencyReport, FileSettingsStore, HotkeyPort, NotificationPort, SettingsStore,
-    SpeechBackend, TtsPort, VirtualMicPort, tokio_bridge,
+    ActiveBackend, AppEvent, AppState, BackendSelection, CheckRequest, DependencyKind,
+    DependencyOutcome, DependencyProvisioningPort, DependencyReport, FileSettingsStore, HotkeyPort,
+    LocalRuntime, NotificationPort, SettingsStore, SpeechBackend, SpeechExecutionTarget, TtsPort,
+    VirtualMicPort, tokio_bridge,
 };
 use voice_me_deps::DepsAdapter;
 use voice_me_tts::TtsAdapter;
 use voice_me_ui::{
-    DependenciesTab, PromptOverlayView, RowProvisioning, SettingsView, blocker_notice,
+    BackendAction, BackendActions, BackendArea, BackendPanel, DependenciesTab, PromptOverlayView,
+    RowProvisioning, SettingsView, blocker_notice,
 };
 
 #[cfg(target_os = "linux")]
@@ -124,17 +138,324 @@ fn overlay_window_kind() -> WindowKind {
     WindowKind::PopUp
 }
 
-/// The AD-9 resolved speech backend for this run.
+/// The helper-process mode (Story 3.3 Decision 1): `voice-me
+/// --probe-runtime <path>` loads the library at `path` through `ort`,
+/// prints which execution providers it offers, and exits. The app runs
+/// itself this way so an added library is never loaded into the main
+/// process just to look at it — `ort` commits one library per process.
+const PROBE_RUNTIME_FLAG: &str = "--probe-runtime";
+
+/// The one line the helper prints on success, followed by the targets.
+const PROBE_OUTPUT_PREFIX: &str = "voice-me-probe-targets:";
+
+/// How long the helper may take before it is killed.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Set on a relaunched process: the pid of the instance that relaunched
+/// it, which has to be gone before this one grabs the tray and hotkey.
+const RESTART_WAIT_ENV: &str = "VOICE_ME_RESTART_WAIT_PID";
+
+/// Run the helper mode, returning the process exit code.
+fn run_runtime_probe(path: Option<std::ffi::OsString>) -> i32 {
+    let Some(path) = path else {
+        eprintln!("usage: voice-me {PROBE_RUNTIME_FLAG} <path to an ONNX Runtime library>");
+        return 2;
+    };
+    match voice_me_tts::sessions::probe_runtime(Path::new(&path)) {
+        Ok(targets) => {
+            println!("{}", probe_output_line(&targets));
+            0
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
+/// `voice-me-probe-targets:cpu,cuda`.
+fn probe_output_line(targets: &[SpeechExecutionTarget]) -> String {
+    let names = targets
+        .iter()
+        .map(|target| match target {
+            SpeechExecutionTarget::Cpu => "cpu",
+            SpeechExecutionTarget::Cuda => "cuda",
+            SpeechExecutionTarget::WebGpu => "webgpu",
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{PROBE_OUTPUT_PREFIX}{names}")
+}
+
+/// Read what the helper said about `file`. Anything but a clean exit with
+/// the one expected line is a refusal carrying the helper's own reason.
+fn parse_probe_output(
+    succeeded: bool,
+    stdout: &str,
+    stderr: &str,
+    file: &Path,
+) -> Result<Vec<SpeechExecutionTarget>, String> {
+    let reason = || {
+        stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| line.trim().to_string())
+            .unwrap_or_else(|| "the probe exited without saying why".to_string())
+    };
+    if !succeeded {
+        return Err(format!(
+            "{} is not a usable ONNX Runtime library: {}",
+            file.display(),
+            reason()
+        ));
+    }
+    let Some(line) = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(PROBE_OUTPUT_PREFIX))
+    else {
+        return Err(format!(
+            "Probing {} gave no answer: {}",
+            file.display(),
+            reason()
+        ));
+    };
+    let targets: Vec<_> = line
+        .split(',')
+        .filter_map(|name| match name.trim() {
+            "cpu" => Some(SpeechExecutionTarget::Cpu),
+            "cuda" => Some(SpeechExecutionTarget::Cuda),
+            "webgpu" => Some(SpeechExecutionTarget::WebGpu),
+            _ => None,
+        })
+        .collect();
+    if targets.is_empty() {
+        return Err(format!(
+            "{} offers none of the CPU, CUDA or WebGPU execution providers.",
+            file.display()
+        ));
+    }
+    Ok(targets)
+}
+
+/// Probe `file` in a helper process, killing it after [`PROBE_TIMEOUT`].
 ///
-/// Epic 3 owns detection: `voice-me-deps` emits nothing yet and
-/// `DependencyProvisioningPort::check` has no `events` parameter, so there
-/// is no detection result to read. Until Story 3.1 there is exactly one
-/// honest input — which release variant this binary was compiled as — and
-/// everything CI builds is the `cpu` variant. Written here, in the
-/// composition root, and read by `voice-me-tts` off `AppState` (AD-9); the
-/// TTS crate never calls `voice-me-deps`.
-fn resolved_speech_backend() -> SpeechBackend {
-    SpeechBackend::CPU
+/// Blocking: run it off the main thread. Both pipes are drained on their
+/// own threads so a chatty library cannot fill one and wedge the helper.
+fn probe_runtime_in_helper(file: &Path) -> Result<Vec<SpeechExecutionTarget>, String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("Could not find voice-me's own executable: {error}"))?;
+    let mut helper = std::process::Command::new(exe);
+    helper.arg(PROBE_RUNTIME_FLAG).arg(file);
+    run_probe(helper, file, PROBE_TIMEOUT)
+}
+
+/// Run the probe `helper` about `file`, killing it after `timeout` — split
+/// from [`probe_runtime_in_helper`] so the "Probe hangs" row can be driven
+/// with any stand-in command and a short timeout.
+fn run_probe(
+    mut helper: std::process::Command,
+    file: &Path,
+    timeout: Duration,
+) -> Result<Vec<SpeechExecutionTarget>, String> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+
+    let mut child = helper
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Could not start the runtime probe: {error}"))?;
+
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_string(&mut text);
+            }
+            text
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|pipe| Box::new(pipe) as _));
+    let stderr = drain(child.stderr.take().map(|pipe| Box::new(pipe) as _));
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Probing {} timed out", file.display()));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Could not wait for the runtime probe: {error}"));
+            }
+        }
+    };
+
+    parse_probe_output(
+        status.success(),
+        &stdout.join().unwrap_or_default(),
+        &stderr.join().unwrap_or_default(),
+        file,
+    )
+}
+
+/// The AD-9 resolved backend for `selection`: the target, and the weights
+/// the target implies (CPU → Q4, a GPU → FP16).
+///
+/// A remote selection never reaches the ONNX engine — no adapter is built
+/// for it — so it resolves to the CPU backend only so that a report has a
+/// backend to carry; its capability row is what the user sees.
+fn resolve_backend(selection: &BackendSelection) -> SpeechBackend {
+    match selection.local_target() {
+        Some(target) => SpeechBackend::for_target(target),
+        None => SpeechBackend::CPU,
+    }
+}
+
+/// What the Dependency Check is asked about for `state`.
+fn check_request(state: &AppState) -> CheckRequest {
+    CheckRequest {
+        backend: resolve_backend(&state.backend_selection),
+        selection: state.backend_selection.clone(),
+        has_api_key: match &state.backend_selection {
+            BackendSelection::Remote(provider) => state.api_keys.has(*provider),
+            BackendSelection::Local { .. } => false,
+        },
+    }
+}
+
+/// The runtime library a selection loads: the added one it names, or the
+/// bundled one by the usual rule. `None` for a remote selection, or when
+/// there is no cache root to resolve the bundled one against.
+fn selection_library(selection: &BackendSelection) -> Option<PathBuf> {
+    selection.local_target()?;
+    let root = voice_me_core::assets::model_cache_root().ok()?;
+    Some(voice_me_core::assets::resolve_runtime_dylib(&root, selection.added_runtime()).path)
+}
+
+/// Decision 2: a switch needs a restart exactly when this process already
+/// committed a runtime library and the new selection needs a different
+/// one. Nothing committed yet, the same library, or no library at all (a
+/// remote selection) all apply without one.
+fn needs_restart(committed: Option<&Path>, wanted: Option<&Path>) -> bool {
+    matches!((committed, wanted), (Some(committed), Some(wanted)) if committed != wanted)
+}
+
+/// Wait for the instance that relaunched this one to exit, so the tray and
+/// the hotkey grab are free before this one claims them.
+fn wait_for_previous_instance() {
+    let Some(pid) = std::env::var_os(RESTART_WAIT_ENV) else {
+        return;
+    };
+    // SAFETY: called first thing in `main`, before any thread exists.
+    unsafe { std::env::remove_var(RESTART_WAIT_ENV) };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    #[cfg(target_os = "linux")]
+    {
+        let proc_entry = Path::new("/proc").join(&pid);
+        while proc_entry.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, deadline);
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Relaunch voice-me with the same arguments (the "Restart now" button).
+/// The caller quits once this succeeds.
+fn relaunch() -> Result<(), String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("Could not find voice-me's own executable: {error}"))?;
+    std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(RESTART_WAIT_ENV, std::process::id().to_string())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Could not restart voice-me: {error}"))
+}
+
+/// The speech engine for the current selection, or why there is none.
+struct Engine {
+    port: Option<Arc<dyn TtsPort>>,
+    unavailable: Option<String>,
+    /// Which build of the engine this is. Every rebuild gets a new one, and
+    /// the adapter tags its `SpeechSessionBuilt` reports with it.
+    generation: u64,
+}
+
+/// The source of engine generations: each `build_engine` call takes the
+/// next one.
+static NEXT_ENGINE_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Build the engine `state` selects. Never falls back: a remote selection
+/// gets no engine and a sentence saying why, rather than a CPU one.
+fn build_engine(
+    state: &AppState,
+    runtime_error: Option<&str>,
+    events: &mpsc::UnboundedSender<AppEvent>,
+) -> Engine {
+    let generation = NEXT_ENGINE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let unavailable = |reason: String| Engine {
+        port: None,
+        unavailable: Some(reason),
+        generation,
+    };
+    if let Some(error) = runtime_error {
+        return unavailable(error.to_string());
+    }
+    if let BackendSelection::Remote(provider) = &state.backend_selection {
+        return unavailable(format!(
+            "{} is selected, and remote generation through it arrives in a later voice-me \
+             release. Choose a local backend under Settings → Dependencies.",
+            provider.label()
+        ));
+    }
+    match TtsAdapter::from_state(state) {
+        Ok(adapter) => Engine {
+            port: Some(Arc::new(adapter.with_events(events.clone(), generation))),
+            unavailable: None,
+            generation,
+        },
+        Err(error) => {
+            eprintln!("could not set up the speech engine: {error}");
+            unavailable(error.to_string())
+        }
+    }
+}
+
+/// Whether a `SpeechSessionBuilt` report may set "Active": only when it
+/// came from the engine in the slot now. A replaced engine's late report —
+/// an in-flight warm-up finishing after a switch — describes sessions the
+/// current engine never built.
+fn is_current_engine_report(current_generation: u64, reported_generation: u64) -> bool {
+    current_generation == reported_generation
+}
+
+/// Whether to warm the engine up now: a Reference Voice Sample exists, this
+/// engine has not been warmed yet, and the check that just landed was run
+/// for the *current* selection and found it runnable — so a selection that
+/// cannot run here never commits its runtime library just by trying, not
+/// even on the strength of a late report about the previous selection.
+fn should_warm_up(
+    runnable: bool,
+    for_current_selection: bool,
+    has_active_sample: bool,
+    already_warmed: bool,
+) -> bool {
+    runnable && for_current_selection && has_active_sample && !already_warmed
 }
 
 /// What a hotkey press should open, given what the last Dependency Check
@@ -245,7 +566,9 @@ fn current_state(
         eprintln!("could not read settings: {error}");
         AppState::default()
     });
-    state.speech_backend = resolved_speech_backend();
+    // AD-9: resolved from the persisted selection on every read, so a
+    // switch in Settings reaches the next Speak Action.
+    state.speech_backend = resolve_backend(&state.backend_selection);
     // The report is held here, not in the settings file (it describes the
     // filesystem, not a preference), and merged into the state every other
     // reader already receives.
@@ -505,6 +828,28 @@ mod tests {
     }
 
     impl SettingsStore for SampleAppearsLater {
+        fn save_backend_selection(
+            &self,
+            _selection: &voice_me_core::BackendSelection,
+        ) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        fn save_local_runtimes(
+            &self,
+            _runtimes: &[voice_me_core::LocalRuntime],
+        ) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        fn save_api_key(
+            &self,
+            _provider: voice_me_core::RemoteProvider,
+            _key: Option<&str>,
+        ) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
         fn load(&self) -> Result<AppState, VoiceMeError> {
             let nth = self.loads.fetch_add(1, Ordering::SeqCst);
             Ok(AppState {
@@ -837,6 +1182,208 @@ mod tests {
         }
     }
 
+    /// Story 3.3's pure decisions: resolution, the check request, restart
+    /// detection, and reading the probe helper's answer.
+    mod backend_choice {
+        use std::path::{Path, PathBuf};
+
+        use voice_me_core::{
+            ApiKeys, AppState, BackendSelection, RemoteProvider, SpeechBackend,
+            SpeechExecutionTarget, SpeechWeights,
+        };
+
+        use super::*;
+
+        fn cuda_on(path: &str) -> BackendSelection {
+            BackendSelection::Local {
+                runtime: Some(PathBuf::from(path)),
+                target: SpeechExecutionTarget::Cuda,
+            }
+        }
+
+        #[test]
+        fn the_selection_resolves_to_its_target_and_the_weights_it_implies() {
+            assert_eq!(
+                resolve_backend(&BackendSelection::BUNDLED_CPU),
+                SpeechBackend::CPU
+            );
+            let cuda = resolve_backend(&cuda_on("/opt/ort/libonnxruntime.so"));
+            assert_eq!(cuda.target, SpeechExecutionTarget::Cuda);
+            assert_eq!(cuda.weights, SpeechWeights::Fp16);
+        }
+
+        #[test]
+        fn the_check_request_carries_the_selection_and_only_whether_a_key_exists() {
+            let mut keys = ApiKeys::default();
+            keys.set(RemoteProvider::DeepInfra, Some("secret".to_string()));
+            let state = AppState {
+                backend_selection: BackendSelection::Remote(RemoteProvider::DeepInfra),
+                api_keys: keys,
+                ..AppState::default()
+            };
+
+            let request = check_request(&state);
+
+            assert!(request.has_api_key);
+            assert_eq!(
+                request.selection,
+                BackendSelection::Remote(RemoteProvider::DeepInfra)
+            );
+            assert!(!format!("{request:?}").contains("secret"));
+
+            let fal = AppState {
+                backend_selection: BackendSelection::Remote(RemoteProvider::FalAi),
+                ..state
+            };
+            assert!(
+                !check_request(&fal).has_api_key,
+                "each provider's key is its own"
+            );
+        }
+
+        /// Decision 2, as a decision.
+        #[test]
+        fn only_a_different_library_than_the_committed_one_needs_a_restart() {
+            let bundled = Path::new("/cache/runtime/libonnxruntime.so");
+            let cuda = Path::new("/opt/ort/libonnxruntime.so");
+
+            assert!(
+                !needs_restart(None, Some(cuda)),
+                "nothing committed yet: the switch applies to the next Speak Action"
+            );
+            assert!(
+                !needs_restart(Some(bundled), Some(bundled)),
+                "same library: no restart"
+            );
+            assert!(needs_restart(Some(bundled), Some(cuda)));
+            assert!(
+                !needs_restart(Some(bundled), None),
+                "a remote selection loads no library"
+            );
+        }
+
+        #[test]
+        fn a_replaced_engines_late_report_is_ignored() {
+            assert!(is_current_engine_report(3, 3));
+            assert!(
+                !is_current_engine_report(4, 3),
+                "a warm-up of the engine before the switch must not set Active"
+            );
+        }
+
+        #[test]
+        fn warm_up_waits_for_a_runnable_check_and_happens_once_per_engine() {
+            assert!(should_warm_up(true, true, true, false));
+            assert!(
+                !should_warm_up(false, true, true, false),
+                "a check that found a blocker never triggers a warm-up"
+            );
+            assert!(
+                !should_warm_up(true, false, true, false),
+                "a late report about the previous selection never triggers one"
+            );
+            assert!(
+                !should_warm_up(true, true, false, false),
+                "no sample, no warm-up"
+            );
+            assert!(!should_warm_up(true, true, true, true), "already warmed");
+        }
+
+        /// No silent fallback: a remote selection gets no engine at all —
+        /// never a CPU one — and a sentence naming the provider.
+        #[test]
+        fn a_remote_selection_gets_no_engine() {
+            let (tx, _rx) = mpsc::unbounded();
+            let state = AppState {
+                backend_selection: BackendSelection::Remote(RemoteProvider::DeepInfra),
+                ..AppState::default()
+            };
+
+            let engine = build_engine(&state, None, &tx);
+
+            assert!(engine.port.is_none());
+            let reason = engine.unavailable.expect("the user is told why");
+            assert!(reason.contains("DeepInfra"), "{reason}");
+        }
+
+        #[test]
+        fn each_engine_build_gets_a_new_generation() {
+            let (tx, _rx) = mpsc::unbounded();
+            let state = AppState {
+                backend_selection: BackendSelection::Remote(RemoteProvider::FalAi),
+                ..AppState::default()
+            };
+
+            let first = build_engine(&state, None, &tx).generation;
+            let second = build_engine(&state, None, &tx).generation;
+
+            assert_ne!(first, second);
+        }
+
+        #[test]
+        fn the_probe_answer_round_trips() {
+            let targets = vec![SpeechExecutionTarget::Cpu, SpeechExecutionTarget::Cuda];
+            let file = Path::new("/opt/ort/libonnxruntime.so");
+
+            let parsed = parse_probe_output(
+                true,
+                &format!("some ort chatter\n{}\n", probe_output_line(&targets)),
+                "",
+                file,
+            );
+
+            assert_eq!(parsed, Ok(targets));
+        }
+
+        /// "Add runtime: bad file": nothing is added, and the helper's own
+        /// reason is what the user reads.
+        #[test]
+        fn a_file_the_helper_refused_is_reported_with_its_reason() {
+            let error = parse_probe_output(
+                false,
+                "",
+                "could not load /tmp/notes.txt: invalid ELF header\n",
+                Path::new("/tmp/notes.txt"),
+            )
+            .unwrap_err();
+
+            assert!(error.contains("/tmp/notes.txt"), "{error}");
+            assert!(error.contains("invalid ELF header"), "{error}");
+        }
+
+        #[test]
+        fn a_helper_that_printed_nothing_useful_is_refused() {
+            assert!(parse_probe_output(true, "", "", Path::new("/x.so")).is_err());
+            assert!(
+                parse_probe_output(true, "voice-me-probe-targets:", "", Path::new("/x.so"))
+                    .is_err()
+            );
+        }
+
+        /// "Probe hangs": a helper that never answers is killed at the
+        /// deadline, nothing is added, and the error says so.
+        #[cfg(unix)]
+        #[test]
+        fn a_helper_that_hangs_is_killed_and_reported_as_timed_out() {
+            let mut hang = std::process::Command::new("sleep");
+            hang.arg("30");
+            let started = std::time::Instant::now();
+
+            let error = run_probe(
+                hang,
+                Path::new("/opt/ort/libonnxruntime.so"),
+                Duration::from_millis(200),
+            )
+            .unwrap_err();
+
+            assert_eq!(error, "Probing /opt/ort/libonnxruntime.so timed out");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the helper was killed rather than waited out"
+            );
+        }
+    }
+
     #[test]
     fn an_x11_session_gets_a_true_always_on_top_overlay() {
         assert_eq!(
@@ -857,6 +1404,16 @@ mod tests {
 }
 
 fn main() {
+    // Decision 1's helper mode: probe one runtime library and exit, before
+    // anything else in this process exists.
+    let mut args = std::env::args_os().skip(1);
+    if args.next().is_some_and(|arg| arg == PROBE_RUNTIME_FLAG) {
+        std::process::exit(run_runtime_probe(args.next()));
+    }
+    // "Restart now": let the previous instance release the tray and the
+    // hotkey before this one claims them.
+    wait_for_previous_instance();
+
     let settings_store: Arc<dyn SettingsStore> =
         Arc::new(FileSettingsStore::new().expect("failed to resolve settings/data directories"));
 
@@ -906,28 +1463,23 @@ fn main() {
 
         // The speech engine holds its four ONNX Runtime sessions for the
         // process lifetime (AD-10) and serializes generations itself, so it
-        // is built once here and shared.
+        // is built once here and shared — until the user switches backend
+        // (Story 3.3), when the slot is rebuilt for the next Speak Action.
         //
         // A cache directory that cannot be resolved — or a Tokio runtime
         // that would not start — is not a reason to lose the tray, the
         // hotkey and Settings: every other adapter failure in this function
         // degrades that way, and these are no more fatal. The engine is
         // simply unavailable, and the Speak Action reports why, in words,
-        // the moment it is pressed. `engine_error` carries that reason all
+        // the moment it is pressed. `unavailable` carries that reason all
         // the way to the notification, because "could not be set up" with no
         // cause is exactly the unactionable message the rest of this story
         // works to avoid.
-        let (tts_port, engine_error): (Option<Arc<dyn TtsPort>>, Option<String>) = match (
-            runtime_error,
-            TtsAdapter::from_state(&current_state(&settings_store, &DependencyOutcome::Pending)),
-        ) {
-            (None, Ok(adapter)) => (Some(Arc::new(adapter)), None),
-            (Some(error), _) => (None, Some(error)),
-            (None, Err(error)) => {
-                eprintln!("could not set up the speech engine: {error}");
-                (None, Some(error.to_string()))
-            }
-        };
+        let engine: Rc<RefCell<Engine>> = Rc::new(RefCell::new(build_engine(
+            &current_state(&settings_store, &DependencyOutcome::Pending),
+            runtime_error.as_deref(),
+            &event_tx,
+        )));
 
         // Stories 3.1/3.2: detection, and one-click provisioning. One
         // adapter for the whole process — it remembers which rows are
@@ -1030,6 +1582,275 @@ fn main() {
         let provisioning: Rc<RefCell<HashMap<DependencyKind, RowProvisioning>>> =
             Rc::new(RefCell::new(HashMap::new()));
 
+        // Story 3.3: the backend section's own state. "Active" comes only
+        // from the adapter's `SpeechSessionBuilt`; the rest is what the
+        // last backend action left behind.
+        let active_backend: Rc<RefCell<ActiveBackend>> =
+            Rc::new(RefCell::new(ActiveBackend::NotStarted));
+        let restart_pending = Rc::new(Cell::new(false));
+        let probing: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
+        let backend_errors: Rc<RefCell<HashMap<BackendArea, String>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        // Warm-up waits for the first check that finds the selected backend
+        // runnable, so a selection that cannot run here never commits its
+        // runtime library by trying.
+        let warmed_up = Rc::new(Cell::new(false));
+
+        // What the backend section shows, from the settings file and the
+        // state above.
+        let make_panel: Rc<dyn Fn() -> BackendPanel> = Rc::new({
+            let settings_store = settings_store.clone();
+            let active_backend = active_backend.clone();
+            let restart_pending = restart_pending.clone();
+            let probing = probing.clone();
+            let backend_errors = backend_errors.clone();
+            move || {
+                let state = settings_store.load().unwrap_or_default();
+                BackendPanel {
+                    check_request: check_request(&state),
+                    selection: state.backend_selection,
+                    runtimes: state.local_runtimes,
+                    api_keys: state.api_keys,
+                    active: active_backend.borrow().clone(),
+                    restart_pending: restart_pending.get(),
+                    probing: probing.borrow().clone(),
+                    errors: backend_errors.borrow().clone(),
+                }
+            }
+        });
+
+        // Push that into an open Settings window. Deferred, because the
+        // action that caused it usually arrives from inside that very view.
+        let push_panel: Rc<dyn Fn(&mut App)> = Rc::new({
+            let make_panel = make_panel.clone();
+            let settings_view_slot = settings_view_slot.clone();
+            move |cx: &mut App| {
+                let make_panel = make_panel.clone();
+                let settings_view_slot = settings_view_slot.clone();
+                cx.defer(move |cx| {
+                    if let Some(view) = settings_view_slot.borrow().clone() {
+                        let panel = make_panel();
+                        view.update(cx, |view, cx| view.set_backend_panel(panel, cx));
+                    }
+                });
+            }
+        });
+
+        // Re-run the Dependency Check for whatever is selected now, in the
+        // background. A check that ran reports by event; only one that
+        // could not run lands here.
+        let run_check: Rc<dyn Fn(&mut App)> = Rc::new({
+            let settings_store = settings_store.clone();
+            let deps_port = deps_port.clone();
+            let event_tx = event_tx.clone();
+            let dependency_outcome = dependency_outcome.clone();
+            let settings_view_slot = settings_view_slot.clone();
+            let provisioning = provisioning.clone();
+            move |cx: &mut App| {
+                let request = check_request(&current_state(
+                    &settings_store,
+                    &dependency_outcome.borrow(),
+                ));
+                let events = event_tx.clone();
+                let deps_port = deps_port.clone();
+                let check = cx.background_spawn(async move { deps_port.check(request, events) });
+                let dependency_outcome = dependency_outcome.clone();
+                let settings_view_slot = settings_view_slot.clone();
+                let provisioning = provisioning.clone();
+                cx.spawn(async move |cx| {
+                    let Err(error) = check.await else { return };
+                    eprintln!("the dependency check could not run: {error}");
+                    let outcome = DependencyOutcome::Failed(error.to_string());
+                    *dependency_outcome.borrow_mut() = outcome.clone();
+                    cx.update(|cx| {
+                        if let Some(view) = settings_view_slot.borrow().clone() {
+                            // No report is coming to replace the view's
+                            // map, so a row left "installing" after an `Ok`
+                            // finish is resynced from the held one.
+                            let rows = provisioning.borrow().clone();
+                            view.update(cx, |view, cx| {
+                                view.set_dependency_outcome(outcome, cx);
+                                view.replace_provisioning(rows, cx);
+                            });
+                        }
+                    });
+                })
+                .detach();
+            }
+        });
+
+        // Make `selection` the selected backend (Decisions 2 and 3): saved
+        // at once; the engine is rebuilt for the next Speak Action unless
+        // the selection needs another runtime library than the one this
+        // process committed, in which case the tab says a restart is due.
+        let apply_selection: Rc<dyn Fn(BackendSelection, BackendArea, &mut App)> = Rc::new({
+            let settings_store = settings_store.clone();
+            let engine = engine.clone();
+            let event_tx = event_tx.clone();
+            let dependency_outcome = dependency_outcome.clone();
+            let active_backend = active_backend.clone();
+            let restart_pending = restart_pending.clone();
+            let backend_errors = backend_errors.clone();
+            let run_check = run_check.clone();
+            let push_panel = push_panel.clone();
+            let runtime_error = runtime_error.clone();
+            let warmed_up = warmed_up.clone();
+            move |selection: BackendSelection, area: BackendArea, cx: &mut App| {
+                match settings_store.save_backend_selection(&selection) {
+                    Err(error) => {
+                        backend_errors
+                            .borrow_mut()
+                            .insert(area, format!("Couldn't save the backend choice: {error}"));
+                    }
+                    Ok(_) => {
+                        let mut errors = backend_errors.borrow_mut();
+                        errors.remove(&BackendArea::Selection);
+                        errors.remove(&BackendArea::Capability);
+                        drop(errors);
+                        let committed = voice_me_tts::sessions::committed_runtime();
+                        let wanted = selection_library(&selection);
+                        if needs_restart(committed.as_deref(), wanted.as_deref()) {
+                            restart_pending.set(true);
+                        } else {
+                            restart_pending.set(false);
+                            let state =
+                                current_state(&settings_store, &dependency_outcome.borrow());
+                            *engine.borrow_mut() =
+                                build_engine(&state, runtime_error.as_deref(), &event_tx);
+                            // A fresh adapter has built nothing yet, and
+                            // is warmed up by the next runnable check.
+                            *active_backend.borrow_mut() = ActiveBackend::NotStarted;
+                            warmed_up.set(false);
+                        }
+                    }
+                }
+                (*run_check)(cx);
+                (*push_panel)(cx);
+            }
+        });
+
+        // Everything the backend section asks for arrives here; the view
+        // itself never touches `SettingsStore`.
+        let backend_actions: BackendActions = Rc::new({
+            let settings_store = settings_store.clone();
+            let probing = probing.clone();
+            let backend_errors = backend_errors.clone();
+            let run_check = run_check.clone();
+            let push_panel = push_panel.clone();
+            let apply_selection = apply_selection.clone();
+            move |action: BackendAction, cx: &mut App| match action {
+                BackendAction::Select(selection) => {
+                    (*apply_selection)(selection, BackendArea::Selection, cx)
+                }
+                BackendAction::UseCpu => {
+                    (*apply_selection)(BackendSelection::BUNDLED_CPU, BackendArea::Capability, cx)
+                }
+                BackendAction::AddRuntime(path) => {
+                    if probing.borrow().is_some() {
+                        return;
+                    }
+                    *probing.borrow_mut() = Some(path.clone());
+                    backend_errors.borrow_mut().remove(&BackendArea::Runtimes);
+                    (*push_panel)(cx);
+
+                    let probe = {
+                        let path = path.clone();
+                        cx.background_spawn(async move { probe_runtime_in_helper(&path) })
+                    };
+                    let settings_store = settings_store.clone();
+                    let probing = probing.clone();
+                    let backend_errors = backend_errors.clone();
+                    let push_panel = push_panel.clone();
+                    cx.spawn(async move |cx| {
+                        let result = probe.await.and_then(|targets| {
+                            let mut runtimes = settings_store
+                                .load()
+                                .map_err(|error| error.to_string())?
+                                .local_runtimes;
+                            runtimes.retain(|runtime| runtime.path != path);
+                            runtimes.push(LocalRuntime {
+                                path: path.clone(),
+                                targets,
+                            });
+                            settings_store
+                                .save_local_runtimes(&runtimes)
+                                .map(|_| ())
+                                .map_err(|error| format!("Couldn't save the runtime: {error}"))
+                        });
+                        *probing.borrow_mut() = None;
+                        if let Err(reason) = result {
+                            eprintln!("adding a runtime failed: {reason}");
+                            backend_errors
+                                .borrow_mut()
+                                .insert(BackendArea::Runtimes, reason);
+                        }
+                        cx.update(|cx| (*push_panel)(cx));
+                    })
+                    .detach();
+                }
+                BackendAction::RemoveRuntime(path) => {
+                    let result = settings_store.load().and_then(|state| {
+                        let runtimes: Vec<_> = state
+                            .local_runtimes
+                            .into_iter()
+                            .filter(|runtime| runtime.path != path)
+                            .collect();
+                        settings_store.save_local_runtimes(&runtimes)
+                    });
+                    match result {
+                        Ok(state) => {
+                            backend_errors.borrow_mut().remove(&BackendArea::Runtimes);
+                            // A selection backed by the removed library has
+                            // nothing left to load; fall back to the
+                            // default, visibly.
+                            if state.backend_selection.added_runtime() == Some(path.as_path()) {
+                                (*apply_selection)(
+                                    BackendSelection::BUNDLED_CPU,
+                                    BackendArea::Runtimes,
+                                    cx,
+                                );
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            backend_errors.borrow_mut().insert(
+                                BackendArea::Runtimes,
+                                format!("Couldn't remove the runtime: {error}"),
+                            );
+                        }
+                    }
+                    (*push_panel)(cx);
+                }
+                BackendAction::SaveApiKey(provider, key) => {
+                    match settings_store.save_api_key(provider, key.as_deref()) {
+                        Ok(_) => {
+                            backend_errors
+                                .borrow_mut()
+                                .remove(&BackendArea::ApiKey(provider));
+                        }
+                        Err(error) => {
+                            backend_errors.borrow_mut().insert(
+                                BackendArea::ApiKey(provider),
+                                format!("Couldn't save the key: {error}"),
+                            );
+                        }
+                    }
+                    (*run_check)(cx);
+                    (*push_panel)(cx);
+                }
+                BackendAction::Restart => match relaunch() {
+                    Ok(()) => cx.quit(),
+                    Err(reason) => {
+                        eprintln!("{reason}");
+                        backend_errors
+                            .borrow_mut()
+                            .insert(BackendArea::Restart, reason);
+                        (*push_panel)(cx);
+                    }
+                },
+            }
+        });
+
         // The same one-at-a-time guarantee for the Prompt Overlay: a press
         // while one is already open activates it instead of stacking a
         // second window on top.
@@ -1049,6 +1870,8 @@ fn main() {
             let event_tx = event_tx.clone();
             let dependency_outcome = dependency_outcome.clone();
             let provisioning = provisioning.clone();
+            let make_panel = make_panel.clone();
+            let backend_actions = backend_actions.clone();
             move |cx: &mut App| {
                 if let Some(handle) = window_slot.borrow().as_ref() {
                     let _ = handle.update(cx, |_, window, _| window.activate_window());
@@ -1073,7 +1896,8 @@ fn main() {
                 let dependencies = DependenciesTab {
                     deps_port: deps_port.clone(),
                     events: event_tx.clone(),
-                    speech_backend: resolved_speech_backend(),
+                    backend: make_panel(),
+                    actions: backend_actions.clone(),
                     outcome: dependency_outcome.borrow().clone(),
                     provisioning: provisioning.borrow().clone(),
                 };
@@ -1230,25 +2054,6 @@ fn main() {
             (*open_settings)(cx);
         }
 
-        // Decision 3: warm-up is eager, but only for someone who already has
-        // a Reference Voice Sample. Session construction measured 86–110 s
-        // (spec-2-5), so paying it in the background at startup is what puts
-        // it behind the user's first Speak Action rather than in front of
-        // it — while a first-run user, who has no voice to clone yet, pays
-        // nothing at all.
-        if has_active_sample && let Some(tts) = tts_port.clone() {
-            let warm_up = tokio_bridge::spawn_blocking(cx, move || tts.warm_up());
-            cx.spawn(async move |_| {
-                if let Err(error) = warm_up.await {
-                    // Not notified: the user did not ask for this, and the
-                    // same failure is reported properly, with the same
-                    // message, the moment they actually press the hotkey.
-                    eprintln!("speech engine warm-up failed: {error}");
-                }
-            })
-            .detach();
-        }
-
         // Story 3.1: the startup check, in the background. Nothing waits on
         // it — the tray, the hotkey and Settings are all up already — and
         // its result arrives on the same channel every on-demand check
@@ -1258,10 +2063,11 @@ fn main() {
         // reason the virtual-microphone ensure uses it: this must happen
         // even on a run where the Tokio runtime would not start.
         {
-            let backend = resolved_speech_backend();
+            let request =
+                check_request(&current_state(&settings_store, &DependencyOutcome::Pending));
             let events = event_tx.clone();
             let deps_port = deps_port.clone();
-            let check = cx.background_spawn(async move { deps_port.check(backend, events) });
+            let check = cx.background_spawn(async move { deps_port.check(request, events) });
             let dependency_outcome = dependency_outcome.clone();
             let settings_view_slot = settings_view_slot.clone();
             let open_dependencies = open_dependencies.clone();
@@ -1331,6 +2137,14 @@ fn main() {
                     }
                     AppEvent::DependencyCheckCompleted { report } => {
                         let anything_missing = report.has_missing();
+                        let runnable = report.speech_engine_blocker().is_none();
+                        // A late report about the previous selection must
+                        // not start a warm-up for the current one.
+                        let for_current_selection = report.backend
+                            == resolve_backend(
+                                &current_state(&settings_store, &DependencyOutcome::Pending)
+                                    .backend_selection,
+                            );
                         // A row the check now calls ready has nothing left
                         // to install; whatever was held against it goes.
                         retain_missing_rows(&mut provisioning.borrow_mut(), &report);
@@ -1360,6 +2174,42 @@ fn main() {
                             *dependencies_auto_opened.borrow_mut() = true;
                             if should_auto_open_dependencies(!first_check, anything_missing) {
                                 (*open_dependencies)(cx);
+                            }
+
+                            // Decision 3 (spec-2-6): warm-up is eager, but
+                            // only for someone who already has a Reference
+                            // Voice Sample. Session construction measured
+                            // 86–110 s (spec-2-5), so paying it in the
+                            // background is what puts it behind the first
+                            // Speak Action rather than in front of it. Story
+                            // 3.3 adds the other condition: only once a
+                            // check finds the selected backend runnable, so
+                            // a selection that cannot run here never commits
+                            // its runtime library just by trying — which
+                            // would turn "Use CPU backend" into a restart.
+                            if should_warm_up(
+                                runnable,
+                                for_current_selection,
+                                has_active_sample,
+                                warmed_up.get(),
+                            ) {
+                                let current_engine = engine.borrow().port.clone();
+                                if let Some(tts) = current_engine {
+                                    warmed_up.set(true);
+                                    let warm_up =
+                                        tokio_bridge::spawn_blocking(cx, move || tts.warm_up());
+                                    cx.spawn(async move |_| {
+                                        if let Err(error) = warm_up.await {
+                                            // Not notified: the user did not
+                                            // ask for this, and the same
+                                            // failure is reported properly
+                                            // the moment they press the
+                                            // hotkey — and "Active" says it.
+                                            eprintln!("speech engine warm-up failed: {error}");
+                                        }
+                                    })
+                                    .detach();
+                                }
                             }
                         });
                     }
@@ -1403,42 +2253,28 @@ fn main() {
                         // the check runs again, on the same background
                         // path as the startup one. It reports by event;
                         // only a check that could not run lands here.
-                        let backend = resolved_speech_backend();
-                        let events = event_tx.clone();
-                        let deps_port = deps_port.clone();
-                        let dependency_outcome = dependency_outcome.clone();
-                        let settings_view_slot = settings_view_slot.clone();
-                        let provisioning = provisioning.clone();
-                        cx.update(|cx| {
-                            let check = cx
-                                .background_spawn(async move { deps_port.check(backend, events) });
-                            cx.spawn(async move |cx| {
-                                let Err(error) = check.await else { return };
-                                eprintln!("the dependency check could not run: {error}");
-                                let outcome = DependencyOutcome::Failed(error.to_string());
-                                *dependency_outcome.borrow_mut() = outcome.clone();
-                                cx.update(|cx| {
-                                    if let Some(view) = settings_view_slot.borrow().clone() {
-                                        // No report is coming to replace
-                                        // the view's map, so a row left
-                                        // "installing" after an `Ok` finish
-                                        // is resynced from the held one.
-                                        let rows = provisioning.borrow().clone();
-                                        view.update(cx, |view, cx| {
-                                            view.set_dependency_outcome(outcome, cx);
-                                            view.replace_provisioning(rows, cx);
-                                        });
-                                    }
-                                });
-                            })
-                            .detach();
-                        });
+                        cx.update(|cx| (*run_check)(cx));
+                    }
+                    AppEvent::SpeechSessionBuilt { generation, result } => {
+                        // A replaced engine's late report is not about the
+                        // engine in the slot now.
+                        if !is_current_engine_report(engine.borrow().generation, generation) {
+                            continue;
+                        }
+                        // The only writer of "Active" (AD-9): what the
+                        // engine actually built, or its own error.
+                        *active_backend.borrow_mut() = match result {
+                            Ok(backend) => ActiveBackend::Acquired(backend),
+                            Err(reason) => ActiveBackend::Failed(reason),
+                        };
+                        cx.update(|cx| (*push_panel)(cx));
                     }
                     AppEvent::SpeakRequested { text } => {
                         let settings_store = settings_store.clone();
                         let notifications = notification_port.clone();
                         let virtual_mic = virtual_mic_port.clone();
-                        let Some(tts) = tts_port.clone() else {
+                        let current_engine = engine.borrow().port.clone();
+                        let Some(tts) = current_engine else {
                             // The engine never came up at startup. Say so
                             // rather than dropping the line silently — this
                             // is the same contract `speak` honours for every
@@ -1448,7 +2284,7 @@ fn main() {
                             // main thread; `cx.background_spawn` rather than
                             // the Tokio bridge, since a failed runtime is one
                             // of the reasons we are in this branch at all.
-                            let reason = engine_error.clone();
+                            let reason = engine.borrow().unavailable.clone();
                             cx.update(|cx| {
                                 cx.background_spawn(async move {
                                     notify_engine_unavailable(

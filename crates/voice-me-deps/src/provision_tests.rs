@@ -318,7 +318,9 @@ impl Fixture {
 
     fn model_row_status(&self) -> DependencyStatus {
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
-        self.adapter().check(SpeechBackend::CPU, tx).unwrap();
+        self.adapter()
+            .check(voice_me_core::CheckRequest::cpu(), tx)
+            .unwrap();
         let Ok(AppEvent::DependencyCheckCompleted { report }) = rx.try_recv() else {
             panic!("the check reports by event");
         };

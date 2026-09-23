@@ -21,6 +21,7 @@
 //!   provisioner and the engine cannot disagree about what "provisioned"
 //!   means. `deps` never depends on `tts`.
 
+pub mod capability;
 pub mod provision;
 #[cfg(test)]
 mod provision_tests;
@@ -34,9 +35,11 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use voice_me_core::{
-    AppEvent, AppEventSender, Dependency, DependencyKind, DependencyProvisioningPort,
+    AppEvent, AppEventSender, CheckRequest, Dependency, DependencyKind, DependencyProvisioningPort,
     DependencyReport, SpeechBackend, SpeechExecutionTarget, SpeechWeights, VoiceMeError, assets,
 };
+
+use crate::capability::{GpuProbe, SystemGpuProbe};
 
 use crate::provision::ProgressReporter;
 use crate::sources::{PlannedDownload, Sources};
@@ -56,6 +59,10 @@ pub struct DepsAdapter {
     /// own `install()` in the app; injectable so the row's provisioning
     /// path is testable without an audio server.
     virtual_mic_installer: Arc<VirtualMicInstaller>,
+    /// What the capability row asks the hardware (Story 3.3). The real
+    /// driver and Vulkan probes in the app; injectable so every capability
+    /// row is testable with no GPU.
+    gpu_probe: Arc<dyn GpuProbe>,
 }
 
 type VirtualMicInstaller = dyn Fn() -> Result<(), VoiceMeError> + Send + Sync;
@@ -88,7 +95,14 @@ impl DepsAdapter {
             sources: Arc::new(sources),
             in_flight: Arc::default(),
             virtual_mic_installer: Arc::new(install_virtual_microphone),
+            gpu_probe: Arc::new(SystemGpuProbe),
         }
+    }
+
+    /// Replace what the capability row asks the hardware.
+    pub fn with_gpu_probe(mut self, probe: impl GpuProbe + 'static) -> Self {
+        self.gpu_probe = Arc::new(probe);
+        self
     }
 
     /// Replace what Install on the Virtual Microphone row runs.
@@ -123,6 +137,13 @@ impl DepsAdapter {
                 });
                 (self.virtual_mic_installer)()
             }
+            // Nothing to fetch: a backend that cannot run here is fixed by
+            // choosing another one, which the row's own action does.
+            DependencyKind::BackendCapability => Err(VoiceMeError::Other(
+                "Nothing can be installed to make this backend run here; choose the CPU \
+                 backend or another one instead."
+                    .to_string(),
+            )),
         }
     }
 
@@ -137,7 +158,9 @@ impl DepsAdapter {
         if backend.target != SpeechExecutionTarget::Cpu {
             return Err(VoiceMeError::Other(gpu_runtime_unavailable(backend)));
         }
-        let resolved = assets::resolve_runtime_dylib(&root);
+        // Only the bundled runtime is ever installed: a library the user
+        // added is theirs, and its row is manual when it goes missing.
+        let resolved = assets::resolve_runtime_dylib(&root, None);
         if resolved.configured {
             return Err(VoiceMeError::Other(format!(
                 "{} is set to {}; voice-me does not replace a runtime you configured. Unset it to \
@@ -174,16 +197,32 @@ impl DepsAdapter {
 }
 
 impl DependencyProvisioningPort for DepsAdapter {
-    fn check(&self, backend: SpeechBackend, events: AppEventSender) -> Result<(), VoiceMeError> {
+    fn check(&self, request: CheckRequest, events: AppEventSender) -> Result<(), VoiceMeError> {
         // The one failure that is not a report: with no cache directory to
         // resolve there is no path to state anything about, so the check
         // itself failed and the Dependencies tab says so with this reason.
         let root = assets::model_cache_root()?;
 
+        // Story 3.3: whether the selection can run here at all comes first
+        // — it is the row that explains every other one. A remote
+        // selection has no file list (its readiness is a key and a
+        // provider), so it reports no engine rows.
+        let capability = capability::capability_row(&request, self.gpu_probe.as_ref());
+        let engine_rows = match request.selection.local_target() {
+            Some(_) => speech_engine_rows(
+                &root,
+                request.backend,
+                request.selection.added_runtime(),
+                &self.sources,
+            ),
+            None => Vec::new(),
+        };
+
         let report = DependencyReport::new(
-            backend,
-            speech_engine_rows(&root, backend, &self.sources)
+            request.backend,
+            capability
                 .into_iter()
+                .chain(engine_rows)
                 .chain(virtual_microphone_row())
                 .collect(),
         );
@@ -296,13 +335,17 @@ fn block_on<T>(future: impl Future<Output = Result<T, VoiceMeError>>) -> Result<
 /// root rather than resolving it, so the whole I/O matrix can be driven
 /// against temporary directories. `sources` decides only whether the
 /// runtime row can offer Install on this target.
+///
+/// `added` is the runtime library the user added and selected, if any
+/// (Story 3.3): it is reported on like any other path.
 pub fn speech_engine_rows(
     root: &Path,
     backend: SpeechBackend,
+    added: Option<&Path>,
     sources: &Sources,
 ) -> Vec<Dependency> {
     vec![
-        runtime_row(root, backend, sources.runtime.is_some()),
+        runtime_row(root, backend, added, sources.runtime.is_some()),
         model_weights_row(root, backend.weights),
     ]
 }
@@ -316,8 +359,13 @@ pub fn speech_engine_rows(
 /// themselves; "nothing is configured and nothing is in the cache" is a
 /// provisioning gap Install fills — where a runtime for this target and
 /// backend exists to be installed at all.
-fn runtime_row(root: &Path, backend: SpeechBackend, installable: bool) -> Dependency {
-    let resolved = assets::resolve_runtime_dylib(root);
+fn runtime_row(
+    root: &Path,
+    backend: SpeechBackend,
+    added: Option<&Path>,
+    installable: bool,
+) -> Dependency {
+    let resolved = assets::resolve_runtime_dylib(root, added);
     let path = resolved.path.display();
 
     if resolved.path.exists() {
@@ -329,6 +377,21 @@ fn runtime_row(root: &Path, backend: SpeechBackend, installable: bool) -> Depend
             // this check never made.
             format!("Found at {path}."),
         );
+    }
+
+    if resolved.added {
+        return Dependency::missing(
+            DependencyKind::OnnxRuntime,
+            RUNTIME_LABEL,
+            format!("The runtime you added is no longer at {path}."),
+        )
+        // Nothing can be downloaded to replace a library the user chose.
+        .manual([
+            "Put the library back at that path, or remove it under Local runtimes and add it \
+             again from where it is now."
+                .to_string(),
+            "Or choose another backend above.".to_string(),
+        ]);
     }
 
     if resolved.configured {
@@ -395,11 +458,11 @@ fn runtime_row(root: &Path, backend: SpeechBackend, installable: bool) -> Depend
 }
 
 fn gpu_runtime_unavailable(backend: SpeechBackend) -> String {
-    let target = match backend.target {
-        SpeechExecutionTarget::Cpu => "CPU",
-        SpeechExecutionTarget::WebGpu => "WebGPU",
-    };
-    format!("The {target} backend's runtime is not yet available to install.")
+    format!(
+        "The {} backend's runtime is not yet available to install. Add a runtime library \
+         that provides it under Local runtimes.",
+        backend.target.label()
+    )
 }
 
 /// The model-files row for the *selected* weight variant.
@@ -446,11 +509,7 @@ fn model_weights_row(root: &Path, weights: SpeechWeights) -> Dependency {
 
 /// How the selected weight variant is named to the user.
 fn weights_label(weights: SpeechWeights) -> &'static str {
-    match weights {
-        SpeechWeights::Q4 => "Q4",
-        SpeechWeights::Fp16 => "FP16",
-        SpeechWeights::Fp32 => "FP32",
-    }
+    weights.label()
 }
 
 const RUNTIME_LABEL: &str = "ONNX Runtime";
@@ -572,7 +631,7 @@ mod tests {
         let _env = no_configured_runtime();
         let dir = provisioned(SpeechWeights::Q4);
 
-        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, &Sources::pinned());
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, None, &Sources::pinned());
 
         assert!(
             rows.iter().all(|row| row.status == DependencyStatus::Ready),
@@ -590,7 +649,7 @@ mod tests {
         );
         std::fs::remove_file(&weights).unwrap();
 
-        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, &Sources::pinned());
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, None, &Sources::pinned());
         let model = row(&rows, DependencyKind::ModelWeights);
 
         assert_eq!(model.status, DependencyStatus::Missing);
@@ -612,7 +671,7 @@ mod tests {
             assets::graph_file(dir.path(), "speech_encoder.onnx").with_extension("onnx_data");
         std::fs::remove_file(&data).unwrap();
 
-        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, &Sources::pinned());
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, None, &Sources::pinned());
 
         assert_eq!(
             row(&rows, DependencyKind::ModelWeights).status,
@@ -626,7 +685,7 @@ mod tests {
         let dir = provisioned(SpeechWeights::Q4);
         std::fs::remove_file(assets::tokenizer_file(dir.path())).unwrap();
 
-        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, &Sources::pinned());
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, None, &Sources::pinned());
 
         assert_eq!(
             row(&rows, DependencyKind::ModelWeights).status,
@@ -640,7 +699,7 @@ mod tests {
         let dir = provisioned(SpeechWeights::Q4);
         std::fs::remove_file(assets::bundled_runtime_dylib(dir.path())).unwrap();
 
-        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, &Sources::pinned());
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, None, &Sources::pinned());
         let runtime = row(&rows, DependencyKind::OnnxRuntime);
 
         assert_eq!(runtime.status, DependencyStatus::Missing);
@@ -666,7 +725,7 @@ mod tests {
         let stale = dir.path().join("moved-away").join("libonnxruntime.so");
         let _env = EnvGuard::new().set(assets::RUNTIME_DYLIB_ENV, &stale);
 
-        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, &Sources::pinned());
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, None, &Sources::pinned());
         let runtime = row(&rows, DependencyKind::OnnxRuntime);
 
         assert_eq!(runtime.status, DependencyStatus::Missing);
@@ -699,7 +758,7 @@ mod tests {
             weights: SpeechWeights::Fp16,
         };
 
-        let rows = speech_engine_rows(dir.path(), backend, &Sources::pinned());
+        let rows = speech_engine_rows(dir.path(), backend, None, &Sources::pinned());
         let runtime = row(&rows, DependencyKind::OnnxRuntime);
 
         assert!(!runtime.automatable);
@@ -722,7 +781,7 @@ mod tests {
             ..Sources::pinned()
         };
 
-        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, &no_runtime);
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, None, &no_runtime);
         let runtime = row(&rows, DependencyKind::OnnxRuntime);
 
         assert!(!runtime.automatable);
@@ -744,7 +803,7 @@ mod tests {
         touch(&elsewhere);
         let _env = EnvGuard::new().set(assets::RUNTIME_DYLIB_ENV, &elsewhere);
 
-        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, &Sources::pinned());
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, None, &Sources::pinned());
 
         assert_eq!(
             row(&rows, DependencyKind::OnnxRuntime).status,
@@ -759,7 +818,7 @@ mod tests {
         let _env = no_configured_runtime();
         let dir = provisioned(SpeechWeights::Fp16);
 
-        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, &Sources::pinned());
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, None, &Sources::pinned());
         let model = row(&rows, DependencyKind::ModelWeights);
 
         assert_eq!(model.status, DependencyStatus::Missing);
@@ -858,7 +917,7 @@ mod tests {
             .set(assets::CACHE_ROOT_ENV, dir.path());
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
 
-        DepsAdapter::new().check(SpeechBackend::CPU, tx).unwrap();
+        DepsAdapter::new().check(CheckRequest::cpu(), tx).unwrap();
 
         let AppEvent::DependencyCheckCompleted { report } =
             rx.try_recv().expect("the check reports by event")
@@ -871,6 +930,153 @@ mod tests {
                 .dependencies
                 .iter()
                 .any(|row| row.kind == DependencyKind::ModelWeights)
+        );
+    }
+
+    /// A probe that answers "nothing here" to everything.
+    struct NoGpu;
+
+    impl GpuProbe for NoGpu {
+        fn cuda(&self) -> capability::CudaProbe {
+            capability::CudaProbe::NoDriver
+        }
+
+        fn vulkan(&self) -> capability::VulkanProbe {
+            capability::VulkanProbe::NoLoader
+        }
+    }
+
+    fn check_with(request: CheckRequest, root: &Path) -> DependencyReport {
+        let _env = EnvGuard::new()
+            .unset(assets::RUNTIME_DYLIB_ENV)
+            .set(assets::CACHE_ROOT_ENV, root);
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        DepsAdapter::new()
+            .with_gpu_probe(NoGpu)
+            .check(request, tx)
+            .unwrap();
+        let AppEvent::DependencyCheckCompleted { report } = rx.try_recv().unwrap() else {
+            panic!("the check sends exactly one kind of event");
+        };
+        report
+    }
+
+    /// The acceptance criterion's machine: CUDA selected, no NVIDIA driver.
+    /// The capability row comes first, blocks, and is the overlay's reason.
+    #[test]
+    fn a_cuda_selection_with_no_driver_leads_with_a_blocking_capability_row() {
+        let dir = provisioned(SpeechWeights::Fp16);
+        let runtime = dir.path().join("gpu").join("libonnxruntime.so");
+        touch(&runtime);
+        let selection = voice_me_core::BackendSelection::Local {
+            runtime: Some(runtime.clone()),
+            target: SpeechExecutionTarget::Cuda,
+        };
+
+        let report = check_with(
+            CheckRequest {
+                backend: SpeechBackend::for_target(SpeechExecutionTarget::Cuda),
+                selection,
+                has_api_key: false,
+            },
+            dir.path(),
+        );
+
+        let first = &report.dependencies[0];
+        assert_eq!(first.kind, DependencyKind::BackendCapability);
+        assert!(
+            first.detail.contains("No NVIDIA driver found."),
+            "{}",
+            first.detail
+        );
+        assert_eq!(
+            report.speech_engine_blocker().map(|row| row.kind),
+            Some(DependencyKind::BackendCapability)
+        );
+        // The added library is reported on like any other path.
+        let runtime_row = row(&report.dependencies, DependencyKind::OnnxRuntime);
+        assert_eq!(runtime_row.status, DependencyStatus::Ready);
+        assert!(runtime_row.detail.contains(&runtime.display().to_string()));
+        // Weights follow the target: FP16 for CUDA.
+        assert!(
+            row(&report.dependencies, DependencyKind::ModelWeights)
+                .label
+                .contains("FP16")
+        );
+    }
+
+    /// A CPU selection has no capability row — and still no FP16 row.
+    #[test]
+    fn a_cpu_selection_reports_no_capability_row() {
+        let dir = provisioned(SpeechWeights::Q4);
+
+        let report = check_with(CheckRequest::cpu(), dir.path());
+
+        assert!(
+            !report
+                .dependencies
+                .iter()
+                .any(|row| row.kind == DependencyKind::BackendCapability),
+            "{:?}",
+            report.dependencies
+        );
+        assert!(report.speech_engine_blocker().is_none());
+    }
+
+    /// A remote selection's readiness is a key, not a file list.
+    #[test]
+    fn a_remote_selection_reports_no_engine_rows() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let report = check_with(
+            CheckRequest {
+                backend: SpeechBackend::CPU,
+                selection: voice_me_core::BackendSelection::Remote(
+                    voice_me_core::RemoteProvider::DeepInfra,
+                ),
+                has_api_key: false,
+            },
+            dir.path(),
+        );
+
+        assert_eq!(
+            report.dependencies[0].kind,
+            DependencyKind::BackendCapability
+        );
+        assert!(
+            !report.dependencies.iter().any(|row| matches!(
+                row.kind,
+                DependencyKind::OnnxRuntime | DependencyKind::ModelWeights
+            )),
+            "{:?}",
+            report.dependencies
+        );
+    }
+
+    #[test]
+    fn an_added_runtime_that_moved_is_a_manual_row_naming_its_path() {
+        let _env = no_configured_runtime();
+        let dir = provisioned(SpeechWeights::Fp16);
+        let gone = dir.path().join("moved").join("libonnxruntime.so");
+
+        let rows = speech_engine_rows(
+            dir.path(),
+            SpeechBackend::for_target(SpeechExecutionTarget::Cuda),
+            Some(&gone),
+            &Sources::pinned(),
+        );
+        let runtime = row(&rows, DependencyKind::OnnxRuntime);
+
+        assert_eq!(runtime.status, DependencyStatus::Missing);
+        assert!(!runtime.automatable);
+        assert!(runtime.detail.contains(&gone.display().to_string()));
+    }
+
+    #[test]
+    fn the_gpu_runtime_sentence_names_cuda() {
+        assert!(
+            gpu_runtime_unavailable(SpeechBackend::for_target(SpeechExecutionTarget::Cuda))
+                .contains("CUDA")
         );
     }
 }

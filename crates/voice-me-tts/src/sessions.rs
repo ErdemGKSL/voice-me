@@ -12,11 +12,12 @@
 //! otherwise.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use ort::ep::ExecutionProviderDispatch;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
-use voice_me_core::{SpeechWeights, VoiceMeError, assets};
+use voice_me_core::{SpeechExecutionTarget, SpeechWeights, VoiceMeError, assets};
 
 use crate::tokenizer::{TextTokenizer, tokenizer_path};
 
@@ -74,46 +75,49 @@ impl LanguageModel {
 /// Which execution provider to place the graphs on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecutionTarget {
-    /// The only target the default build can reach: Microsoft's linux-x64
-    /// tarball ships the core library and no provider libraries at all.
+    /// Every ONNX Runtime build has it.
     Cpu,
-    /// WebGPU (Dawn → Vulkan), per device id. Available only under the
-    /// `webgpu-probe` feature; see this crate's `Cargo.toml` for why that is
-    /// not the default. CUDA is deliberately absent — see spec-2-5's
-    /// Decision 1: this machine's GM107 is sm_50 and ONNX Runtime's prebuilt
-    /// CUDA floor is sm_60 with no PTX target to JIT from.
+    /// CUDA, per device id (Story 3.3). Reachable only through a runtime
+    /// library built with the CUDA provider, on a GPU at or above the
+    /// compute-capability floor the Dependency Check enforces.
+    Cuda { device_id: i32 },
+    /// WebGPU (Dawn → Vulkan), per device id. Reachable only through a
+    /// runtime library built with the WebGPU provider.
     WebGpu { device_id: i32 },
 }
 
 impl ExecutionTarget {
-    fn providers(self) -> Result<Vec<ExecutionProviderDispatch>, VoiceMeError> {
-        match self {
-            ExecutionTarget::Cpu => Ok(vec![ort::ep::CPU::default().build()]),
-            #[cfg(feature = "webgpu-probe")]
-            ExecutionTarget::WebGpu { device_id } => Ok(vec![
-                // `error_on_failure` turns a silent CPU fallback into a hard
-                // error — but only for EP *registration*. Per-node fallback
-                // is invisible to it, which is why the spike also reads
-                // ORT's own node-placement logging before calling any
-                // measurement a GPU measurement.
+    /// The providers a session is built with.
+    ///
+    /// A GPU target is registered with `error_on_failure`: a provider that
+    /// will not register is a hard error naming it, never ORT's default of
+    /// quietly carrying on on CPU. That is the whole of the no-silent-
+    /// fallback rule at this layer — and why "Active" can be believed.
+    /// (Per-node fallback is invisible to it; spec-2-5 reads ORT's own
+    /// placement logging for that.)
+    pub fn providers(self) -> Result<Vec<ExecutionProviderDispatch>, VoiceMeError> {
+        Ok(match self {
+            ExecutionTarget::Cpu => vec![ort::ep::CPU::default().build()],
+            ExecutionTarget::Cuda { device_id } => vec![
+                ort::ep::CUDA::default()
+                    .with_device_id(device_id)
+                    .build()
+                    .error_on_failure(),
+            ],
+            ExecutionTarget::WebGpu { device_id } => vec![
                 ort::ep::WebGPU::default()
                     .with_device_id(device_id)
                     .build()
                     .error_on_failure(),
-            ]),
-            #[cfg(not(feature = "webgpu-probe"))]
-            ExecutionTarget::WebGpu { .. } => Err(VoiceMeError::SpeechEngine(
-                "this build has no WebGPU support — rebuild with `--no-default-features \
-                 --features webgpu-probe`"
-                    .to_string(),
-            )),
-        }
+            ],
+        })
     }
 
     /// A short label for timing output.
     pub fn label(self) -> String {
         match self {
             ExecutionTarget::Cpu => "cpu".to_string(),
+            ExecutionTarget::Cuda { device_id } => format!("cuda:{device_id}"),
             ExecutionTarget::WebGpu { device_id } => format!("webgpu:{device_id}"),
         }
     }
@@ -175,48 +179,110 @@ impl ModelCache {
     }
 }
 
-/// Load ONNX Runtime itself.
+/// Which runtime library this process committed, if any.
 ///
-/// `load-dynamic` means the library is resolved at run time, from
-/// `ORT_DYLIB_PATH` or from `dylib` here. The environment is immutable once
-/// committed, so this is called once per process, before any session.
+/// `ort` commits exactly one `libonnxruntime` per process; a second
+/// `init_from` with a different path would silently keep using the first.
+/// Recording it here is what lets [`init_runtime`] refuse that honestly,
+/// and lets the composition root tell a switch that needs a restart from
+/// one that does not (Decision 2).
+static COMMITTED_RUNTIME: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// The runtime library this process has committed, or `None` if no session
+/// build has loaded one yet.
+pub fn committed_runtime() -> Option<PathBuf> {
+    COMMITTED_RUNTIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// Load ONNX Runtime itself.
 ///
 /// Under `webgpu-probe` there is no dylib to resolve — that build statically
 /// links pyke's Dawn-bundling distribution — so `dylib` is ignored and the
 /// environment is committed as-is.
 #[cfg(not(feature = "dynamic-runtime"))]
-pub fn init_runtime(_dylib: Option<&Path>) -> Result<(), VoiceMeError> {
+pub fn init_runtime(_dylib: &Path) -> Result<(), VoiceMeError> {
     let _ = ort::init().with_name("voice-me").commit();
     Ok(())
 }
 
-/// Load ONNX Runtime itself. See the `webgpu-probe` sibling above.
+/// Load ONNX Runtime itself, from `dylib` — the path the caller resolved
+/// with `assets::resolve_runtime_dylib`, the same rule the Dependency Check
+/// reports on.
+///
+/// The environment is immutable once committed, so the first successful
+/// call wins for the process lifetime. A later call naming the same
+/// library is a no-op; one naming a *different* library is refused with a
+/// sentence saying a restart is needed, because `ort` would otherwise keep
+/// running the first library while the caller believed it had switched.
 #[cfg(feature = "dynamic-runtime")]
-pub fn init_runtime(dylib: Option<&Path>) -> Result<(), VoiceMeError> {
-    let path = match dylib {
-        Some(path) => path.to_path_buf(),
-        // The same resolution rule the Dependency Check reports on
-        // (Story 3.1): `ORT_DYLIB_PATH` wins, otherwise the cache root's
-        // own copy. Reading it from one place is what keeps the runtime row
-        // from claiming "ready" about a library the engine would then fail
-        // to find.
-        None => assets::resolve_runtime_dylib(&assets::model_cache_root()?).path,
-    };
+pub fn init_runtime(dylib: &Path) -> Result<(), VoiceMeError> {
+    let mut committed = COMMITTED_RUNTIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(loaded) = committed.as_ref() {
+        if loaded == dylib {
+            return Ok(());
+        }
+        return Err(VoiceMeError::SpeechEngine(format!(
+            "ONNX Runtime is already loaded from {} in this session; restart voice-me to use {}",
+            loaded.display(),
+            dylib.display()
+        )));
+    }
 
-    if !path.exists() {
-        return Err(VoiceMeError::MissingRuntimeAsset { path });
+    if !dylib.exists() {
+        return Err(VoiceMeError::MissingRuntimeAsset {
+            path: dylib.to_path_buf(),
+        });
     }
 
     // `commit()` returns `bool`, not `Result`: `false` means an environment
-    // was already committed, which is fine — this is idempotent by design.
-    let _ = ort::init_from(&path)
+    // was already committed, which cannot happen here — this is the only
+    // place that commits one, and it holds the lock.
+    let _ = ort::init_from(dylib)
         .map_err(|error| {
-            VoiceMeError::SpeechEngine(format!("could not load {}: {error}", path.display()))
+            VoiceMeError::SpeechEngine(format!("could not load {}: {error}", dylib.display()))
         })?
         .with_name("voice-me")
         .commit();
+    *committed = Some(dylib.to_path_buf());
 
     Ok(())
+}
+
+/// Load the ONNX Runtime library at `dylib` and report which of the CPU,
+/// CUDA and WebGPU execution providers it offers (Story 3.3 Decision 1).
+///
+/// Only ever called in the `voice-me --probe-runtime` helper process: it
+/// commits `dylib` as that process's runtime, which the app itself must
+/// never do just to look at a file the user picked. A file that is not an
+/// ONNX Runtime library fails here, with `ort`'s reason.
+pub fn probe_runtime(dylib: &Path) -> Result<Vec<SpeechExecutionTarget>, VoiceMeError> {
+    init_runtime(dylib)?;
+
+    let available = |provider: &dyn ort::ep::ExecutionProvider| {
+        provider.is_available().map_err(|error| {
+            VoiceMeError::SpeechEngine(format!(
+                "could not ask {} for its execution providers: {error}",
+                dylib.display()
+            ))
+        })
+    };
+
+    let mut targets = Vec::new();
+    if available(&ort::ep::CPU::default())? {
+        targets.push(SpeechExecutionTarget::Cpu);
+    }
+    if available(&ort::ep::CUDA::default())? {
+        targets.push(SpeechExecutionTarget::Cuda);
+    }
+    if available(&ort::ep::WebGPU::default())? {
+        targets.push(SpeechExecutionTarget::WebGpu);
+    }
+    Ok(targets)
 }
 
 /// The four sessions plus the tokenizer, built once and held (AD-10).
@@ -364,70 +430,43 @@ mod tests {
     #[test]
     fn a_missing_onnx_runtime_names_the_dylib_rather_than_panicking() {
         let path = Path::new("/nonexistent/libonnxruntime.so");
-        let error = init_runtime(Some(path)).unwrap_err();
+        let error = init_runtime(path).unwrap_err();
         assert!(
             matches!(&error, VoiceMeError::MissingRuntimeAsset { path: p } if p == path),
             "got {error:?}"
         );
     }
 
-    /// The widened resolution rule, which is the whole reason the
-    /// Dependency Check's "ready" runtime row can be believed: with
-    /// `ORT_DYLIB_PATH` unset the engine must look in exactly the place
-    /// `voice-me-deps` reports on — `<cache root>/runtime/<dylib>` — and
-    /// nowhere else. If these two drift apart the tab says "ready" and
-    /// generation then fails naming a path the user was never shown.
-    ///
-    /// Both variables are process-global, so this restores whatever it
-    /// found; `ORT_DYLIB_PATH` is also read by the sibling test above.
-    #[cfg(feature = "dynamic-runtime")]
+    /// The no-silent-fallback rule at the provider layer: a GPU target is
+    /// registered so that a failure is an error, never a quiet CPU run.
     #[test]
-    fn an_unset_dylib_path_resolves_to_the_cache_root_the_check_reports_on() {
-        use std::ffi::OsString;
-
-        struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
-
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                for (key, value) in self.0.drain(..) {
-                    match value {
-                        Some(value) => unsafe { std::env::set_var(key, value) },
-                        None => unsafe { std::env::remove_var(key) },
-                    }
-                }
-            }
+    fn gpu_targets_refuse_to_fall_back_to_cpu() {
+        for target in [
+            ExecutionTarget::Cuda { device_id: 0 },
+            ExecutionTarget::WebGpu { device_id: 0 },
+        ] {
+            let providers = target.providers().unwrap();
+            assert_eq!(providers.len(), 1, "no CPU provider listed after it");
+            let described = format!("{:?}", providers[0]);
+            assert!(
+                described.contains("error_on_failure: true"),
+                "{target:?}: {described}"
+            );
         }
-
-        let cache = tempfile::tempdir().unwrap();
-        let _guard = EnvGuard(vec![
-            ("ORT_DYLIB_PATH", std::env::var_os("ORT_DYLIB_PATH")),
-            (
-                voice_me_core::assets::CACHE_ROOT_ENV,
-                std::env::var_os(voice_me_core::assets::CACHE_ROOT_ENV),
-            ),
-        ]);
-        unsafe {
-            std::env::remove_var("ORT_DYLIB_PATH");
-            std::env::set_var(voice_me_core::assets::CACHE_ROOT_ENV, cache.path());
-        }
-
-        let expected = assets::bundled_runtime_dylib(cache.path());
-        let error = init_runtime(None).unwrap_err();
-
-        assert!(
-            matches!(&error, VoiceMeError::MissingRuntimeAsset { path } if *path == expected),
-            "the engine must look where the Dependency Check says it looks \
-             ({}), got {error:?}",
-            expected.display()
+        let cuda = format!(
+            "{:?}",
+            ExecutionTarget::Cuda { device_id: 0 }.providers().unwrap()[0]
         );
+        assert!(cuda.contains("CUDAExecutionProvider"), "{cuda}");
     }
 
-    #[cfg(not(feature = "webgpu-probe"))]
+    #[cfg(feature = "dynamic-runtime")]
     #[test]
-    fn the_default_build_says_outright_that_it_cannot_reach_webgpu() {
-        let error = ExecutionTarget::WebGpu { device_id: 0 }
-            .providers()
-            .unwrap_err();
-        assert!(matches!(error, VoiceMeError::SpeechEngine(_)));
+    fn a_file_that_is_not_there_is_refused_by_the_probe_naming_it() {
+        let error = probe_runtime(Path::new("/nonexistent/libonnxruntime.so")).unwrap_err();
+        assert!(
+            matches!(&error, VoiceMeError::MissingRuntimeAsset { .. }),
+            "got {error:?}"
+        );
     }
 }

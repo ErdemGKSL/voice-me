@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::VoiceMeError;
 use crate::ports::SettingsStore;
-use crate::state::{AppState, DependencyOutcome, SpeechBackend};
+use crate::state::{
+    ActiveBackend, ApiKeys, AppState, BackendSelection, DependencyOutcome, LocalRuntime,
+    RemoteProvider, SpeechBackend, SpeechExecutionTarget,
+};
 
 const SETTINGS_FILE_NAME: &str = "settings.toml";
 const REFERENCE_VOICE_SAMPLE_FILE_NAME: &str = "reference_voice_sample.wav";
@@ -49,6 +52,109 @@ struct SettingsFile {
     speech_language: String,
     #[serde(default)]
     selected_mic_device: Option<String>,
+    /// Story 3.5. Absent in files written before it — which load as the
+    /// bundled CPU runtime, the only backend those builds had.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    backend_selection: Option<SelectionFile>,
+    /// Story 3.3: the ONNX Runtime libraries the user added.
+    #[serde(
+        default,
+        deserialize_with = "lenient_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    local_runtimes: Vec<LocalRuntime>,
+    /// Stories 3.5/3.6: plaintext, as the UI says next to the fields.
+    /// `ApiKeys`' own `Debug` keeps them out of this struct's. Lenient like
+    /// the fields above: a malformed table loses the keys, not the file.
+    #[serde(default, deserialize_with = "lenient_keys")]
+    api_keys: ApiKeys,
+}
+
+/// How a [`BackendSelection`] is written to TOML:
+///
+/// ```toml
+/// [backend_selection]
+/// kind = "local"
+/// runtime = "/opt/onnxruntime/lib/libonnxruntime.so"
+/// target = "cuda"
+/// ```
+///
+/// A mirror rather than serde on the core type, so the in-memory shape
+/// (`Remote(RemoteProvider)`) and the file format can each stay natural.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SelectionFile {
+    Local {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<PathBuf>,
+        target: SpeechExecutionTarget,
+    },
+    Remote {
+        provider: RemoteProvider,
+    },
+}
+
+impl From<&BackendSelection> for SelectionFile {
+    fn from(selection: &BackendSelection) -> Self {
+        match selection {
+            BackendSelection::Local { runtime, target } => SelectionFile::Local {
+                runtime: runtime.clone(),
+                target: *target,
+            },
+            BackendSelection::Remote(provider) => SelectionFile::Remote {
+                provider: *provider,
+            },
+        }
+    }
+}
+
+impl From<SelectionFile> for BackendSelection {
+    fn from(file: SelectionFile) -> Self {
+        match file {
+            SelectionFile::Local { runtime, target } => BackendSelection::Local { runtime, target },
+            SelectionFile::Remote { provider } => BackendSelection::Remote(provider),
+        }
+    }
+}
+
+/// A selection this build cannot read — a target a newer version wrote,
+/// say — falls back to the default rather than making the whole settings
+/// file unreadable: losing the hotkey over a backend name would be far
+/// worse than landing on the CPU backend, which the Dependencies tab then
+/// states plainly.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = toml::Value::deserialize(deserializer)?;
+    Ok(T::deserialize(value).ok())
+}
+
+/// The same leniency for the API keys: an unreadable table reads as no keys.
+fn lenient_keys<'de, D>(deserializer: D) -> Result<ApiKeys, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(lenient(deserializer)?.unwrap_or_default())
+}
+
+/// The same leniency per entry: one unreadable runtime drops out of the
+/// list without taking the others with it.
+fn lenient_list<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let values = Vec::<toml::Value>::deserialize(deserializer).unwrap_or_default();
+    Ok(values
+        .into_iter()
+        .filter_map(|value| T::deserialize(value).ok())
+        .collect())
 }
 
 /// Hand-written rather than derived: `Default` is what a *missing* settings
@@ -63,6 +169,9 @@ impl Default for SettingsFile {
             ui_language: default_ui_language(),
             speech_language: default_speech_language(),
             selected_mic_device: None,
+            backend_selection: None,
+            local_runtimes: Vec::new(),
+            api_keys: ApiKeys::default(),
         }
     }
 }
@@ -118,6 +227,14 @@ impl FileSettingsStore {
         let contents = toml::to_string_pretty(settings)
             .map_err(|err| VoiceMeError::Other(format!("failed to serialize settings: {err}")))?;
         fs::write(self.settings_path(), contents)?;
+        // The file holds API keys in plaintext (Stories 3.5/3.6), so on Unix
+        // it is readable by its owner only — which is what the UI's notice
+        // promises — including a file an older build left at 0644.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(self.settings_path(), fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 
@@ -130,8 +247,16 @@ impl FileSettingsStore {
             speech_language: settings.speech_language,
             selected_mic_device: settings.selected_mic_device,
             // Not persisted: the composition root overwrites it with the
-            // backend this build and this machine resolved to (AD-9).
+            // backend the selection below resolves to (AD-9).
             speech_backend: SpeechBackend::default(),
+            backend_selection: settings
+                .backend_selection
+                .map(BackendSelection::from)
+                .unwrap_or_default(),
+            local_runtimes: settings.local_runtimes,
+            api_keys: settings.api_keys,
+            // A fact about this process, never read from a file.
+            active_backend: ActiveBackend::default(),
             // Not persisted either, and for a stronger reason: a dependency
             // report describes the filesystem as it was a moment ago, so
             // one read back from a file would be a claim about a machine
@@ -192,6 +317,34 @@ impl SettingsStore for FileSettingsStore {
     fn save_hotkey(&self, hotkey: Option<&str>) -> Result<AppState, VoiceMeError> {
         let mut settings = self.read_settings_file()?;
         settings.hotkey = hotkey.map(str::to_string);
+        self.write_settings_file(&settings)?;
+        Ok(self.build_state(settings))
+    }
+
+    fn save_backend_selection(
+        &self,
+        selection: &BackendSelection,
+    ) -> Result<AppState, VoiceMeError> {
+        let mut settings = self.read_settings_file()?;
+        settings.backend_selection = Some(SelectionFile::from(selection));
+        self.write_settings_file(&settings)?;
+        Ok(self.build_state(settings))
+    }
+
+    fn save_local_runtimes(&self, runtimes: &[LocalRuntime]) -> Result<AppState, VoiceMeError> {
+        let mut settings = self.read_settings_file()?;
+        settings.local_runtimes = runtimes.to_vec();
+        self.write_settings_file(&settings)?;
+        Ok(self.build_state(settings))
+    }
+
+    fn save_api_key(
+        &self,
+        provider: RemoteProvider,
+        key: Option<&str>,
+    ) -> Result<AppState, VoiceMeError> {
+        let mut settings = self.read_settings_file()?;
+        settings.api_keys.set(provider, key.map(str::to_string));
         self.write_settings_file(&settings)?;
         Ok(self.build_state(settings))
     }
@@ -396,5 +549,177 @@ mod tests {
         assert_eq!(state.selected_mic_device, Some("USB Mic".to_string()));
         assert_eq!(state.hotkey, Some("Ctrl+Alt+KeyV".to_string()));
         assert_eq!(state.speech_language, "en");
+    }
+
+    fn store_in(config_dir: &Path, data_dir: &Path) -> FileSettingsStore {
+        FileSettingsStore::with_dirs(config_dir.to_path_buf(), data_dir.to_path_buf())
+    }
+
+    #[test]
+    fn a_file_from_before_story_3_5_loads_as_the_bundled_cpu_backend() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_dir.path().join(SETTINGS_FILE_NAME),
+            "hotkey = \"Ctrl+Alt+KeyV\"\nspeech_language = \"en\"\n",
+        )
+        .unwrap();
+
+        let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+
+        assert_eq!(state.backend_selection, BackendSelection::BUNDLED_CPU);
+        assert!(state.local_runtimes.is_empty());
+        assert_eq!(state.api_keys, ApiKeys::default());
+        assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
+    }
+
+    #[test]
+    fn the_backend_selection_round_trips_across_a_fresh_load() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = store_in(config_dir.path(), data_dir.path());
+
+        let cuda = BackendSelection::Local {
+            runtime: Some(PathBuf::from("/opt/ort/libonnxruntime.so")),
+            target: SpeechExecutionTarget::Cuda,
+        };
+        store.save_backend_selection(&cuda).unwrap();
+        assert_eq!(
+            store_in(config_dir.path(), data_dir.path())
+                .load()
+                .unwrap()
+                .backend_selection,
+            cuda
+        );
+
+        let remote = BackendSelection::Remote(RemoteProvider::FalAi);
+        store.save_backend_selection(&remote).unwrap();
+        assert_eq!(store.load().unwrap().backend_selection, remote);
+
+        let written = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
+        assert!(written.contains("fal_ai"), "{written}");
+    }
+
+    #[test]
+    fn added_runtimes_round_trip_and_leave_the_other_settings_alone() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = store_in(config_dir.path(), data_dir.path());
+        store.save_hotkey(Some("Ctrl+Alt+KeyV")).unwrap();
+
+        let runtimes = vec![LocalRuntime {
+            path: PathBuf::from("/opt/ort/libonnxruntime.so"),
+            targets: vec![SpeechExecutionTarget::Cpu, SpeechExecutionTarget::WebGpu],
+        }];
+        store.save_local_runtimes(&runtimes).unwrap();
+
+        let reloaded = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+        assert_eq!(reloaded.local_runtimes, runtimes);
+        assert_eq!(reloaded.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
+
+        let cleared = store.save_local_runtimes(&[]).unwrap();
+        assert!(cleared.local_runtimes.is_empty());
+    }
+
+    #[test]
+    fn api_keys_are_stored_independently_and_can_be_removed() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = store_in(config_dir.path(), data_dir.path());
+
+        store
+            .save_api_key(RemoteProvider::DeepInfra, Some("di-key"))
+            .unwrap();
+        let state = store
+            .save_api_key(RemoteProvider::FalAi, Some("fal-key"))
+            .unwrap();
+        assert_eq!(
+            state.api_keys.get(RemoteProvider::DeepInfra),
+            Some("di-key")
+        );
+        assert_eq!(state.api_keys.get(RemoteProvider::FalAi), Some("fal-key"));
+
+        // Decision: plaintext in the settings file, which the UI states.
+        let written = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
+        assert!(written.contains("di-key"), "{written}");
+
+        let state = store.save_api_key(RemoteProvider::DeepInfra, None).unwrap();
+        assert_eq!(state.api_keys.get(RemoteProvider::DeepInfra), None);
+        assert_eq!(
+            store_in(config_dir.path(), data_dir.path())
+                .load()
+                .unwrap()
+                .api_keys
+                .get(RemoteProvider::FalAi),
+            Some("fal-key")
+        );
+    }
+
+    #[test]
+    fn an_unreadable_selection_falls_back_without_losing_the_rest_of_the_file() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_dir.path().join(SETTINGS_FILE_NAME),
+            "hotkey = \"Ctrl+Alt+KeyV\"\n\n[backend_selection]\nkind = \"local\"\ntarget = \"tpu\"\n",
+        )
+        .unwrap();
+
+        let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+
+        assert_eq!(state.backend_selection, BackendSelection::BUNDLED_CPU);
+        assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
+    }
+
+    #[test]
+    fn the_settings_files_debug_output_never_contains_a_key() {
+        let settings = SettingsFile {
+            api_keys: {
+                let mut keys = ApiKeys::default();
+                keys.set(
+                    RemoteProvider::DeepInfra,
+                    Some("sk-very-secret".to_string()),
+                );
+                keys
+            },
+            ..SettingsFile::default()
+        };
+
+        assert!(!format!("{settings:?}").contains("sk-very-secret"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_settings_file_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let path = config_dir.path().join(SETTINGS_FILE_NAME);
+        fs::write(&path, "hotkey = \"Ctrl+Alt+KeyV\"\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        store_in(config_dir.path(), data_dir.path())
+            .save_api_key(RemoteProvider::DeepInfra, Some("di-key"))
+            .unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+    }
+
+    #[test]
+    fn a_malformed_api_keys_table_loses_the_keys_not_the_file() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_dir.path().join(SETTINGS_FILE_NAME),
+            "hotkey = \"Ctrl+Alt+KeyV\"\napi_keys = 42\n",
+        )
+        .unwrap();
+
+        let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+
+        assert_eq!(state.api_keys, ApiKeys::default());
+        assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
     }
 }

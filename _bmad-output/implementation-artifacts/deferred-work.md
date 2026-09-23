@@ -128,3 +128,11 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-3-1-3-4-dependency-check-and-overlay-block.md`
   summary: When Story 3.2 adds provisioning, `DependencyProvisioningPort` failures raised outside the event channel will diverge between the Dependencies tab and the overlay gate.
   evidence: `DependenciesView::check_again` writes a `Failed` outcome into the view only; the composition root's held outcome is updated solely from `AppEvent`. Unreachable in Story 3.1 (the one `Err` source depends on process environment that cannot change after launch), but provisioning adds reachable failures. The fix is an `AppEvent` variant carrying the failure.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-3-be-honest-when-the-selected-backend-cant-run-here.md`
+  summary: On Windows, a WebGPU selection on a machine with a D3D12 adapter but no Vulkan loader is reported as "can't run here", because the capability probe only asks Vulkan.
+  evidence: `crates/voice-me-deps/src/capability.rs` probes WebGPU capability through `ash`'s runtime-loaded Vulkan loader only (`vulkan-1.dll` on Windows). Dawn's WebGPU backend on Windows prefers D3D12, so a D3D12-only adapter (no Vulkan ICD installed) is a real, runnable machine that the row would block. A DXGI adapter enumeration (skipping WARP / software adapters, the D3D12 analogue of excluding `PHYSICAL_DEVICE_TYPE_CPU`) is the fix; there is no Windows toolchain here to build or verify it.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-3-be-honest-when-the-selected-backend-cant-run-here.md`
+  summary: The CUDA capability row says "can run here" on a machine with a good NVIDIA driver and GPU but no CUDA runtime, cuBLAS or cuDNN, which ONNX Runtime's CUDA provider needs at registration.
+  evidence: `crates/voice-me-deps/src/capability.rs` checks only the driver (`libcuda`) and compute capability, and `probe_runtime`'s `is_available()` reports only that the provider was compiled in. The first session build then fails with an engine error (honestly — "Active: none — …", no CPU fallback), which is the late failure Story 3.3 set out to prevent. The fix is a probe that dlopens `libcudart`/`libcublas`/`libcudnn` (or the ORT CUDA provider shared library) — best settled together with Story 3.8, which decides which CUDA libraries ship alongside the all-provider runtime.

@@ -3,7 +3,37 @@ use std::path::Path;
 use crate::AppEventSender;
 use crate::audio::AudioBuffer;
 use crate::error::VoiceMeError;
-use crate::state::{AppState, DependencyKind, SpeechBackend};
+use crate::state::LocalRuntime;
+use crate::state::{AppState, BackendSelection, DependencyKind, RemoteProvider, SpeechBackend};
+
+/// What one Dependency Check is asked about (Story 3.3).
+///
+/// The resolved backend alone is not enough any more: whether the selection
+/// can run here depends on which library the user picked and — for a remote
+/// provider — on whether a key is saved. Only whether a key exists travels
+/// here, never the key itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckRequest {
+    /// The backend the selection resolves to: the target and the weights
+    /// it implies.
+    pub backend: SpeechBackend,
+    /// What the user selected.
+    pub selection: BackendSelection,
+    /// Whether the selected remote provider has an API key. Meaningless
+    /// for a local selection.
+    pub has_api_key: bool,
+}
+
+impl CheckRequest {
+    /// The request for the bundled CPU backend — the default selection.
+    pub fn cpu() -> Self {
+        Self {
+            backend: SpeechBackend::CPU,
+            selection: BackendSelection::BUNDLED_CPU,
+            has_api_key: false,
+        }
+    }
+}
 
 /// Driving adapter port: captures the configured global hotkey per OS.
 pub trait HotkeyPort {
@@ -162,7 +192,7 @@ pub trait NotificationPort: Send + Sync {
 /// server and freezing the Settings window is not an acceptable way to
 /// find that out.
 pub trait DependencyProvisioningPort: Send + Sync {
-    /// Run the Dependency Check for `backend`, sending
+    /// Run the Dependency Check for `request`, sending
     /// [`crate::AppEvent::DependencyCheckCompleted`] on `events`.
     ///
     /// Backend-relative by construction: there is no fixed dependency list
@@ -177,7 +207,11 @@ pub trait DependencyProvisioningPort: Send + Sync {
     /// (no cache directory to resolve, say), which is a different thing
     /// from a check that ran and found something missing — the latter is a
     /// perfectly successful call carrying a report full of `missing` rows.
-    fn check(&self, backend: SpeechBackend, events: AppEventSender) -> Result<(), VoiceMeError>;
+    ///
+    /// Story 3.3: the first row is whether the selected backend can run on
+    /// this machine at all (a driver, a GPU, an API key), probed afresh on
+    /// every call.
+    fn check(&self, request: CheckRequest, events: AppEventSender) -> Result<(), VoiceMeError>;
 
     /// Fetch or install whatever `backend` still lacks for the `kind` row
     /// (Story 3.2), blocking until it is done.
@@ -232,4 +266,23 @@ pub trait SettingsStore {
     /// bespoke parser; the display form shown on a chip is derived for
     /// rendering only and never persisted. Returns the resulting `AppState`.
     fn save_hotkey(&self, hotkey: Option<&str>) -> Result<AppState, VoiceMeError>;
+
+    /// Persist the selected backend (Story 3.5). Returns the resulting
+    /// `AppState`.
+    fn save_backend_selection(
+        &self,
+        selection: &BackendSelection,
+    ) -> Result<AppState, VoiceMeError>;
+
+    /// Persist the list of ONNX Runtime libraries the user added, replacing
+    /// the previous list. Returns the resulting `AppState`.
+    fn save_local_runtimes(&self, runtimes: &[LocalRuntime]) -> Result<AppState, VoiceMeError>;
+
+    /// Persist `provider`'s API key, or `None` to remove it. Each provider's
+    /// key is stored independently. Returns the resulting `AppState`.
+    fn save_api_key(
+        &self,
+        provider: RemoteProvider,
+        key: Option<&str>,
+    ) -> Result<AppState, VoiceMeError>;
 }

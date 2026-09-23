@@ -12,11 +12,19 @@ voice-me-core = { path = "../voice-me-core" }
 # forbids. `load-dynamic` instead resolves `libonnxruntime.so` at run time
 # from `ORT_DYLIB_PATH`, so the binary CI builds carries no runtime and
 # downloads nothing.
+#
+# `cuda` and `webgpu` (Story 3.3) only compile in the two execution
+# providers' *registration* code — under `load-dynamic` they link nothing and
+# download nothing. Whether a provider is actually there is a property of
+# the runtime library loaded at run time, which is exactly what the
+# `--probe-runtime` helper asks it.
 ort = { version = "2.0.0-rc.13", default-features = false, features = [
   "std",
   "ndarray",
   "half",
   "api-27",
+  "cuda",
+  "webgpu",
 ] }
 # The version ort rc.13 itself depends on — a mismatch here means its
 # `try_extract_array` returns a type this crate cannot name.

@@ -1,4 +1,4 @@
-use crate::state::{DependencyKind, DependencyReport};
+use crate::state::{DependencyKind, DependencyReport, SpeechBackend};
 
 /// Events emitted by adapters onto the single shared `AppEvent` channel (AD-3).
 ///
@@ -57,5 +57,19 @@ pub enum AppEvent {
     ProvisioningFinished {
         kind: DependencyKind,
         result: Result<(), String>,
+    },
+    /// The TTS adapter finished trying to build its sessions (Story 3.3).
+    ///
+    /// The only source of "Active" on the backend line: `Ok` names the
+    /// backend the sessions were actually built on — never merely the one
+    /// that was asked for, because the adapter never falls back — and `Err`
+    /// is the engine's own error. Sent for every build attempt, success
+    /// and failure alike.
+    SpeechSessionBuilt {
+        /// Which engine reported: the generation the composition root gave
+        /// the adapter when it built it. A report from an engine that has
+        /// since been replaced is stale and must not set "Active".
+        generation: u64,
+        result: Result<SpeechBackend, String>,
     },
 }

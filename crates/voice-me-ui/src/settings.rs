@@ -21,10 +21,10 @@ use gpui_kit::{
 };
 use voice_me_core::{
     AppEventSender, DependencyKind, DependencyOutcome, DependencyProvisioningPort, HotkeyPort,
-    SettingsStore, SpeechBackend,
+    SettingsStore,
 };
 
-use crate::dependencies::{DependenciesView, RowProvisioning};
+use crate::dependencies::{BackendActions, BackendPanel, DependenciesView, RowProvisioning};
 use crate::hotkey::HotkeyView;
 use crate::voice_setup::VoiceSetupView;
 
@@ -40,7 +40,10 @@ const DEPENDENCIES_TAB: usize = 2;
 pub struct DependenciesTab {
     pub deps_port: Arc<dyn DependencyProvisioningPort>,
     pub events: AppEventSender,
-    pub speech_backend: SpeechBackend,
+    /// The backend section's state (Story 3.3).
+    pub backend: BackendPanel,
+    /// Where the backend section's requests go — the composition root.
+    pub actions: BackendActions,
     pub outcome: DependencyOutcome,
     /// Installs already running or already failed when the window opens
     /// (Story 3.2), so a reopened window never offers a second Install on
@@ -92,12 +95,15 @@ impl SettingsView {
             )
         });
 
-        let dependencies = cx.new(|_| {
+        let dependencies = cx.new(|cx| {
             DependenciesView::new(
                 dependencies.deps_port,
                 dependencies.events,
-                dependencies.speech_backend,
+                dependencies.backend,
                 dependencies.outcome,
+                dependencies.actions,
+                window,
+                cx,
             )
             .with_provisioning(dependencies.provisioning)
         });
@@ -138,6 +144,12 @@ impl SettingsView {
     ) {
         self.dependencies
             .update(cx, |view, cx| view.replace_provisioning(provisioning, cx));
+    }
+
+    /// Push the backend section's new state into the Dependencies tab.
+    pub fn set_backend_panel(&mut self, panel: BackendPanel, cx: &mut Context<Self>) {
+        self.dependencies
+            .update(cx, |view, cx| view.set_backend_panel(panel, cx));
     }
 
     /// Push a fresh Dependency Check outcome into the Dependencies tab.
@@ -193,6 +205,28 @@ mod tests {
     struct StubSettingsStore;
 
     impl SettingsStore for StubSettingsStore {
+        fn save_backend_selection(
+            &self,
+            _selection: &voice_me_core::BackendSelection,
+        ) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        fn save_local_runtimes(
+            &self,
+            _runtimes: &[voice_me_core::LocalRuntime],
+        ) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        fn save_api_key(
+            &self,
+            _provider: voice_me_core::RemoteProvider,
+            _key: Option<&str>,
+        ) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
         fn load(&self) -> Result<AppState, VoiceMeError> {
             Ok(AppState::default())
         }
@@ -218,7 +252,7 @@ mod tests {
     impl DependencyProvisioningPort for StubDepsPort {
         fn check(
             &self,
-            _backend: SpeechBackend,
+            _request: voice_me_core::CheckRequest,
             _events: AppEventSender,
         ) -> Result<(), VoiceMeError> {
             Ok(())
@@ -227,7 +261,7 @@ mod tests {
         fn provision(
             &self,
             _kind: DependencyKind,
-            _backend: SpeechBackend,
+            _backend: voice_me_core::SpeechBackend,
             _events: AppEventSender,
         ) -> Result<(), VoiceMeError> {
             Ok(())
@@ -268,7 +302,8 @@ mod tests {
                     DependenciesTab {
                         deps_port: Arc::new(StubDepsPort),
                         events: event_tx.clone(),
-                        speech_backend: SpeechBackend::CPU,
+                        backend: BackendPanel::default(),
+                        actions: std::rc::Rc::new(|_, _| {}),
                         outcome: DependencyOutcome::Pending,
                         provisioning: HashMap::new(),
                     },
@@ -336,7 +371,8 @@ mod tests {
                     DependenciesTab {
                         deps_port: Arc::new(StubDepsPort),
                         events: event_tx.clone(),
-                        speech_backend: SpeechBackend::CPU,
+                        backend: BackendPanel::default(),
+                        actions: std::rc::Rc::new(|_, _| {}),
                         outcome: DependencyOutcome::Pending,
                         provisioning: HashMap::new(),
                     },
@@ -365,7 +401,7 @@ mod tests {
             view.update(cx, |view, cx| {
                 view.set_dependency_outcome(
                     DependencyOutcome::Ready(voice_me_core::DependencyReport::new(
-                        SpeechBackend::CPU,
+                        voice_me_core::SpeechBackend::CPU,
                         vec![voice_me_core::Dependency::missing(
                             voice_me_core::DependencyKind::ModelWeights,
                             "Speech model files (Q4)",

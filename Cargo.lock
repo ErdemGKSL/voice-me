@@ -8706,8 +8706,10 @@ dependencies = [
 name = "voice-me-deps"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "flate2",
  "futures",
+ "libloading 0.8.9",
  "reqwest",
  "sha2 0.10.9",
  "tar",

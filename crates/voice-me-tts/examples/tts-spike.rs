@@ -172,7 +172,9 @@ fn run(args: Args) -> Result<String, VoiceMeError> {
         return Err(error);
     }
 
-    init_runtime(None)?;
+    // The same resolution rule the Dependency Check reports on:
+    // `ORT_DYLIB_PATH` if set, otherwise the cache root's own copy.
+    init_runtime(&voice_me_core::assets::resolve_runtime_dylib(cache.root(), None).path)?;
 
     let decode_started = std::time::Instant::now();
     let reference = voice_me_tts::reference::load_reference_clip(&reference_path)?;

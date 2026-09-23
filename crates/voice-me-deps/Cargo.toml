@@ -22,6 +22,14 @@ sha2 = "0.10"
 # extracted.
 flate2 = "1.1"
 tar = { version = "0.4", default-features = false }
+# Story 3.3: the CUDA capability probe opens the NVIDIA driver library
+# (`libcuda.so.1` / `nvcuda.dll`) at run time — a missing driver is a
+# "not found" answer, never a link error. The version `ash` already uses.
+libloading = "0.8"
+# Story 3.3: the WebGPU capability probe enumerates Vulkan adapters through
+# a runtime-loaded loader (`loaded`), so a machine with no Vulkan at all
+# still starts. Already in Cargo.lock through gpui's own graph.
+ash = { version = "0.38", default-features = false, features = ["loaded", "std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Decision 1: the Virtual Microphone's status is *asked of* the crate that

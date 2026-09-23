@@ -635,6 +635,28 @@ mod tests {
     }
 
     impl SettingsStore for FakeSettingsStore {
+        fn save_backend_selection(
+            &self,
+            _selection: &voice_me_core::BackendSelection,
+        ) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        fn save_local_runtimes(
+            &self,
+            _runtimes: &[voice_me_core::LocalRuntime],
+        ) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        fn save_api_key(
+            &self,
+            _provider: voice_me_core::RemoteProvider,
+            _key: Option<&str>,
+        ) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
         fn load(&self) -> Result<AppState, VoiceMeError> {
             Ok(AppState::default())
         }

@@ -16,13 +16,13 @@ pub mod reference;
 pub mod sessions;
 pub mod tokenizer;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use voice_me_core::{
-    AppState, AudioBuffer, SpeechBackend, SpeechExecutionTarget, SpeechWeights, TtsPort,
-    VoiceMeError,
+    AppEvent, AppEventSender, AppState, AudioBuffer, SpeechBackend, SpeechExecutionTarget,
+    SpeechWeights, TtsPort, VoiceMeError, assets,
 };
 
 pub use generate::{GenerationOutcome, GenerationSettings, generate};
@@ -108,31 +108,67 @@ impl<T> SessionSlot<T> {
 /// measurements are what AD-10's build-once/hold rule rests on.
 pub struct TtsAdapter {
     cache: ModelCache,
+    /// The ONNX Runtime library this adapter loads, resolved once at
+    /// construction by the same rule the Dependency Check reports on.
+    runtime: PathBuf,
+    backend: SpeechBackend,
     variant: LanguageModel,
     target: ExecutionTarget,
     sessions: SessionSlot<Sessions>,
+    /// Where each session build is reported (Story 3.3): the only source
+    /// of "Active" on the backend line.
+    events: Option<AppEventSender>,
+    /// The generation the composition root gave this adapter, carried on
+    /// every report so a replaced adapter's late report can be told apart.
+    generation: u64,
 }
 
 impl TtsAdapter {
-    /// Build the adapter for the backend `state` resolved to (AD-9).
+    /// Build the adapter for the backend `state` resolved to (AD-9), loading
+    /// the runtime library its selection names.
     ///
-    /// `AppState` is the *only* place this crate reads its execution target
-    /// and weight variant from — it never calls `voice-me-deps`. No session
-    /// is built here; that is [`TtsPort::warm_up`]'s job, so constructing
-    /// the adapter stays free and a first-run user pays nothing.
+    /// `AppState` is the *only* place this crate reads its execution target,
+    /// weight variant and runtime library from — it never calls
+    /// `voice-me-deps`. No session is built here; that is
+    /// [`TtsPort::warm_up`]'s job, so constructing the adapter stays free
+    /// and a first-run user pays nothing.
     pub fn from_state(state: &AppState) -> Result<Self, VoiceMeError> {
-        Ok(Self::new(ModelCache::from_env()?, state.speech_backend))
+        let cache = ModelCache::from_env()?;
+        let runtime =
+            assets::resolve_runtime_dylib(cache.root(), state.backend_selection.added_runtime())
+                .path;
+        Ok(Self::new(cache, state.speech_backend).with_runtime(runtime))
     }
 
     /// The same, against an explicit cache directory — used in tests, and by
-    /// anything that does not want `VOICE_ME_MODEL_CACHE`'s answer.
+    /// anything that does not want `VOICE_ME_MODEL_CACHE`'s answer. Loads
+    /// the cache root's own runtime copy unless [`Self::with_runtime`] says
+    /// otherwise.
     pub fn new(cache: ModelCache, backend: SpeechBackend) -> Self {
         Self {
+            runtime: assets::bundled_runtime_dylib(cache.root()),
             cache,
+            backend,
             variant: language_model_for(backend.weights),
             target: execution_target_for(backend),
             sessions: SessionSlot::new(),
+            events: None,
+            generation: 0,
         }
+    }
+
+    /// Load the runtime library at `runtime` instead.
+    pub fn with_runtime(mut self, runtime: PathBuf) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    /// Report every session build on `events` as
+    /// [`AppEvent::SpeechSessionBuilt`], tagged with `generation`.
+    pub fn with_events(mut self, events: AppEventSender, generation: u64) -> Self {
+        self.events = Some(events);
+        self.generation = generation;
+        self
     }
 
     /// Which `language_model` this adapter loads.
@@ -145,23 +181,47 @@ impl TtsAdapter {
         self.target
     }
 
+    /// Which runtime library it loads.
+    pub fn runtime(&self) -> &Path {
+        &self.runtime
+    }
+
     /// The build step, as a closure the session slot can call under its lock.
+    ///
+    /// Every attempt is reported, success and failure alike. A success names
+    /// `self.backend` because nothing else can have been built: the GPU
+    /// providers are registered with `error_on_failure`, so a target that
+    /// cannot be reached fails the build rather than landing on CPU.
     fn build_sessions(&self) -> impl FnOnce() -> Result<Sessions, VoiceMeError> + '_ {
         move || {
-            // Model files before the runtime library, the same order the
-            // spike example reports them in: the nine-file model list is the
-            // larger and likelier-incomplete half of provisioning, and its
-            // error names an exact absolute path, which is the single most
-            // useful thing to put in front of someone.
-            self.cache.check(self.variant)?;
-            // Committing the ONNX Runtime environment is idempotent and
-            // cheap. It happens here rather than at startup so a build with
-            // nothing provisioned yet fails at the moment something is
-            // actually asked of the engine, naming the dylib, instead of at
-            // launch.
-            sessions::init_runtime(None)?;
-            Sessions::build(&self.cache, self.variant, self.target, false)
+            let built = self.build_sessions_unreported();
+            if let Some(events) = self.events.as_ref() {
+                let _ = events.unbounded_send(AppEvent::SpeechSessionBuilt {
+                    generation: self.generation,
+                    result: built
+                        .as_ref()
+                        .map(|_| self.backend)
+                        .map_err(ToString::to_string),
+                });
+            }
+            built
         }
+    }
+
+    fn build_sessions_unreported(&self) -> Result<Sessions, VoiceMeError> {
+        // Model files before the runtime library, the same order the
+        // spike example reports them in: the nine-file model list is the
+        // larger and likelier-incomplete half of provisioning, and its
+        // error names an exact absolute path, which is the single most
+        // useful thing to put in front of someone.
+        self.cache.check(self.variant)?;
+        // Committing the ONNX Runtime environment is idempotent and
+        // cheap. It happens here rather than at startup so a build with
+        // nothing provisioned yet fails at the moment something is
+        // actually asked of the engine, naming the dylib, instead of at
+        // launch.
+        sessions::init_runtime(&self.runtime)?;
+        Sessions::build(&self.cache, self.variant, self.target, false)
     }
 }
 
@@ -218,12 +278,15 @@ fn language_model_for(weights: SpeechWeights) -> LanguageModel {
 /// Runtime's CPU provider has no such concept, so a device recorded
 /// alongside `Cpu` is ignored rather than refused — it is stale state from a
 /// previous detection, not a user error.
+///
+/// Every target maps to itself and nothing else: there is no fallback here,
+/// so a GPU selection that cannot run fails as that GPU selection.
 fn execution_target_for(backend: SpeechBackend) -> ExecutionTarget {
+    let device_id = backend.device.unwrap_or(0) as i32;
     match backend.target {
         SpeechExecutionTarget::Cpu => ExecutionTarget::Cpu,
-        SpeechExecutionTarget::WebGpu => ExecutionTarget::WebGpu {
-            device_id: backend.device.unwrap_or(0) as i32,
-        },
+        SpeechExecutionTarget::Cuda => ExecutionTarget::Cuda { device_id },
+        SpeechExecutionTarget::WebGpu => ExecutionTarget::WebGpu { device_id },
     }
 }
 
@@ -499,5 +562,146 @@ mod tests {
             path.display()
         );
         assert!(!adapter.is_ready());
+    }
+
+    // ---- Story 3.3: honest reporting of what was built -------------------
+
+    #[test]
+    fn every_target_maps_to_itself_and_never_to_cpu() {
+        let cache = ModelCache::new(PathBuf::from("/cache"));
+        let cuda = TtsAdapter::new(
+            cache,
+            SpeechBackend::for_target(SpeechExecutionTarget::Cuda),
+        );
+
+        assert_eq!(cuda.target(), ExecutionTarget::Cuda { device_id: 0 });
+        assert_eq!(cuda.variant(), LanguageModel::Fp16);
+    }
+
+    /// A CUDA selection whose runtime cannot be loaded reports `Failed`
+    /// with the engine's reason — and never an acquired CPU session.
+    #[test]
+    fn an_unreachable_target_reports_failed_and_never_cpu() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in assets::required_model_files(dir.path(), SpeechWeights::Fp16) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"stand-in").unwrap();
+        }
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let adapter = TtsAdapter::new(
+            ModelCache::new(dir.path().to_path_buf()),
+            SpeechBackend::for_target(SpeechExecutionTarget::Cuda),
+        )
+        .with_runtime(dir.path().join("missing").join("libonnxruntime.so"))
+        .with_events(tx, 7);
+
+        assert!(adapter.warm_up().is_err());
+
+        let Ok(AppEvent::SpeechSessionBuilt { generation, result }) = rx.try_recv() else {
+            panic!("every build attempt is reported");
+        };
+        assert_eq!(generation, 7, "the report names the engine that sent it");
+        let reason = result.expect_err("nothing was built, so nothing is active");
+        assert!(reason.contains("libonnxruntime.so"), "{reason}");
+        assert!(!adapter.is_ready());
+    }
+
+    /// A missing model file is a failed build too, and says so.
+    #[test]
+    fn a_build_that_fails_on_a_missing_file_is_reported_as_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let adapter = TtsAdapter::new(
+            ModelCache::new(dir.path().to_path_buf()),
+            SpeechBackend::CPU,
+        )
+        .with_events(tx, 0);
+
+        let _ = adapter.warm_up();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppEvent::SpeechSessionBuilt { result: Err(_), .. })
+        ));
+    }
+
+    /// With `ORT_DYLIB_PATH` unset and nothing added, the engine loads
+    /// exactly the library the Dependency Check reports on —
+    /// `<cache root>/runtime/<dylib>` — and a selected added library wins.
+    #[test]
+    fn the_adapter_loads_the_library_the_check_reports_on() {
+        let cache = ModelCache::new(PathBuf::from("/cache"));
+        let adapter = TtsAdapter::new(cache.clone(), SpeechBackend::CPU);
+        assert_eq!(
+            adapter.runtime(),
+            assets::bundled_runtime_dylib(Path::new("/cache"))
+        );
+
+        let added = PathBuf::from("/opt/ort/libonnxruntime.so");
+        let adapter = TtsAdapter::new(cache, SpeechBackend::CPU).with_runtime(added.clone());
+        assert_eq!(adapter.runtime(), added);
+    }
+
+    /// `from_state` loads exactly the library the Dependency Check reports
+    /// on: the selected added library when there is one, otherwise the usual
+    /// rule (`ORT_DYLIB_PATH`, then the cache copy).
+    ///
+    /// Both variables are process-global; this is the only test in the crate
+    /// that touches them, and it puts back what it found.
+    #[test]
+    fn from_state_loads_the_library_the_check_reports_on() {
+        use std::ffi::OsString;
+
+        struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (key, value) in self.0.drain(..) {
+                    match value {
+                        Some(value) => unsafe { std::env::set_var(key, value) },
+                        None => unsafe { std::env::remove_var(key) },
+                    }
+                }
+            }
+        }
+
+        let cache = tempfile::tempdir().unwrap();
+        let configured = cache.path().join("configured").join("libonnxruntime.so");
+        let _guard = EnvGuard(vec![
+            (
+                assets::RUNTIME_DYLIB_ENV,
+                std::env::var_os(assets::RUNTIME_DYLIB_ENV),
+            ),
+            (
+                assets::CACHE_ROOT_ENV,
+                std::env::var_os(assets::CACHE_ROOT_ENV),
+            ),
+        ]);
+        unsafe {
+            std::env::set_var(assets::RUNTIME_DYLIB_ENV, &configured);
+            std::env::set_var(assets::CACHE_ROOT_ENV, cache.path());
+        }
+
+        let added = PathBuf::from("/opt/ort/libonnxruntime.so");
+        let with_added = AppState {
+            backend_selection: voice_me_core::BackendSelection::Local {
+                runtime: Some(added.clone()),
+                target: SpeechExecutionTarget::Cuda,
+            },
+            speech_backend: SpeechBackend::for_target(SpeechExecutionTarget::Cuda),
+            ..AppState::default()
+        };
+        assert_eq!(
+            TtsAdapter::from_state(&with_added).unwrap().runtime(),
+            added,
+            "a selected added library wins over ORT_DYLIB_PATH"
+        );
+
+        let bundled = TtsAdapter::from_state(&AppState::default()).unwrap();
+        assert_eq!(
+            bundled.runtime(),
+            assets::resolve_runtime_dylib(cache.path(), None).path
+        );
+        assert_eq!(bundled.runtime(), configured);
     }
 }

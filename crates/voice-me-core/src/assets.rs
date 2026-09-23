@@ -159,22 +159,35 @@ pub struct RuntimeDylib {
     pub path: PathBuf,
     /// Whether [`RUNTIME_DYLIB_ENV`] is what named it.
     pub configured: bool,
+    /// Whether it is a library the user added through "Add runtime…" and
+    /// selected (Story 3.3).
+    pub added: bool,
 }
 
-/// Apply the runtime-resolution rule: an explicit [`RUNTIME_DYLIB_ENV`]
-/// wins, otherwise the cache root's own copy.
+/// Apply the runtime-resolution rule: a selected added library wins
+/// (Story 3.3 Decision 1), then an explicit [`RUNTIME_DYLIB_ENV`], then the
+/// cache root's own copy.
 ///
 /// Reads no filesystem — resolution and existence are separate questions,
 /// and the caller needs both answers separately to say anything useful.
-pub fn resolve_runtime_dylib(root: &Path) -> RuntimeDylib {
+pub fn resolve_runtime_dylib(root: &Path, added: Option<&Path>) -> RuntimeDylib {
+    if let Some(added) = added {
+        return RuntimeDylib {
+            path: added.to_path_buf(),
+            configured: false,
+            added: true,
+        };
+    }
     match std::env::var_os(RUNTIME_DYLIB_ENV).filter(|value| !value.is_empty()) {
         Some(configured) => RuntimeDylib {
             path: PathBuf::from(configured),
             configured: true,
+            added: false,
         },
         None => RuntimeDylib {
             path: bundled_runtime_dylib(root),
             configured: false,
+            added: false,
         },
     }
 }
@@ -250,5 +263,17 @@ mod tests {
             bundled_runtime_dylib(Path::new("/cache")),
             PathBuf::from("/cache/runtime").join(runtime_dylib_file_name())
         );
+    }
+
+    #[test]
+    fn a_selected_added_library_wins_over_everything_else() {
+        let resolved = resolve_runtime_dylib(
+            Path::new("/cache"),
+            Some(Path::new("/opt/ort/libonnxruntime.so")),
+        );
+
+        assert_eq!(resolved.path, PathBuf::from("/opt/ort/libonnxruntime.so"));
+        assert!(resolved.added);
+        assert!(!resolved.configured);
     }
 }

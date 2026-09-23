@@ -1,4 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
 
 /// The interface language when nothing has been saved yet.
 pub const DEFAULT_UI_LANGUAGE: &str = "en";
@@ -17,15 +19,36 @@ pub const DEFAULT_SPEECH_LANGUAGE: &str = "tr";
 /// Core-side vocabulary on purpose: `voice-me-core` must never name an `ort`
 /// type, and `voice-me-tts` must never read anything but `AppState`. The two
 /// enums here are the shared words the two sides map between.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SpeechExecutionTarget {
-    /// The floor, and the only target the shipped `cpu` build can reach.
+    /// The floor: every ONNX Runtime build has it.
     #[default]
     Cpu,
-    /// A Vulkan/D3D12 GPU through the WebGPU execution provider. Present as
-    /// vocabulary so the resolved-backend value can express it; only a build
-    /// compiled with that provider can actually honour it.
+    /// An NVIDIA GPU through the CUDA execution provider (Story 3.3). Only a
+    /// runtime library built with that provider can honour it, and only on
+    /// a machine whose driver and GPU pass the capability check.
+    Cuda,
+    /// A Vulkan/D3D12 GPU through the WebGPU execution provider. Only a
+    /// runtime library compiled with that provider can honour it.
+    #[serde(rename = "webgpu")]
     WebGpu,
+}
+
+impl SpeechExecutionTarget {
+    /// How the target is named to the user.
+    pub fn label(self) -> &'static str {
+        match self {
+            SpeechExecutionTarget::Cpu => "CPU",
+            SpeechExecutionTarget::Cuda => "CUDA",
+            SpeechExecutionTarget::WebGpu => "WebGPU",
+        }
+    }
+
+    /// Whether this target runs on a GPU.
+    pub fn is_gpu(self) -> bool {
+        !matches!(self, SpeechExecutionTarget::Cpu)
+    }
 }
 
 /// Which `language_model` weight variant the backend implies (AD-12).
@@ -42,6 +65,17 @@ pub enum SpeechWeights {
     Fp16,
     /// 2.08 GB. The quality baseline.
     Fp32,
+}
+
+impl SpeechWeights {
+    /// How the variant is named to the user.
+    pub fn label(self) -> &'static str {
+        match self {
+            SpeechWeights::Q4 => "Q4",
+            SpeechWeights::Fp16 => "FP16",
+            SpeechWeights::Fp32 => "FP32",
+        }
+    }
 }
 
 /// The AD-9 resolved backend: one value holding the active execution target,
@@ -61,6 +95,25 @@ pub struct SpeechBackend {
 }
 
 impl SpeechBackend {
+    /// The backend `target` implies: the target decides the weights (AD-12
+    /// — CPU runs Q4, a GPU target runs FP16), and no device is chosen
+    /// (Story 3.9 adds the device picker).
+    pub fn for_target(target: SpeechExecutionTarget) -> Self {
+        Self {
+            target,
+            device: None,
+            weights: match target {
+                SpeechExecutionTarget::Cpu => SpeechWeights::Q4,
+                SpeechExecutionTarget::Cuda | SpeechExecutionTarget::WebGpu => SpeechWeights::Fp16,
+            },
+        }
+    }
+
+    /// "CUDA — FP16 weights": what the backend line says a session runs on.
+    pub fn summary(self) -> String {
+        format!("{} — {} weights", self.target.label(), self.weights.label())
+    }
+
     /// The shipped `cpu` variant's backend: CPU, no device selection, Q4.
     ///
     /// Q4 rather than FP32 (spec-2-6 Decision 1): 354 MB against 2.08 GB, and
@@ -71,6 +124,258 @@ impl SpeechBackend {
         device: None,
         weights: SpeechWeights::Q4,
     };
+}
+
+/// A remote speech provider the user can select (Stories 3.5–3.7).
+///
+/// Selectable now so the choice and its key can be made; generation through
+/// it arrives with Story 3.6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteProvider {
+    #[serde(rename = "deepinfra")]
+    DeepInfra,
+    FalAi,
+}
+
+impl RemoteProvider {
+    /// Every provider, in the order the UI lists them.
+    pub const ALL: [RemoteProvider; 2] = [RemoteProvider::DeepInfra, RemoteProvider::FalAi];
+
+    /// How the provider is named to the user.
+    pub fn label(self) -> &'static str {
+        match self {
+            RemoteProvider::DeepInfra => "DeepInfra",
+            RemoteProvider::FalAi => "fal.ai",
+        }
+    }
+}
+
+/// Which backend the user chose to generate speech with (Story 3.5).
+///
+/// Persisted. It is a *wish*, not a fact: whether it can run here is the
+/// Dependency Check's capability row, and what actually ran is
+/// [`ActiveBackend`]. Keeping the three apart is what lets the UI say
+/// "Selected" and "Active" as two separate things (AD-9).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum BackendSelection {
+    /// An ONNX Runtime execution provider on this machine.
+    Local {
+        /// The runtime library that provides `target`. `None` is the
+        /// bundled runtime (`ORT_DYLIB_PATH`, or the cache copy); `Some` is
+        /// one the user added through "Add runtime…".
+        runtime: Option<PathBuf>,
+        target: SpeechExecutionTarget,
+    },
+    /// A remote provider, with the user's own key.
+    Remote(RemoteProvider),
+}
+
+impl Default for BackendSelection {
+    fn default() -> Self {
+        Self::BUNDLED_CPU
+    }
+}
+
+impl BackendSelection {
+    /// The built-in "CPU (bundled runtime)" entry — the default, and what
+    /// "Use CPU backend" selects.
+    pub const BUNDLED_CPU: Self = Self::Local {
+        runtime: None,
+        target: SpeechExecutionTarget::Cpu,
+    };
+
+    /// The local execution target, or `None` for a remote provider.
+    pub fn local_target(&self) -> Option<SpeechExecutionTarget> {
+        match self {
+            BackendSelection::Local { target, .. } => Some(*target),
+            BackendSelection::Remote(_) => None,
+        }
+    }
+
+    /// The added runtime library this selection loads, if it is one the
+    /// user added rather than the bundled one.
+    pub fn added_runtime(&self) -> Option<&Path> {
+        match self {
+            BackendSelection::Local {
+                runtime: Some(path),
+                ..
+            } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a CPU selection — the normal, never-warned-about
+    /// state (UX-DR18), whichever library provides it.
+    pub fn is_cpu(&self) -> bool {
+        self.local_target() == Some(SpeechExecutionTarget::Cpu)
+    }
+
+    /// How the entry reads in the backend `Select`: "CPU (bundled
+    /// runtime)", "CUDA (libonnxruntime.so)", "DeepInfra (remote)".
+    pub fn label(&self) -> String {
+        match self {
+            BackendSelection::Local {
+                runtime: None,
+                target,
+            } => format!("{} (bundled runtime)", target.label()),
+            BackendSelection::Local {
+                runtime: Some(path),
+                target,
+            } => format!("{} ({})", target.label(), file_name(path)),
+            BackendSelection::Remote(provider) => format!("{} (remote)", provider.label()),
+        }
+    }
+}
+
+/// A path's file name for display, falling back to the whole path.
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// An ONNX Runtime library the user added through "Add runtime…", with
+/// what its probe reported (Decision 1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalRuntime {
+    pub path: PathBuf,
+    /// Every execution provider the library reported as available, CPU
+    /// included.
+    pub targets: Vec<SpeechExecutionTarget>,
+}
+
+impl LocalRuntime {
+    /// The backend entries this library contributes: one per GPU provider
+    /// it has, or a single CPU entry when it has none (Decision 1). A GPU
+    /// build's CPU provider is not listed again — the bundled runtime
+    /// already covers CPU.
+    pub fn entries(&self) -> Vec<BackendSelection> {
+        let mut gpu: Vec<_> = self
+            .targets
+            .iter()
+            .copied()
+            .filter(|target| target.is_gpu())
+            .collect();
+        gpu.dedup();
+        let targets = if gpu.is_empty() {
+            vec![SpeechExecutionTarget::Cpu]
+        } else {
+            gpu
+        };
+        targets
+            .into_iter()
+            .map(|target| BackendSelection::Local {
+                runtime: Some(self.path.clone()),
+                target,
+            })
+            .collect()
+    }
+
+    /// The library's file name, for display.
+    pub fn file_name(&self) -> String {
+        file_name(&self.path)
+    }
+}
+
+/// Every entry the backend `Select` lists, in order: the bundled CPU
+/// runtime, each added runtime's entries, then the remote providers.
+pub fn backend_choices(runtimes: &[LocalRuntime]) -> Vec<BackendSelection> {
+    std::iter::once(BackendSelection::BUNDLED_CPU)
+        .chain(runtimes.iter().flat_map(LocalRuntime::entries))
+        .chain(
+            RemoteProvider::ALL
+                .into_iter()
+                .map(BackendSelection::Remote),
+        )
+        .collect()
+}
+
+/// The user's provider API keys (Stories 3.5/3.6).
+///
+/// Stored in plaintext in the settings file — the UI says so where they are
+/// entered. `Debug` is written by hand so a key can never reach a log line
+/// through `{:?}` on this, on `AppState`, or on the settings file.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKeys {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deepinfra: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fal_ai: Option<String>,
+}
+
+impl ApiKeys {
+    /// The key for `provider`, if one is saved. A blank string is no key.
+    pub fn get(&self, provider: RemoteProvider) -> Option<&str> {
+        match provider {
+            RemoteProvider::DeepInfra => self.deepinfra.as_deref(),
+            RemoteProvider::FalAi => self.fal_ai.as_deref(),
+        }
+        .filter(|key| !key.trim().is_empty())
+    }
+
+    /// Whether a key is saved for `provider`.
+    pub fn has(&self, provider: RemoteProvider) -> bool {
+        self.get(provider).is_some()
+    }
+
+    /// Replace (or with `None`, remove) the key for `provider`. Surrounding
+    /// whitespace — a pasted newline, say — is not part of a key.
+    pub fn set(&mut self, provider: RemoteProvider, key: Option<String>) {
+        let key = key
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty());
+        match provider {
+            RemoteProvider::DeepInfra => self.deepinfra = key,
+            RemoteProvider::FalAi => self.fal_ai = key,
+        }
+    }
+}
+
+impl std::fmt::Debug for ApiKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |key: &Option<String>| {
+            if key.is_some() {
+                "<redacted>"
+            } else {
+                "<none>"
+            }
+        };
+        f.debug_struct("ApiKeys")
+            .field("deepinfra", &redact(&self.deepinfra))
+            .field("fal_ai", &redact(&self.fal_ai))
+            .finish()
+    }
+}
+
+/// What the speech engine actually acquired when it built its session —
+/// the "Active" half of the backend line (AD-9).
+///
+/// Written only from the TTS adapter's own report
+/// ([`crate::AppEvent::SpeechSessionBuilt`]), never from the selection:
+/// "Active" must never name a target no session was built on. Not
+/// persisted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ActiveBackend {
+    /// No session has been built this launch (or since the last switch).
+    #[default]
+    NotStarted,
+    /// The engine built its sessions on this backend.
+    Acquired(SpeechBackend),
+    /// The last build failed, and this is the engine's error.
+    Failed(String),
+}
+
+impl ActiveBackend {
+    /// "Active: CUDA — FP16 weights", "Active: not started yet",
+    /// "Active: none — <engine error>".
+    pub fn summary(&self) -> String {
+        match self {
+            ActiveBackend::NotStarted => "Active: not started yet".to_string(),
+            ActiveBackend::Acquired(backend) => format!("Active: {}", backend.summary()),
+            ActiveBackend::Failed(reason) => format!("Active: none — {reason}"),
+        }
+    }
 }
 
 /// Whether one dependency is on this machine right now.
@@ -122,6 +427,10 @@ pub enum DependencyKind {
     /// no device can still type, and playback fails afterwards through the
     /// existing `VirtualMicUnavailable` notification.
     VirtualMicrophone,
+    /// Whether the *selected* backend can run on this machine at all
+    /// (Story 3.3): a driver, a capable GPU, an API key. Blocking — a
+    /// selection that cannot run is never quietly run on CPU instead.
+    BackendCapability,
 }
 
 impl DependencyKind {
@@ -130,7 +439,9 @@ impl DependencyKind {
     pub fn blocks_speech(self) -> bool {
         matches!(
             self,
-            DependencyKind::OnnxRuntime | DependencyKind::ModelWeights
+            DependencyKind::OnnxRuntime
+                | DependencyKind::ModelWeights
+                | DependencyKind::BackendCapability
         )
     }
 }
@@ -302,9 +613,19 @@ pub struct AppState {
     /// is built.
     pub speech_language: String,
     pub selected_mic_device: Option<String>,
-    /// The AD-9 resolved speech backend. Not persisted: it describes this
-    /// machine and this binary, not the user's preferences.
+    /// The AD-9 resolved speech backend. Not persisted: the composition
+    /// root derives it from [`Self::backend_selection`] on every read.
     pub speech_backend: SpeechBackend,
+    /// Which backend the user selected (Story 3.5). Persisted.
+    pub backend_selection: BackendSelection,
+    /// The ONNX Runtime libraries the user added. Persisted.
+    pub local_runtimes: Vec<LocalRuntime>,
+    /// The remote providers' API keys. Persisted, in plaintext; redacted
+    /// from `Debug`.
+    pub api_keys: ApiKeys,
+    /// What the engine actually acquired at its last session build. Not
+    /// persisted — it is a fact about this process.
+    pub active_backend: ActiveBackend,
     /// The latest Dependency Check's outcome — including a check that could
     /// not run at all, which is a different thing from one that has not run
     /// yet. Not persisted either, and deliberately not a `SettingsFile`
@@ -326,6 +647,10 @@ impl Default for AppState {
             speech_language: DEFAULT_SPEECH_LANGUAGE.to_string(),
             selected_mic_device: None,
             speech_backend: SpeechBackend::default(),
+            backend_selection: BackendSelection::default(),
+            local_runtimes: Vec::new(),
+            api_keys: ApiKeys::default(),
+            active_backend: ActiveBackend::default(),
             dependencies: DependencyOutcome::default(),
         }
     }
@@ -350,5 +675,105 @@ mod tests {
 
         assert!(!row.automatable);
         assert_eq!(row.manual_steps, vec!["one".to_string(), "two".to_string()]);
+    }
+
+    #[test]
+    fn debug_output_never_contains_an_api_key() {
+        let mut keys = ApiKeys::default();
+        keys.set(
+            RemoteProvider::DeepInfra,
+            Some("sk-secret-deepinfra".to_string()),
+        );
+        let state = AppState {
+            api_keys: keys.clone(),
+            ..AppState::default()
+        };
+
+        for printed in [
+            format!("{keys:?}"),
+            format!("{state:?}"),
+            format!("{state:#?}"),
+        ] {
+            assert!(!printed.contains("sk-secret"), "{printed}");
+            assert!(printed.contains("<redacted>"), "{printed}");
+        }
+    }
+
+    #[test]
+    fn a_blank_key_is_no_key() {
+        let mut keys = ApiKeys::default();
+        keys.set(RemoteProvider::FalAi, Some("   ".to_string()));
+        assert!(!keys.has(RemoteProvider::FalAi));
+        keys.set(RemoteProvider::FalAi, Some(" key\n".to_string()));
+        assert_eq!(keys.get(RemoteProvider::FalAi), Some("key"));
+    }
+
+    #[test]
+    fn the_target_implies_the_weights() {
+        assert_eq!(
+            SpeechBackend::for_target(SpeechExecutionTarget::Cpu),
+            SpeechBackend::CPU
+        );
+        assert_eq!(
+            SpeechBackend::for_target(SpeechExecutionTarget::Cuda).weights,
+            SpeechWeights::Fp16
+        );
+        assert_eq!(
+            SpeechBackend::for_target(SpeechExecutionTarget::WebGpu).weights,
+            SpeechWeights::Fp16
+        );
+    }
+
+    #[test]
+    fn a_gpu_runtime_lists_its_gpu_providers_and_a_cpu_only_one_lists_cpu() {
+        let cuda = LocalRuntime {
+            path: PathBuf::from("/opt/ort/libonnxruntime.so"),
+            targets: vec![SpeechExecutionTarget::Cpu, SpeechExecutionTarget::Cuda],
+        };
+        assert_eq!(
+            cuda.entries(),
+            vec![BackendSelection::Local {
+                runtime: Some(PathBuf::from("/opt/ort/libonnxruntime.so")),
+                target: SpeechExecutionTarget::Cuda,
+            }]
+        );
+        assert_eq!(cuda.entries()[0].label(), "CUDA (libonnxruntime.so)");
+
+        let cpu_only = LocalRuntime {
+            path: PathBuf::from("/opt/cpu/libonnxruntime.so"),
+            targets: vec![SpeechExecutionTarget::Cpu],
+        };
+        assert_eq!(cpu_only.entries()[0].label(), "CPU (libonnxruntime.so)");
+
+        let choices = backend_choices(&[cuda]);
+        assert_eq!(choices.first(), Some(&BackendSelection::BUNDLED_CPU));
+        assert_eq!(choices[0].label(), "CPU (bundled runtime)");
+        assert_eq!(
+            choices.last(),
+            Some(&BackendSelection::Remote(RemoteProvider::FalAi))
+        );
+        assert_eq!(choices.len(), 4);
+    }
+
+    #[test]
+    fn the_active_line_reads_the_three_ways_the_spec_writes_it() {
+        assert_eq!(
+            ActiveBackend::NotStarted.summary(),
+            "Active: not started yet"
+        );
+        assert_eq!(
+            ActiveBackend::Acquired(SpeechBackend::for_target(SpeechExecutionTarget::Cuda))
+                .summary(),
+            "Active: CUDA — FP16 weights"
+        );
+        assert_eq!(
+            ActiveBackend::Failed("no driver".to_string()).summary(),
+            "Active: none — no driver"
+        );
+    }
+
+    #[test]
+    fn a_capability_miss_blocks_speech() {
+        assert!(DependencyKind::BackendCapability.blocks_speech());
     }
 }
