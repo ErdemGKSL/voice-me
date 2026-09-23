@@ -27,7 +27,7 @@ FR3: User can assign and change a single global hotkey combination that summons 
 
 FR4: Pressing the configured hotkey opens a minimal, borderless, always-on-top single-line Prompt Overlay; pressing Enter closes it immediately and triggers the Speak Action with the typed text (generation happens after the UI is gone); pressing Escape or losing focus closes it without speaking and discards the text.
 
-FR5: On a Speak Action, the typed text plus the active Reference Voice Sample and selected speech language are passed to the Inference Engine (Chatterbox-Multilingual V3's ONNX export, run in-process on ONNX Runtime — Architecture Spine AD-12), producing audio in the user's cloned voice; a generation failure surfaces a clear failure indication rather than silence. v1 speech languages are limited to those needing no Python-only text normalization (Turkish and English included; Chinese, Japanese, Hebrew and Korean excluded).
+FR5: On a Speak Action, the typed text plus the selected backend's speech language are handed to the selected speech backend — the local Inference Engine (Chatterbox-Multilingual V3's ONNX export, run in-process on ONNX Runtime — Architecture Spine AD-12) or a remote speech API (FR10). A voice-cloning backend also receives the active Reference Voice Sample and produces audio in the user's cloned voice; a stock-voice backend — the local instant system voice (eSpeak NG on Linux, the Windows speech engine on Windows) or Azure Neural TTS — produces audio in the stock voice the user selected and never receives the sample. A generation failure surfaces a clear failure indication rather than silence. The local backend's speech languages are limited to those needing no Python-only text normalization (Turkish and English included; Chinese, Japanese, Hebrew and Korean excluded); a remote backend offers its provider's own set (revised 2026-09-23).
 
 FR6: Generated audio plays out through the Virtual Microphone device (not the default speaker) on both Linux and Windows, timed to the Speak Action, so any application selecting it as input receives the audio; the user's real physical microphone is unaffected.
 
@@ -36,6 +36,8 @@ FR7: On first run and on demand, the app checks for locally required components 
 FR8: The application interface (menus, settings, Prompt Overlay chrome, error messages) is available in Turkish and English, user-selectable, switching without requiring a restart, and independent of the TTS speech language.
 
 FR9: The UI is implemented using gpui-kit components rather than hand-rolled GPUI primitives wherever a suitable component exists, and follows the gpui-kit Design Guides for spacing, typography, color, density, and interaction states, checked before being considered done.
+
+FR10: The user selects which speech backend generates their voice from Settings → Backend — first Local or Remote, then the backend — and sets that backend's options there, including its own speech language. Local backends run on the machine — Chatterbox in the user's cloned voice (CPU, CUDA, WebGPU) and an instant system voice (eSpeak NG on Linux, the Windows speech engine on Windows); remote backends use a user-supplied key: voice-cloning providers (DeepInfra `ResembleAI/chatterbox-multilingual`, fal.ai) and one stock-voice provider (Azure Neural TTS, standard voices). Before any text leaves the machine, the app states what is sent to that provider and the user confirms it once per provider (revised 2026-09-23).
 
 ### NonFunctional Requirements
 
@@ -93,7 +95,7 @@ UX-DR5: Build a **Hotkey chip** component (monospace shortcut style, `muted` bac
 
 UX-DR6: Build a **Recording indicator** component (primary-violet dot/waveform) shown only while capturing a Reference Voice Sample in Voice Setup — the one place the accent color appears outside a primary button.
 
-UX-DR7: Settings is one window with four sections (Voice, Hotkey, Dependencies, General) via gpui-kit `Tabs` — no sidebar workspace shell at this scope.
+UX-DR7: Settings is one window with five sections (Voice, Hotkey, Backend, Dependencies, General) via gpui-kit `Tabs` — no sidebar workspace shell at this scope.
 
 UX-DR8: Tray menu has exactly two items: "Settings…" and "Quit" — no status submenu.
 
@@ -105,7 +107,7 @@ UX-DR11: Voice recorder component — Record/Stop with the recording indicator, 
 
 UX-DR12: Dependency row component — name, status `Badge` (ready/missing/installing), one-click "Install" when automatable, else a short manual-steps link.
 
-UX-DR13: UI language selector (Settings → General) applies instantly to every open surface with no restart, and is independent of the TTS speech-language selection in Settings → Voice.
+UX-DR13: UI language selector (Settings → General) applies instantly to every open surface with no restart, and is independent of each backend's speech language in Settings → Backend.
 
 UX-DR14: When TTS generation is unusually slow, a brief OS-native notification reports it's still working (no blocking UI, since the overlay is already closed by then).
 
@@ -125,6 +127,8 @@ UX-DR21 (Platform): Hotkey chips render platform-native modifier names (Linux: C
 
 UX-DR22 (Motion): The Prompt Overlay uses only a short fade/scale-in on summon and fade-out on dismiss; no other animation anywhere in the app.
 
+UX-DR23: Settings → Backend is two-step (Local/Remote, then backend) and shows only the selected backend's options; a stock-voice backend is labelled "stock voice" wherever it is selected (added 2026-09-23).
+
 ### FR Coverage Map
 
 FR1: Epic 1 - Record/import/replace the Reference Voice Sample
@@ -135,6 +139,7 @@ FR5: Epic 2 - TTS generation via the cloned voice
 FR6: Epic 2 - Playback through the Virtual Microphone
 FR7: Epic 3 - Dependency Check and one-click provisioning
 FR8: Epic 4 - Turkish/English UI
+FR10: Epic 3 - Backend selection, per-backend options and speech language, remote providers and disclosure
 FR9: Cross-cutting - gpui-kit visual design, applied as an acceptance-criteria bar within every epic's stories rather than its own epic (per PRD §4.5, not a standalone user-facing capability)
 
 ## Epic List
@@ -148,9 +153,9 @@ Users press a global hotkey from anywhere — including inside a fullscreen game
 **FRs covered:** FR2, FR3, FR4, FR5, FR6
 
 ### Epic 3: Never Get Stuck on Setup
-The app detects missing runtime dependencies itself and offers one-click provisioning from inside its own UI, naming anything it can't fix automatically with clear manual steps; it lets the user choose which backend generates their speech — local or remote — and it is honest about whether the selected backend can actually run on this machine.
+The app detects missing runtime dependencies itself and offers one-click provisioning from inside its own UI, naming anything it can't fix automatically with clear manual steps; it lets the user choose which backend generates their speech — local or remote — and set, per backend, its speech language and options in a dedicated Settings → Backend tab, including Azure Neural TTS as a stock-voice remote backend; and it is honest about whether the selected backend can actually run on this machine.
 
-**Scope note (2026-09-22, replacing 2026-09-21):** one artefact per OS carries every backend, and the user selects one inside the app (AD-7). Every story in this epic is therefore *backend-aware* rather than variant-aware: what counts as a required dependency depends on the **selected** backend, and a remote backend's readiness is a key and a reachable provider rather than a file list. Selecting the CPU backend is what "no GPU" resolves to — never a silent substitution (AD-9). See `sprint-change-proposal-2026-09-22.md`.
+**Scope note (2026-09-22, replacing 2026-09-21):** one artefact per OS carries every backend, and the user selects one inside the app (AD-7). Every story in this epic is therefore *backend-aware* rather than variant-aware: what counts as a required dependency depends on the **selected** backend, and a remote backend's readiness is a key and a reachable provider rather than a file list. Selecting the CPU backend is what "no GPU" resolves to — never a silent substitution (AD-9). See `sprint-change-proposal-2026-09-22.md`. **2026-09-23 addendum:** backend choice and per-backend options move to Settings → Backend; speech language becomes per-backend; Azure Neural TTS (standard voices) is added. See `sprint-change-proposal-2026-09-23.md`. Instant local system voices are added too — eSpeak NG on Linux, the Windows speech engine on Windows; macOS later. See `sprint-change-proposal-2026-09-23-instant-local.md`.
 **FRs covered:** FR7, FR10
 
 ### Epic 4: Use It In Your Language
@@ -371,9 +376,9 @@ So that my teammates in voice chat hear it as if I'd spoken.
 
 ## Epic 3: Never Get Stuck on Setup
 
-The app detects missing runtime dependencies itself and offers one-click provisioning from inside its own UI, naming anything it can't fix automatically with clear manual steps; it lets the user choose which backend generates their speech — local or remote — and it is honest about whether the selected backend can actually run on this machine.
+The app detects missing runtime dependencies itself and offers one-click provisioning from inside its own UI, naming anything it can't fix automatically with clear manual steps; it lets the user choose which backend generates their speech — local or remote — and set, per backend, its speech language and options in a dedicated Settings → Backend tab, including Azure Neural TTS as a stock-voice remote backend; and it is honest about whether the selected backend can actually run on this machine.
 
-**Scope note (2026-09-22, replacing 2026-09-21):** one artefact per OS carries every backend, and the user selects one inside the app (AD-7). Every story in this epic is therefore *backend-aware* rather than variant-aware: what counts as a required dependency depends on the **selected** backend, and a remote backend's readiness is a key and a reachable provider rather than a file list. Selecting the CPU backend is what "no GPU" resolves to — never a silent substitution (AD-9). See `sprint-change-proposal-2026-09-22.md`.
+**Scope note (2026-09-22, replacing 2026-09-21):** one artefact per OS carries every backend, and the user selects one inside the app (AD-7). Every story in this epic is therefore *backend-aware* rather than variant-aware: what counts as a required dependency depends on the **selected** backend, and a remote backend's readiness is a key and a reachable provider rather than a file list. Selecting the CPU backend is what "no GPU" resolves to — never a silent substitution (AD-9). See `sprint-change-proposal-2026-09-22.md`. **2026-09-23 addendum:** backend choice and per-backend options move to Settings → Backend; speech language becomes per-backend; Azure Neural TTS (standard voices) is added. See `sprint-change-proposal-2026-09-23.md`. Instant local system voices are added too — eSpeak NG on Linux, the Windows speech engine on Windows; macOS later. See `sprint-change-proposal-2026-09-23-instant-local.md`.
 
 ### Story 3.1: Detect Missing Dependencies
 
@@ -481,7 +486,7 @@ So that I'm not stuck if one is down, expensive, or drops the model I use.
 **When** fal.ai is added
 **Then** it is a new `SpeechProvider` implementation only — no change above `TtsPort`, and no provider-specific type reaches `voice-me-core` or `voice-me-ui` (AD-13)
 **And** each provider carries its own key and its own uploaded-sample id, independently
-**And** switching providers is the same backend-selection act as Story 3.5, with its own one-time disclosure confirmation
+**And** switching providers is the same backend-selection act as Story 3.5, in Settings → Backend (Story 3.10), with fal.ai's own supported speech languages (Story 3.11) and its own one-time disclosure confirmation
 
 ### Story 3.8: Build and Mirror the All-Provider ONNX Runtime
 
@@ -507,12 +512,92 @@ So that a laptop with both integrated and discrete graphics doesn't guess wrong 
 **Acceptance Criteria:**
 
 **Given** a GPU backend is selected and the Dependency Check found more than one candidate device
-**When** I open Settings → Dependencies
+**When** I open Settings → Backend
 **Then** the detected devices are listed by name and I can select which one generation uses
 **And** the selection persists across restarts through `SettingsStore` (AD-6), and an unset selection means "let the backend decide"
 **And** a previously selected device that is no longer present is reported as such and falls back to the default, rather than failing silently
 **And** a device that loses its context mid-generation surfaces as an error rather than playing the corrupted audio it produced — Story 2.5 measured exactly this on a Maxwell GPU under NVK
 **And** the selection reaches `voice-me-tts-onnx` through `AppState` only, never by querying `voice-me-deps` directly (AD-9)
+
+### Story 3.10: Give Backends Their Own Settings Tab
+
+As Erdem,
+I want backend choice and its options in a Settings → Backend tab of their own,
+So that I pick a kind of backend, then one backend, and see only what that one needs.
+
+**Acceptance Criteria:**
+
+**Given** Settings is open
+**When** I open the Backend tab
+**Then** I choose Local or Remote first, then a backend of that kind (Local: Chatterbox — the bundled CPU runtime and each added runtime's targets — and the instant System voice from Story 3.12/3.13 once built; Remote: DeepInfra, fal.ai, Azure)
+**And** only the selected backend's options appear — added runtimes for Local; API key with its plaintext notice, and remote sample state for a cloning provider
+**And** the Selected / Active lines and the "CPU mode" badge move here unchanged (AD-9, UX-DR18)
+**And** Settings → Dependencies keeps only dependency rows and the speech-blocking capability row, which links to the Backend tab (UX-DR23)
+**And** every behaviour of Stories 3.3, 3.5 and 3.6 is preserved — this story moves UI, it changes no backend logic
+
+### Story 3.11: Choose the Speech Language per Backend
+
+As Erdem,
+I want to pick the speech language for each backend in Settings → Backend,
+So that I don't hand-edit settings.toml and each backend offers only what it can speak.
+
+**Acceptance Criteria:**
+
+**Given** a backend is selected in Settings → Backend
+**When** I open its speech language selector
+**Then** it lists only that backend's languages — local ONNX: Turkish and English (AD-12); DeepInfra: the 23 languages of `ResembleAI/chatterbox-multilingual`
+**And** the choice persists per backend through `SettingsStore` and applies to the next Speak Action with no restart; switching backends restores that backend's own choice
+**And** core validates the Speak Action's language against the selected backend's set, not a global list
+**And** an existing `speech_language` in settings.toml seeds the Local and DeepInfra choices on first load
+**And** the UI language (Epic 4) is untouched by any of this, and vice versa
+
+### Story 3.12: Speak Instantly With eSpeak NG on Linux
+
+As Erdem,
+I want an instant local voice on Linux,
+So that a line is spoken the moment I press Enter, even without the model download or a key.
+
+**Acceptance Criteria:**
+
+**Given** I select Local → System voice in Settings → Backend on Linux
+**When** I perform a Speak Action
+**Then** `voice-me-tts-system-linux` generates it by running `espeak-ng` (fixed name on PATH, text on stdin, no shell, 10 s deadline) behind the same `TtsPort`, resampled to 24 kHz mono f32 and played through the Virtual Microphone unchanged (AD-11, AD-12)
+**And** the speech language list is eSpeak NG's own, and a voice picker appears when a language has more than one voice (Story 3.11)
+**And** it is labelled "stock voice", never receives the Reference Voice Sample, opens no socket and needs no disclosure (AD-8)
+**And** `espeak-ng` missing from PATH is a dependency row with the distro's install command as manual steps, and blocks speech while this backend is selected (Story 3.4)
+**And** a failure (non-zero exit, timeout, unreadable output) is one notification naming eSpeak NG and the reason
+
+### Story 3.13: Speak Instantly With the Windows Speech Engine
+
+As Erdem,
+I want an instant local voice on Windows,
+So that Windows gets the same no-download, no-key option Linux has.
+
+**Acceptance Criteria:**
+
+**Given** I select Local → System voice in Settings → Backend on Windows
+**When** I perform a Speak Action
+**Then** `voice-me-tts-system-windows` generates it with WinRT `SpeechSynthesizer::SynthesizeTextToStreamAsync` — never to the speaker — decoded and resampled to 24 kHz mono f32 (AD-11)
+**And** the speech language and voice lists come from the installed voices (`SpeechSynthesizer::AllVoices`); a language with no installed voice is a speech-blocking row naming Windows' steps to add one
+**And** it is labelled "stock voice", never receives the Reference Voice Sample, opens no socket and needs no disclosure
+**And** the crate compiles and its unit tests pass on CI's Windows job; manual verification waits until the Windows app can start (Story 2.8, tray)
+
+### Story 3.14: Generate Through Azure Neural TTS
+
+As Erdem,
+I want to use Azure's standard neural voices with my own key,
+So that I have a fast remote option even when I don't need my cloned voice.
+
+**Acceptance Criteria:**
+
+**Given** I select Remote → Azure in Settings → Backend
+**When** I enter my key and region and open the voice picker
+**Then** the voice list is fetched from Azure with the key alone — the one request allowed before the disclosure (AD-13) — and filtered to the selected locale
+**And** Azure is a stock-voice `SpeechProvider` in `voice-me-tts-remote` behind the same `TtsPort`; it never receives the Reference Voice Sample and shows no "sample held on provider" line
+**And** before the first line, the one-time disclosure names Azure, lists the typed text, the language and the voice name, and says speech will be in a Microsoft voice, not mine; core enforces it (FR10)
+**And** generation requests SSML with `riff-24khz-16bit-mono-pcm`, which plays through the Virtual Microphone unchanged (AD-11)
+**And** no key, no region, or no voice selected is a speech-blocking capability row naming what is missing; a provider failure (rejected key, timeout, provider error) is one notification naming Azure and the reason, never re-sent
+**And** the key stays plaintext-with-notice and out of logs; the region is stored beside it
 
 ## Epic 4: Use It In Your Language
 
@@ -529,7 +614,7 @@ So that I can use voice-me comfortably in either language.
 **Given** Settings → General is open
 **When** I select Turkish or English from the UI language selector (UX-DR13)
 **Then** every open surface (menus, Settings, Prompt Overlay chrome, error/notification messages) re-renders in the selected language immediately, without an app restart (NFR5)
-**And** the TTS speech language selection in Settings → Voice is unaffected by this change, and vice versa
+**And** each backend's speech language in Settings → Backend is unaffected by this change, and vice versa
 
 ### Story 4.2: Persist and Apply UI Language on Launch
 

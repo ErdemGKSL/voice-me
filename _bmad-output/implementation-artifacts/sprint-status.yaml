@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-20-2026 19:26
-last_updated: 09-23-2026 13:40
+last_updated: 09-23-2026 15:40
 project: voice-me
 project_key: NOKEY
 tracking_system: file-system
@@ -65,6 +65,11 @@ development_status:
   3-7-add-fal-ai-as-a-second-provider: backlog
   3-8-build-and-mirror-the-all-provider-onnx-runtime: backlog
   3-9-choose-which-gpu-runs-generation: backlog
+  3-10-give-backends-their-own-settings-tab: backlog
+  3-11-choose-the-speech-language-per-backend: backlog
+  3-12-speak-instantly-with-espeak-ng-on-linux: backlog
+  3-13-speak-instantly-with-the-windows-speech-engine: backlog
+  3-14-generate-through-azure-neural-tts: backlog
   epic-3-retrospective: optional
 
   epic-4: backlog

@@ -93,10 +93,10 @@ Pressing the configured hotkey opens a minimal, borderless, always-on-top single
 - Escape or losing focus without pressing Enter discards the typed text and does not trigger playback.
 
 #### FR-5: Text-to-speech generation via the TTS Engine
-On a Speak Action, the typed text plus the active Reference Voice Sample and selected language are handed to the **selected speech backend** — a local ONNX backend running in-process, or a remote speech API (FR-10) — producing audio in the user's cloned voice.
+On a Speak Action, the typed text plus the selected backend's speech language are handed to the **selected speech backend** — a local ONNX backend running in-process, or a remote speech API (FR-10). A voice-cloning backend also receives the active Reference Voice Sample and produces audio in the user's cloned voice; a stock-voice backend — the local instant system voice (eSpeak NG on Linux, the Windows speech engine on Windows) or Azure Neural TTS — produces audio in the stock voice the user selected, and never receives the sample.
 
 **Consequences (testable):**
-- Generated audio is in the language the user selected for speech output (independent of UI language), from Chatterbox-Multilingual V3's supported language set.
+- Generated audio is in the speech language the user selected **for the active backend** (independent of UI language), from that backend's own supported set; each backend remembers its own choice.
 - If generation fails, the user sees a clear in-app failure indication rather than silence with no feedback, and it names which backend failed and why (missing local asset, no API key, provider error) rather than a generic message.
 
 **Feature-specific NFRs:**
@@ -151,11 +151,12 @@ The UI is implemented using gpui-kit components (`gpui_kit::component`, `gpui_ki
 **Description:** Which engine generates the speech is the user's choice, local or remote. Added 2026-09-22 with PRD Open Question 7's resolution.
 
 #### FR-10: Backend selection and remote disclosure
-The user selects which speech backend generates their voice, from Settings. Local backends (CPU, CUDA, WebGPU) run entirely on the machine. A remote backend (DeepInfra `ensembleAI/chatterbox-multilingual`, fal.ai) generates through a third-party API using a key the user supplies.
+The user selects which speech backend generates their voice, from Settings → Backend: first Local or Remote, then the specific backend. Local backends run entirely on the machine: Chatterbox in the user's cloned voice (CPU, CUDA, WebGPU), and an instant system voice (eSpeak NG on Linux, the Windows speech engine on Windows) that needs no model download. Remote backends generate through a third-party API using a key the user supplies: voice-cloning providers (DeepInfra `ResembleAI/chatterbox-multilingual`, fal.ai) and one stock-voice provider (Azure Neural TTS, standard neural voices). Only the selected backend's options are shown, including its speech language and, for Azure, its region and voice.
 
 **Consequences (testable):**
 - A local backend is the default on first run; no network call is possible until the user selects a remote backend and enters a key.
-- Before the first byte leaves the machine, the app states plainly what is sent — the typed text and the Reference Voice Sample — and to which provider, and the user confirms it once per provider.
+- Before any text leaves the machine, the app states plainly what is sent to that provider and the user confirms it once per provider: for a cloning provider the typed text, the language tag and the Reference Voice Sample; for Azure the typed text, the language and the voice name, together with the statement that speech will be in a Microsoft voice rather than the user's own. The only earlier request is Azure's voice list, which carries the key alone.
+- A stock-voice backend is labelled as such wherever it is selected, so it is never mistaken for the user's cloned voice.
 - The Reference Voice Sample is uploaded once per provider and referenced by id on later calls; the app shows that the sample is stored on the provider's infrastructure and offers a way to delete it there.
 - The API key is stored in the settings file in plaintext (Architecture AD-13). The app says so where the key is entered, so a user sharing a config knows what is in it.
 - Switching backends takes effect on the next Speak Action, with no restart.
@@ -167,7 +168,7 @@ The user selects which speech backend generates their voice, from Settings. Loca
 - Not a monetized product in v1 — free and open source.
 - Not targeting macOS in v1.
 - Not building Preset Phrase (hotkey → fixed phrase, no overlay) in v1 — real planned feature, deferred (see `brief.md` § Possible Future Features).
-- Not supporting speech languages beyond what Chatterbox-Multilingual V3 ships with.
+- Not supporting speech languages beyond what each backend itself supports — local Chatterbox is further limited to languages needing no Python-only normalization (AD-12).
 
 ## 6. MVP Scope
 
@@ -177,7 +178,9 @@ The user selects which speech backend generates their voice, from Settings. Loca
 - Virtual Microphone output on both Linux and Windows (developed/validated on Linux first, then Windows, following whichever machine is in hand — not a strict phase gate)
 - In-app Dependency Check with one-click setup where feasible (FR-7)
 - Backend selection across local CPU / CUDA / WebGPU and remote providers, with per-backend dependency reporting (FR-7, FR-10)
-- Remote generation through DeepInfra and fal.ai with user-supplied keys (FR-10)
+- Remote generation through DeepInfra and fal.ai (voice cloning) and Azure Neural TTS (standard stock voices) with user-supplied keys (FR-10)
+- A Settings → Backend tab with per-backend options and per-backend speech language (FR-5, FR-10)
+- An instant local system-voice backend: eSpeak NG on Linux, the Windows speech engine on Windows (FR-5, FR-10)
 - Turkish/English UI (FR-8)
 - Modern, clean visual design built with gpui-kit components, per gpui-kit's Design Guides (FR-9)
 - Rust workspace structured as multiple crates (binary, lib(s), tests) — see `addendum.md` for the proposed breakdown
@@ -185,7 +188,8 @@ The user selects which speech backend generates their voice, from Settings. Loca
 ### 6.2 Out of Scope for MVP
 - macOS support — deferred, no notarization/system-extension work scoped
 - Preset Phrase hotkey-to-fixed-phrase mapping — deferred to v2, tracked in `brief.md`
-- Remote models that cannot clone a voice (stock-voice-only providers) — the AD-13 abstraction allows them, v1 ships only voice-cloning providers
+- Stock-voice-only providers other than Azure Neural TTS, and Azure Personal Voice (it requires Microsoft's limited-access approval) — revised 2026-09-23, product-owner decision (`sprint-change-proposal-2026-09-23.md`)
+- A macOS system-voice backend — follows macOS support itself (deferred)
 - A voice-me-hosted proxy, shared keys, or any billing relationship — the user brings their own provider account
 - Accounts, licensing, monetization
 - Saved/favorite phrase library, per-game profiles, and the other items under `brief.md` § Possible Future Features

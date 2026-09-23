@@ -20,13 +20,14 @@ Desktop utility, Linux and Windows in v1 (macOS deferred), built with gpui-kit o
 | Surface | Reached from | Purpose |
 |---|---|---|
 | Prompt Overlay | Global hotkey (configurable) | Type a line, speak it, gone — the entire product's reason to exist |
-| Settings — Voice | Tray menu → Settings | Record/import Reference Voice Sample, pick speech language |
+| Settings — Voice | Tray menu → Settings | Record/import Reference Voice Sample |
+| Settings — Backend | Tray menu → Settings | Local/Remote → backend; that backend's options: speech language, key, region, voice, sample state, GPU device |
 | Settings — Hotkey | Tray menu → Settings | Capture and confirm the global hotkey |
 | Settings — Dependencies | Tray menu → Settings, or auto-opened on a blocking Dependency Check failure | Status of runtime dependencies, one-click provisioning |
 | Settings — General | Tray menu → Settings | UI language (Turkish/English) |
 | Tray menu | System tray icon | Open Settings, quit |
 
-Settings is one window with the four sections above as tabs or a simple in-window nav (gpui-kit `Tabs`) — not four separate windows. No sidebar workspace shell is warranted at this scope (four sections, one user, no growth expected). → Composition reference: none rendered this run (Fast path, creative tools skipped); spine text is authoritative until a mock exists.
+Settings is one window with the five sections above as tabs or a simple in-window nav (gpui-kit `Tabs`) — not four separate windows. No sidebar workspace shell is warranted at this scope (five sections, one user, no growth expected). → Composition reference: none rendered this run (Fast path, creative tools skipped); spine text is authoritative until a mock exists.
 
 ## Voice and Tone
 
@@ -49,13 +50,15 @@ Behavioral. Visual specs live in `DESIGN.md.Components`.
 | Hotkey capture field | Settings → Hotkey | Click "Change," press the desired combination, it's captured live and rendered as a hotkey chip for confirmation before saving. Already-in-use combinations are rejected inline, not after Save. |
 | Voice recorder | Settings → Voice | Record button starts capture with the recording indicator (`DESIGN.md`); stop button ends it; a short playback control lets the user hear it back before accepting. Import is a standard file picker as an alternative entry point, same accept/re-record actions after either path. |
 | Dependency row | Settings → Dependencies | One row per dependency: name, status (`Badge`: ready / missing / installing), and a one-click "Install" action when missing and automatable, or a short manual-steps link when not. |
-| Backend selector | Settings → Dependencies, above the dependency rows | A `Select` of the backends this binary carries — CPU, CUDA, WebGPU, and each configured remote provider (AD-7). Beneath it, read-only, what the selection **actually acquired** at session build, which is not always what was selected (AD-9). |
-| API key field | Settings → Dependencies, when a remote backend is selected | A masked `Input` for the provider key, with a plain line stating the key is stored in the settings file in plaintext (AD-13). |
-| Remote sample state | Settings → Dependencies, when a remote backend is configured | States that the Reference Voice Sample has been uploaded to that provider and is held there, with a delete action (FR-10). |
-| GPU device selector | Settings → Dependencies, when a GPU backend is selected | A `Select` listing the devices the Dependency Check found this backend can drive, by name. Unset means "let the backend decide". Hidden when the CPU or a remote backend is selected, where there is nothing to choose. |
+| Backend selector | Settings → Backend, top | Two steps: a Local/Remote choice, then a `Select` of that kind's backends (Local: "Chatterbox — your voice" with the bundled CPU and each added runtime's targets, and "System voice — instant" — eSpeak NG on Linux, Windows voices on Windows, tagged "stock voice"; Remote: DeepInfra, fal.ai, Azure — Azure tagged "stock voice"). Below it, only the selected backend's options. Beneath all, read-only, what the selection **actually acquired** at session build, which is not always what was selected (AD-9). |
+| Speech language selector | Settings → Backend, per backend | A `Select` of the languages the selected backend supports; each backend remembers its own. Independent of the UI language. |
+| Azure voice picker | Settings → Backend, Azure selected | Region `Input`, then a `Select` of the voices for the chosen locale, fetched on demand with the key (the one pre-disclosure request, AD-13). States plainly: "Speech will be in this Microsoft voice, not yours." |
+| API key field | Settings → Backend, when a remote backend is selected | A masked `Input` for the provider key, with a plain line stating the key is stored in the settings file in plaintext (AD-13). |
+| Remote sample state | Settings → Backend, when a cloning remote backend is configured | States that the Reference Voice Sample has been uploaded to that provider and is held there, with a delete action (FR-10). |
+| GPU device selector | Settings → Backend, when a GPU backend is selected | A `Select` listing the devices the Dependency Check found this backend can drive, by name. Unset means "let the backend decide". Hidden when the CPU or a remote backend is selected, where there is nothing to choose. |
 | Remote disclosure dialog | First Speak Action after selecting a remote provider | A `Dialog` naming the provider and stating exactly what is sent — the typed text, the language tag, and the Reference Voice Sample — confirmed once per provider before the first request. Declining leaves the backend selected but unusable, not silently switched. |
 | Tray menu | System tray | Two items: "Settings…", "Quit". No status submenu at this scope — Settings itself is the place to check state. |
-| UI language selector | Settings → General | A `Select` of Turkish/English. Applying a new value re-renders every open surface immediately — no restart, no confirmation dialog. Independent of the TTS speech language set in Settings → Voice; changing one never changes the other. |
+| UI language selector | Settings → General | A `Select` of Turkish/English. Applying a new value re-renders every open surface immediately — no restart, no confirmation dialog. Independent of each backend's speech language set in Settings → Backend; changing one never changes the other. |
 
 ## State Patterns
 
@@ -68,10 +71,12 @@ Behavioral. Visual specs live in `DESIGN.md.Components`.
 | Speak failed | OS-native notification | "Couldn't generate speech. {short reason}." This notification, originating from voice-me itself, *is* the "clear failure" surface (SPEC CAP-5) — no overlay reappears automatically, and the user re-invokes the hotkey to retry. |
 | First run / no Reference Voice Sample yet | Settings → Voice (auto-opened) | Empty state: "Record your voice to get started," single primary action, no other Settings tabs distract from this blocking prerequisite. |
 | Dependency missing (blocking) | Settings → Dependencies (auto-opened) | Named dependency, status `missing`, one-click Install where possible. The Prompt Overlay still opens on hotkey press but shows an inline notice instead of accepting input until resolved. |
-| CPU backend selected | Settings → Dependencies | Informational `Badge`: "CPU mode" — not an error and not a fallback, just the selected backend. Generation works, slower. |
-| Selected backend unavailable here | Settings → Dependencies | Named in words, not a bare error: what the selected backend needs, what this machine has, and what selecting the CPU backend would do — with that selection one click away. Never a silent substitution (AD-9). |
-| Remote backend selected, no key | Settings → Dependencies | The backend row states that a key is required and where to get one; the Speak Action is blocked by Story 3.4's rules rather than failing at the provider. |
-| Selected GPU no longer present | Settings → Dependencies | The selector reports the missing device by name and reverts to the default rather than failing silently. |
+| CPU backend selected | Settings → Backend | Informational `Badge`: "CPU mode" — not an error and not a fallback, just the selected backend. Generation works, slower. |
+| Selected backend unavailable here | Settings → Dependencies (speech-blocking row, linking to Settings → Backend) | Named in words, not a bare error: what the selected backend needs, what this machine has, and what selecting the CPU backend would do — with that selection one click away. Never a silent substitution (AD-9). |
+| Remote backend selected, no key | Settings → Backend | The backend row states that a key is required and where to get one; the Speak Action is blocked by Story 3.4's rules rather than failing at the provider. |
+| System voice unavailable | Settings → Backend, and a speech-blocking row in Dependencies | Linux: "eSpeak NG is not installed" with the distro install command; either OS: "No system voice for Turkish" with the OS's steps to add one. Never a silent switch to another voice or language. |
+| Azure selected, no voice | Settings → Backend | "Pick a voice for Azure" inline; the Speak Action is blocked by Story 3.4's rules. |
+| Selected GPU no longer present | Settings → Backend | The selector reports the missing device by name and reverts to the default rather than failing silently. |
 | GPU lost mid-generation | OS-native notification | Surfaced as a generation failure. The audio produced by a device that lost its context is corrupted (measured on Maxwell/NVK, Story 2.5) and must never be played. |
 | Hotkey conflict | Settings → Hotkey | Inline error at the capture field: "Already used by {app}." Previous working hotkey stays active until a new one is confirmed. |
 
@@ -106,7 +111,7 @@ Not a responsive-web surface; this is fixed-purpose desktop software with two re
 | Linux | Hotkey chip renders `Ctrl`/`Alt`/`Shift`/`Super` in platform-native naming; tray icon uses the desktop environment's native status-icon convention. |
 | Windows | Hotkey chip renders `Ctrl`/`Alt`/`Shift`/`Win`; tray icon sits in the Windows notification area. |
 
-The Prompt Overlay is a fixed comfortable width (not user-resizable) per `DESIGN.md`'s "utility window, short fixed action path" — there is no responsive breakpoint behavior to define at this scope. Settings has a documented minimum window size (small, four-tab content) but is otherwise not a layout concern worth detailing further at this stage.
+The Prompt Overlay is a fixed comfortable width (not user-resizable) per `DESIGN.md`'s "utility window, short fixed action path" — there is no responsive breakpoint behavior to define at this scope. Settings has a documented minimum window size (small, five-tab content) but is otherwise not a layout concern worth detailing further at this stage.
 
 ## Key Flows
 
