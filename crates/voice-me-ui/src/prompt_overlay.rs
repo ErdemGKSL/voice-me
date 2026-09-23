@@ -10,6 +10,14 @@
 //! Three routes out, all of which close the window and leave the app
 //! tray-resident: `Enter` (speaks), `Escape` (discards) and losing window
 //! activation (discards).
+//!
+//! Story 3.4 adds a fourth shape rather than a fourth route: the overlay
+//! can open *blocked*. It still appears on the hotkey press and still
+//! dismisses exactly as an unblocked one does, but it renders an inline
+//! notice naming the missing dependency in place of the `Input`, and there
+//! is nothing to type and nothing to send. The composition root decides
+//! which shape to open; the view is told, and never asks `voice-me-deps`
+//! anything itself.
 
 use std::time::Duration;
 
@@ -17,9 +25,9 @@ use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, ThemeStyled as _, v_flex};
 use gpui_kit::{
     Animation, AnimationExt as _, AnyElement, AppContext as _, Context, Entity, FocusHandle,
-    Focusable, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement as _, Render, Styled as _, Subscription, TestSupportExt as _, Window, div,
-    ease_out_quint, px,
+    Focusable, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, ParentElement as _, Render, SharedString, Styled as _, Subscription,
+    TestSupportExt as _, Window, div, ease_out_quint, px,
 };
 use voice_me_core::{AppEvent, AppEventSender};
 
@@ -44,11 +52,21 @@ const DISMISS_MS: u64 = 100;
 const SURFACE_INSET_START: f32 = 12.;
 const SURFACE_INSET_END: f32 = 6.;
 
+/// What the overlay leads with when it is blocked: the same word Settings →
+/// Dependencies uses, so the two surfaces cannot describe one gap two ways.
+const BLOCKED_HEADLINE: &str = "voice-me can't speak yet";
+
+/// The second line, pointing at the one place the whole gap is explained.
+const BLOCKED_HINT: &str = "Settings → Dependencies has the details.";
+
 /// The borderless prompt window's contents.
 pub struct PromptOverlayView {
     input: Entity<InputState>,
     focus_handle: FocusHandle,
     events: AppEventSender,
+    /// The missing dependency this overlay opened blocked on, if any
+    /// (Story 3.4). `None` is the ordinary typeable overlay.
+    blocker: Option<SharedString>,
     /// Set once a dismissal route has fired. The window is still up for
     /// [`DISMISS_MS`] while the fade-out renders, so this both drives that
     /// frame and makes every dismissal route idempotent.
@@ -60,6 +78,30 @@ impl PromptOverlayView {
     /// Build the view with the `Input` already focused, so the overlay is
     /// typeable the moment it appears with no click (UX-DR20).
     pub fn new(events: AppEventSender, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::build(events, None, window, cx)
+    }
+
+    /// Build the blocked shape (Story 3.4): the overlay opens and dismisses
+    /// normally but refuses input, naming `blocker` inline.
+    ///
+    /// `blocker` is a finished sentence rather than a dependency value: the
+    /// wording belongs to `crate::dependencies::blocker_notice`, next to the
+    /// tab that shows the same row, and this view's job is to display it.
+    pub fn blocked(
+        events: AppEventSender,
+        blocker: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(events, Some(blocker.into()), window, cx)
+    }
+
+    fn build(
+        events: AppEventSender,
+        blocker: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder(PLACEHOLDER));
 
         let subscriptions = vec![
@@ -84,12 +126,22 @@ impl PromptOverlayView {
             }),
         ];
 
-        input.update(cx, |state, cx| state.focus(window, cx));
+        let focus_handle = cx.focus_handle();
+        if blocker.is_some() {
+            // Nothing to type into, so focus goes to the frame instead —
+            // which is also what puts `Escape` in reach: the `Input`'s key
+            // context is not in the tree when the `Input` is not rendered,
+            // so the frame's own key handler is the one that sees it.
+            window.focus(&focus_handle, cx);
+        } else {
+            input.update(cx, |state, cx| state.focus(window, cx));
+        }
 
         Self {
             input,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             events,
+            blocker,
             dismissing: false,
             _subscriptions: subscriptions,
         }
@@ -100,6 +152,14 @@ impl PromptOverlayView {
     /// plain dismissal: there is nothing to say.
     fn speak(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.dismissing {
+            return;
+        }
+
+        // A blocked overlay has no `Input` rendered, so this is
+        // belt-and-braces — but it is the promise the story makes, and it
+        // is cheaper to state it than to rely on the view tree to enforce
+        // it: nothing is sent while a speech-engine dependency is missing.
+        if self.blocker.is_some() {
             return;
         }
 
@@ -138,15 +198,45 @@ impl PromptOverlayView {
         .detach();
     }
 
-    /// Everything inside the overlay surface.
-    ///
-    /// Kept as its own element so Epic 3's Story 3.4 can put an inline
-    /// notice here in place of the `Input` without reshaping the view.
+    /// Everything inside the overlay surface: the one `Input`, or — when a
+    /// dependency the speech engine needs is missing — the inline notice
+    /// that replaces it (Story 3.4).
     fn body(&self, cx: &mut Context<Self>) -> AnyElement {
-        Input::new(&self.input)
-            .appearance(false)
-            .text_size(px(16.))
-            .text_color(cx.theme().popover_foreground)
+        let Some(blocker) = self.blocker.clone() else {
+            return Input::new(&self.input)
+                .appearance(false)
+                .text_size(px(16.))
+                .text_color(cx.theme().popover_foreground)
+                .into_any_element();
+        };
+
+        v_flex()
+            .id("prompt-overlay-blocked")
+            .test_support()
+            .gap_1()
+            .child(
+                div()
+                    .text_size(px(15.))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(cx.theme().popover_foreground)
+                    .child(BLOCKED_HEADLINE),
+            )
+            // The specific blocker, in words, rather than a generic
+            // "dependency missing" the user would have to go and decode.
+            .child(
+                div()
+                    .id("prompt-overlay-blocker")
+                    .test_support()
+                    .text_size(px(13.))
+                    .text_color(cx.theme().popover_foreground)
+                    .child(blocker),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(BLOCKED_HINT),
+            )
             .into_any_element()
     }
 }
@@ -184,6 +274,16 @@ impl Render for PromptOverlayView {
             // `Escape` is bound in the inner `"Input"` context, which
             // propagates it; a raw `on_key_down` here would never see it.
             .on_action(cx.listener(|this, _: &Escape, window, cx| this.dismiss(window, cx)))
+            // A blocked overlay renders no `Input`, so the `Escape` action
+            // above — bound in the `"Input"` key context — is never
+            // dispatched. The frame holds focus in that shape and sees the
+            // raw key itself, so Escape dismisses exactly as it does in an
+            // unblocked overlay.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if this.blocker.is_some() && event.keystroke.key == "escape" {
+                    this.dismiss(window, cx);
+                }
+            }))
             // `track_focus` makes the frame focusable, and GPUI then
             // transfers focus to it on any mouse-down inside it — which
             // would take focus off the `Input` the moment someone clicks the
@@ -195,6 +295,11 @@ impl Render for PromptOverlayView {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
                     window.prevent_default();
+                    if this.blocker.is_some() {
+                        // Keep focus on the frame, which is what `Escape`
+                        // is reaching this view through.
+                        return;
+                    }
                     this.input.update(cx, |state, cx| state.focus(window, cx));
                 }),
             )
@@ -288,6 +393,24 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded::<AppEvent>();
         let handle = cx.open_window(size(px(560.), px(84.)), |window, cx| {
             let view = cx.new(|cx| PromptOverlayView::new(event_tx.clone(), window, cx));
+            Root::new(view, window, cx)
+        });
+        Harness {
+            handle,
+            events: event_rx,
+        }
+    }
+
+    /// The Story 3.4 shape: summoned while a speech-engine dependency is
+    /// missing.
+    fn open_blocked(cx: &mut TestAppContext, blocker: &str) -> Harness {
+        cx.update(gpui_kit::init);
+        let (event_tx, event_rx) = mpsc::unbounded::<AppEvent>();
+        let blocker = blocker.to_string();
+        let handle = cx.open_window(size(px(560.), px(84.)), |window, cx| {
+            let view = cx.new(|cx| {
+                PromptOverlayView::blocked(event_tx.clone(), blocker.clone(), window, cx)
+            });
             Root::new(view, window, cx)
         });
         Harness {
@@ -458,6 +581,63 @@ mod tests {
 
         settle(cx);
         assert!(harness.window_is_gone(cx));
+    }
+
+    #[gpui_kit::test]
+    fn a_blocked_overlay_names_the_blocker_instead_of_accepting_input(cx: &mut TestAppContext) {
+        let mut harness = open_blocked(cx, "Speech model files (Q4) — Missing: /c/lm.onnx");
+
+        cx.update_window(harness.handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("prompt-overlay-blocked").is_some(),
+                "the overlay still opens — it just cannot be typed into"
+            );
+            assert!(
+                window.try_find("prompt-overlay-blocker").is_some(),
+                "and it names the specific blocker, not `dependency missing`"
+            );
+            // There is no Input to receive this, and Enter must send
+            // nothing whether or not anything was typed.
+            window.input("hello there", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+
+        assert!(
+            harness.drain().is_empty(),
+            "a blocked overlay never reaches the Speak Action"
+        );
+    }
+
+    /// The other half of "blocked, not broken": every way out of an
+    /// ordinary overlay still works.
+    #[gpui_kit::test]
+    fn a_blocked_overlay_dismisses_on_escape_like_any_other(cx: &mut TestAppContext) {
+        let mut harness = open_blocked(cx, "ONNX Runtime — Not found at /c/libort.so");
+
+        cx.update_window(harness.handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.press("escape", cx);
+        })
+        .unwrap();
+
+        assert!(harness.is_dismissing(cx));
+        assert!(harness.drain().is_empty());
+
+        settle(cx);
+        assert!(harness.window_is_gone(cx));
+    }
+
+    #[gpui_kit::test]
+    fn an_unblocked_overlay_shows_no_notice(cx: &mut TestAppContext) {
+        let harness = open(cx);
+
+        cx.update_window(harness.handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("prompt-overlay-blocked").is_none());
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]

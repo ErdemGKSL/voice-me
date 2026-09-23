@@ -112,3 +112,19 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-9-play-generated-audio-through-the-virtual-microphone.md`
   summary: A Windows build panics at launch, before a Speak Action can reach the virtual-microphone error spec-2-9 Decision 2 added — `WindowsTrayAdapter::show` is still `todo!()` and `main.rs` calls it unconditionally.
   evidence: Found by the spec-2-9 review and verified: `crates/voice-me-tray-windows/src/lib.rs` returns `todo!()` from `show`, and `crates/voice-me-app/src/main.rs` calls `WindowsTrayAdapter.show(cx, …)` with no fallback on the startup path. Decision 2 made `WindowsVirtualMicAdapter::play` honest so a Windows user would get a notification rather than a crash; that is true of the virtual-mic path and moot in practice, because the process aborts long before any line is typed. Pre-existing (spec-2-1 deferred Windows for want of a toolchain), so not this story's to fix — but Story 2.8 should not be judged complete while the app cannot start on Windows at all.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-1-3-4-dependency-check-and-overlay-block.md`
+  summary: Confirm every ONNX graph really has an `.onnx_data` sibling, now that the required-file list gates whether the user can type at all.
+  evidence: `voice-me-core::assets::required_model_files` unconditionally pairs each of the four graphs with a `<name>.onnx_data`, a rule moved verbatim from `ModelCache::required_files`. Under Story 3.1 a false "missing" no longer fails at generation time — it blocks the Prompt Overlay. Settled by listing a real provisioned cache and checking whether the small graphs (`embed_tokens`, `conditional_decoder`) carry external data at all.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-1-3-4-dependency-check-and-overlay-block.md`
+  summary: `PulseSession::connect_with`'s readiness loop has no timeout, so an audio server that connects but never becomes ready hangs its caller forever.
+  evidence: `crates/voice-me-audio-linux/src/pulse.rs:79-90` iterates the mainloop until `Ready`, `Failed` or `Terminated`, with no deadline. Pre-existing, but the Dependency Check gives it new callers — including, before this review's patch, the UI thread.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-1-3-4-dependency-check-and-overlay-block.md`
+  summary: The dependency row set is derived from the backend's weight variant only, never its execution target, so a GPU selection would report the CPU row set.
+  evidence: `speech_engine_rows(root, backend.weights)` in `voice-me-deps` never reads `backend.target`. Harmless today — no GPU backend can be selected until Story 3.5 — and provider-library rows belong to Stories 3.3/3.8.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-1-3-4-dependency-check-and-overlay-block.md`
+  summary: When Story 3.2 adds provisioning, `DependencyProvisioningPort` failures raised outside the event channel will diverge between the Dependencies tab and the overlay gate.
+  evidence: `DependenciesView::check_again` writes a `Failed` outcome into the view only; the composition root's held outcome is updated solely from `AppEvent`. Unreachable in Story 3.1 (the one `Err` source depends on process environment that cannot change after launch), but provisioning adds reachable failures. The fix is an `AppEvent` variant carrying the failure.

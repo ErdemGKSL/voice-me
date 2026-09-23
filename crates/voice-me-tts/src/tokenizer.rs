@@ -95,9 +95,10 @@ impl TextTokenizer {
 }
 
 /// Where `tokenizer.json` lives inside the model cache directory: at the
-/// repo root, not under `onnx/`.
+/// repo root, not under `onnx/`. Delegated to `voice-me-core::assets` since
+/// Story 3.1 — the Dependency Check names the same file.
 pub fn tokenizer_path(cache_dir: &Path) -> PathBuf {
-    cache_dir.join("tokenizer.json")
+    voice_me_core::assets::tokenizer_file(cache_dir)
 }
 
 #[cfg(test)]

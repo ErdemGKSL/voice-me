@@ -18,18 +18,36 @@ use gpui_kit::{
     AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _, Window,
     div,
 };
-use voice_me_core::{HotkeyPort, SettingsStore};
+use voice_me_core::{
+    AppEventSender, DependencyOutcome, DependencyProvisioningPort, HotkeyPort, SettingsStore,
+    SpeechBackend,
+};
 
+use crate::dependencies::DependenciesView;
 use crate::hotkey::HotkeyView;
 use crate::voice_setup::VoiceSetupView;
 
 const VOICE_TAB: usize = 0;
 const HOTKEY_TAB: usize = 1;
+const DEPENDENCIES_TAB: usize = 2;
+
+/// Everything the Dependencies tab needs, as one argument.
+///
+/// Grouped rather than spread across four more parameters: `SettingsView`
+/// already takes the startup state of two other tabs, and a twelve-argument
+/// constructor is a place for two of them to be swapped by accident.
+pub struct DependenciesTab {
+    pub deps_port: Arc<dyn DependencyProvisioningPort>,
+    pub events: AppEventSender,
+    pub speech_backend: SpeechBackend,
+    pub outcome: DependencyOutcome,
+}
 
 /// The tabbed Settings window.
 pub struct SettingsView {
     voice: Entity<VoiceSetupView>,
     hotkey: Entity<HotkeyView>,
+    dependencies: Entity<DependenciesView>,
     active_tab: usize,
 }
 
@@ -46,6 +64,7 @@ impl SettingsView {
         selected_mic_device: Option<String>,
         saved_hotkey: Option<String>,
         hotkey_startup_error: Option<String>,
+        dependencies: DependenciesTab,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -68,11 +87,36 @@ impl SettingsView {
             )
         });
 
+        let dependencies = cx.new(|_| {
+            DependenciesView::new(
+                dependencies.deps_port,
+                dependencies.events,
+                dependencies.speech_backend,
+                dependencies.outcome,
+            )
+        });
+
         Self {
             voice,
             hotkey,
+            dependencies,
             active_tab: VOICE_TAB,
         }
+    }
+
+    /// Open the window on the Dependencies tab.
+    ///
+    /// Story 3.4 needs *exactly* this tab: a blocked overlay that sent the
+    /// user to Settings and left them on Voice would have told them nothing.
+    pub fn show_dependencies(&mut self, cx: &mut Context<Self>) {
+        self.active_tab = DEPENDENCIES_TAB;
+        cx.notify();
+    }
+
+    /// Push a fresh Dependency Check outcome into the Dependencies tab.
+    pub fn set_dependency_outcome(&mut self, outcome: DependencyOutcome, cx: &mut Context<Self>) {
+        self.dependencies
+            .update(cx, |view, cx| view.set_outcome(outcome, cx));
     }
 }
 
@@ -86,6 +130,7 @@ impl Render for SettingsView {
                     .selected_index(self.active_tab)
                     .child(Tab::new().label("Voice"))
                     .child(Tab::new().label("Hotkey"))
+                    .child(Tab::new().label("Dependencies"))
                     .on_click(cx.listener(|this, index: &usize, _window, cx| {
                         this.active_tab = *index;
                         cx.notify();
@@ -97,6 +142,7 @@ impl Render for SettingsView {
                     .overflow_hidden()
                     .map(|el| match self.active_tab {
                         HOTKEY_TAB => el.child(self.hotkey.clone()),
+                        DEPENDENCIES_TAB => el.child(self.dependencies.clone()),
                         _ => el.child(self.voice.clone()),
                     }),
             )
@@ -113,7 +159,7 @@ mod tests {
 
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{TestAppContext, component::Root, px, size};
-    use voice_me_core::{AppEventSender, AppState, VoiceMeError};
+    use voice_me_core::{AppEvent, AppEventSender, AppState, VoiceMeError};
 
     use super::*;
 
@@ -140,6 +186,18 @@ mod tests {
         }
     }
 
+    struct StubDepsPort;
+
+    impl DependencyProvisioningPort for StubDepsPort {
+        fn check(
+            &self,
+            _backend: SpeechBackend,
+            _events: AppEventSender,
+        ) -> Result<(), VoiceMeError> {
+            Ok(())
+        }
+    }
+
     struct StubHotkeyPort;
 
     impl HotkeyPort for StubHotkeyPort {
@@ -161,6 +219,7 @@ mod tests {
         cx.update(gpui_kit::init);
         let settings_store: Arc<dyn SettingsStore> = Arc::new(StubSettingsStore);
         let hotkey_port: Arc<dyn HotkeyPort> = Arc::new(StubHotkeyPort);
+        let (event_tx, _event_rx) = futures::channel::mpsc::unbounded::<AppEvent>();
         let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
             let view = cx.new(|cx| {
                 SettingsView::new(
@@ -170,6 +229,12 @@ mod tests {
                     None,
                     None,
                     None,
+                    DependenciesTab {
+                        deps_port: Arc::new(StubDepsPort),
+                        events: event_tx.clone(),
+                        speech_backend: SpeechBackend::CPU,
+                        outcome: DependencyOutcome::Pending,
+                    },
                     window,
                     cx,
                 )
@@ -198,6 +263,88 @@ mod tests {
             window.click(VOICE_TAB, cx);
             window.render_frame(cx);
             assert!(window.try_find("voice-setup-record").is_some());
+
+            window.click(DEPENDENCIES_TAB, cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("dependencies-surface").is_some(),
+                "the third tab must route to the Dependencies section"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Story 3.4 sends the user here from a blocked overlay, so "open
+    /// Settings" has to mean this tab specifically — landing on Voice would
+    /// have told them nothing about what is missing.
+    #[gpui_kit::test]
+    fn settings_can_be_opened_focused_on_the_dependencies_tab(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let settings_store: Arc<dyn SettingsStore> = Arc::new(StubSettingsStore);
+        let hotkey_port: Arc<dyn HotkeyPort> = Arc::new(StubHotkeyPort);
+        let (event_tx, _event_rx) = futures::channel::mpsc::unbounded::<AppEvent>();
+        let view_slot: Arc<std::sync::Mutex<Option<Entity<SettingsView>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        let slot = view_slot.clone();
+        let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+            let view = cx.new(|cx| {
+                SettingsView::new(
+                    settings_store.clone(),
+                    hotkey_port.clone(),
+                    true,
+                    None,
+                    None,
+                    None,
+                    DependenciesTab {
+                        deps_port: Arc::new(StubDepsPort),
+                        events: event_tx.clone(),
+                        speech_backend: SpeechBackend::CPU,
+                        outcome: DependencyOutcome::Pending,
+                    },
+                    window,
+                    cx,
+                )
+            });
+            *slot.lock().unwrap() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = view_slot.lock().unwrap().clone().unwrap();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("dependencies-surface").is_none());
+
+            view.update(cx, |view, cx| view.show_dependencies(cx));
+            window.render_frame(cx);
+            assert!(
+                window.try_find("dependencies-surface").is_some(),
+                "opening Settings on the Dependencies tab is what Story 3.4 needs"
+            );
+
+            // And a report arriving afterwards re-renders the rows without
+            // the user leaving the window.
+            view.update(cx, |view, cx| {
+                view.set_dependency_outcome(
+                    DependencyOutcome::Ready(voice_me_core::DependencyReport::new(
+                        SpeechBackend::CPU,
+                        vec![voice_me_core::Dependency::missing(
+                            voice_me_core::DependencyKind::ModelWeights,
+                            "Speech model files (Q4)",
+                            "Missing: /cache/onnx/language_model_q4.onnx",
+                        )],
+                    )),
+                    cx,
+                )
+            });
+            window.render_frame(cx);
+            assert!(
+                window
+                    .try_find("dependency-missing-model-weights")
+                    .is_some(),
+                "the row says the word `missing`, in text"
+            );
+            assert!(window.try_find("dependencies-pending").is_none());
         })
         .unwrap();
     }

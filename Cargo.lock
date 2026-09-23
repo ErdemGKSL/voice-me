@@ -8589,6 +8589,7 @@ dependencies = [
  "voice-me-audio-linux",
  "voice-me-audio-windows",
  "voice-me-core",
+ "voice-me-deps",
  "voice-me-hotkey-linux",
  "voice-me-hotkey-windows",
  "voice-me-notify-linux",
@@ -8635,6 +8636,9 @@ dependencies = [
 name = "voice-me-deps"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "tempfile",
+ "voice-me-audio-linux",
  "voice-me-core",
 ]
 
@@ -8681,6 +8685,8 @@ dependencies = [
 name = "voice-me-tests"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "gpui-kit",
  "tempfile",
  "voice-me-core",
  "voice-me-ui",

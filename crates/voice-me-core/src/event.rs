@@ -1,3 +1,5 @@
+use crate::state::DependencyReport;
+
 /// Events emitted by adapters onto the single shared `AppEvent` channel (AD-3).
 ///
 /// Only `voice-me-app` (the composition root) holds the receiver; every
@@ -8,7 +10,15 @@ pub enum AppEvent {
     /// The configured global hotkey was pressed.
     HotkeyPressed,
     /// `voice-me-deps`'s Dependency Check finished running.
-    DependencyCheckCompleted,
+    ///
+    /// The report travels *on the event*, and nowhere else: `voice-me-deps`
+    /// holds nothing after sending it, and the composition root is the only
+    /// thing that keeps it (AD-3). That is what stops a second source of
+    /// truth from appearing beside `AppState`.
+    DependencyCheckCompleted {
+        /// What the check found, for the backend it was run against.
+        report: DependencyReport,
+    },
     /// The tray's "Settings…" menu item was clicked.
     SettingsRequested,
     /// The Speak Action: the Prompt Overlay was confirmed with a non-empty

@@ -40,3 +40,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --workspace
+      # `cargo build` never compiles `#[cfg(test)]` code, so without this
+      # every `cfg(not(target_os = "linux"))` test — the ones that exist
+      # precisely because they cannot run on the Ubuntu job — would be dead
+      # code nothing ever executed.
+      - run: cargo test --workspace

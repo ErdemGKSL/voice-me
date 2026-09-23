@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use ort::ep::ExecutionProviderDispatch;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
-use voice_me_core::VoiceMeError;
+use voice_me_core::{SpeechWeights, VoiceMeError, assets};
 
 use crate::tokenizer::{TextTokenizer, tokenizer_path};
 
@@ -38,13 +38,19 @@ pub enum LanguageModel {
 }
 
 impl LanguageModel {
+    /// The core-side name for this variant — the vocabulary
+    /// `voice-me-deps` and the settings both speak (AD-9).
+    pub fn weights(self) -> SpeechWeights {
+        match self {
+            LanguageModel::Q4 => SpeechWeights::Q4,
+            LanguageModel::Fp16 => SpeechWeights::Fp16,
+            LanguageModel::Fp32 => SpeechWeights::Fp32,
+        }
+    }
+
     /// The graph's filename inside `onnx/`.
     pub fn file_name(self) -> &'static str {
-        match self {
-            LanguageModel::Q4 => "language_model_q4.onnx",
-            LanguageModel::Fp16 => "language_model_fp16.onnx",
-            LanguageModel::Fp32 => "language_model.onnx",
-        }
+        assets::language_model_file_name(self.weights())
     }
 
     /// Whether the 60 KV tensors are f16 rather than f32. This is the one
@@ -129,14 +135,12 @@ impl ModelCache {
 
     /// The conventional location, `$XDG_CACHE_HOME/voice-me` (overridable
     /// with `VOICE_ME_MODEL_CACHE`).
+    ///
+    /// Delegated to `voice-me-core`'s asset vocabulary since Story 3.1:
+    /// `voice-me-deps` has to look in the same place this crate reads from,
+    /// and it cannot depend on this crate to find out where that is.
     pub fn from_env() -> Result<Self, VoiceMeError> {
-        if let Some(explicit) = std::env::var_os("VOICE_ME_MODEL_CACHE") {
-            return Ok(Self::new(PathBuf::from(explicit)));
-        }
-        let dirs = directories_cache_dir().ok_or_else(|| {
-            VoiceMeError::Other("could not resolve a cache directory".to_string())
-        })?;
-        Ok(Self::new(dirs.join("voice-me")))
+        Ok(Self::new(assets::model_cache_root()?))
     }
 
     /// The cache root itself.
@@ -145,24 +149,16 @@ impl ModelCache {
     }
 
     fn graph(&self, file_name: &str) -> PathBuf {
-        self.root.join("onnx").join(file_name)
+        assets::graph_file(&self.root, file_name)
     }
 
     /// Every file that must be present for `variant` to load, in the order
-    /// the spike reports them. This *is* Story 3.2's provisioning list.
+    /// the spike reports them. This *is* Story 3.2's provisioning list, and
+    /// since Story 3.1 also Story 3.1's model-weights dependency row — one
+    /// list, owned by `voice-me-core::assets` so the Dependency Check and
+    /// the engine cannot disagree about it.
     pub fn required_files(&self, variant: LanguageModel) -> Vec<PathBuf> {
-        let mut files = vec![tokenizer_path(&self.root)];
-        for graph in [
-            "speech_encoder.onnx",
-            "embed_tokens.onnx",
-            variant.file_name(),
-            "conditional_decoder.onnx",
-        ] {
-            let path = self.graph(graph);
-            files.push(path.with_extension("onnx_data"));
-            files.push(path);
-        }
-        files
+        assets::required_model_files(&self.root, variant.weights())
     }
 
     /// Report the first missing file, if any, before ONNX Runtime is asked
@@ -177,13 +173,6 @@ impl ModelCache {
         }
         Ok(())
     }
-}
-
-fn directories_cache_dir() -> Option<PathBuf> {
-    std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
 }
 
 /// Load ONNX Runtime itself.
@@ -206,13 +195,12 @@ pub fn init_runtime(_dylib: Option<&Path>) -> Result<(), VoiceMeError> {
 pub fn init_runtime(dylib: Option<&Path>) -> Result<(), VoiceMeError> {
     let path = match dylib {
         Some(path) => path.to_path_buf(),
-        None => PathBuf::from(std::env::var_os("ORT_DYLIB_PATH").ok_or_else(|| {
-            VoiceMeError::SpeechEngine(
-                "ONNX Runtime was not located: set ORT_DYLIB_PATH to the absolute path of \
-                 libonnxruntime.so (see the README for how to provision it)"
-                    .to_string(),
-            )
-        })?),
+        // The same resolution rule the Dependency Check reports on
+        // (Story 3.1): `ORT_DYLIB_PATH` wins, otherwise the cache root's
+        // own copy. Reading it from one place is what keeps the runtime row
+        // from claiming "ready" about a library the engine would then fail
+        // to find.
+        None => assets::resolve_runtime_dylib(&assets::model_cache_root()?).path,
     };
 
     if !path.exists() {
@@ -380,6 +368,57 @@ mod tests {
         assert!(
             matches!(&error, VoiceMeError::MissingRuntimeAsset { path: p } if p == path),
             "got {error:?}"
+        );
+    }
+
+    /// The widened resolution rule, which is the whole reason the
+    /// Dependency Check's "ready" runtime row can be believed: with
+    /// `ORT_DYLIB_PATH` unset the engine must look in exactly the place
+    /// `voice-me-deps` reports on — `<cache root>/runtime/<dylib>` — and
+    /// nowhere else. If these two drift apart the tab says "ready" and
+    /// generation then fails naming a path the user was never shown.
+    ///
+    /// Both variables are process-global, so this restores whatever it
+    /// found; `ORT_DYLIB_PATH` is also read by the sibling test above.
+    #[cfg(feature = "dynamic-runtime")]
+    #[test]
+    fn an_unset_dylib_path_resolves_to_the_cache_root_the_check_reports_on() {
+        use std::ffi::OsString;
+
+        struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (key, value) in self.0.drain(..) {
+                    match value {
+                        Some(value) => unsafe { std::env::set_var(key, value) },
+                        None => unsafe { std::env::remove_var(key) },
+                    }
+                }
+            }
+        }
+
+        let cache = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard(vec![
+            ("ORT_DYLIB_PATH", std::env::var_os("ORT_DYLIB_PATH")),
+            (
+                voice_me_core::assets::CACHE_ROOT_ENV,
+                std::env::var_os(voice_me_core::assets::CACHE_ROOT_ENV),
+            ),
+        ]);
+        unsafe {
+            std::env::remove_var("ORT_DYLIB_PATH");
+            std::env::set_var(voice_me_core::assets::CACHE_ROOT_ENV, cache.path());
+        }
+
+        let expected = assets::bundled_runtime_dylib(cache.path());
+        let error = init_runtime(None).unwrap_err();
+
+        assert!(
+            matches!(&error, VoiceMeError::MissingRuntimeAsset { path } if *path == expected),
+            "the engine must look where the Dependency Check says it looks \
+             ({}), got {error:?}",
+            expected.display()
         );
     }
 

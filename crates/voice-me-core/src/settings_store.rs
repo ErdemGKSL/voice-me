@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::VoiceMeError;
 use crate::ports::SettingsStore;
-use crate::state::{AppState, SpeechBackend};
+use crate::state::{AppState, DependencyOutcome, SpeechBackend};
 
 const SETTINGS_FILE_NAME: &str = "settings.toml";
 const REFERENCE_VOICE_SAMPLE_FILE_NAME: &str = "reference_voice_sample.wav";
@@ -132,6 +132,12 @@ impl FileSettingsStore {
             // Not persisted: the composition root overwrites it with the
             // backend this build and this machine resolved to (AD-9).
             speech_backend: SpeechBackend::default(),
+            // Not persisted either, and for a stronger reason: a dependency
+            // report describes the filesystem as it was a moment ago, so
+            // one read back from a file would be a claim about a machine
+            // that may have changed since. The composition root merges in
+            // whatever the latest live check found.
+            dependencies: DependencyOutcome::default(),
         }
     }
 }

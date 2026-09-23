@@ -1,6 +1,7 @@
 //! `voice-me-core` — the hexagon: platform-agnostic domain types, `AppState`,
 //! `AppEvent`, and the port traits every adapter implements (AD-1).
 
+pub mod assets;
 mod audio;
 mod error;
 mod event;
@@ -23,7 +24,8 @@ pub use speak::{
     speak,
 };
 pub use state::{
-    AppState, DEFAULT_SPEECH_LANGUAGE, DEFAULT_UI_LANGUAGE, SpeechBackend, SpeechExecutionTarget,
+    AppState, DEFAULT_SPEECH_LANGUAGE, DEFAULT_UI_LANGUAGE, Dependency, DependencyKind,
+    DependencyOutcome, DependencyReport, DependencyStatus, SpeechBackend, SpeechExecutionTarget,
     SpeechWeights,
 };
 

@@ -5,3 +5,14 @@ edition.workspace = true
 
 [dependencies]
 voice-me-core = { path = "../voice-me-core" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Decision 1: the Virtual Microphone's status is *asked of* the crate that
+# already owns every line of PipeWire knowledge, never detected a second
+# time here.
+voice-me-audio-linux = { path = "../voice-me-audio-linux" }
+
+[dev-dependencies]
+tempfile = "3.14"
+# The `AppEvent` channel the check reports on (AD-3).
+futures = "0.3"

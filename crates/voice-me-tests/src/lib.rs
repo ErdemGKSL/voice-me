@@ -114,3 +114,119 @@ mod recording_duration_rule {
         assert!(should_auto_stop(75.0));
     }
 }
+
+#[cfg(test)]
+mod dependency_report_gates_the_prompt_overlay {
+    //! Stories 3.1 + 3.4 acceptance, end to end across three crates: a
+    //! report from `voice-me-core`'s vocabulary decides which shape of
+    //! `voice-me-ui`'s Prompt Overlay a hotkey press opens, and a blocked
+    //! one never reaches the Speak Action.
+    //!
+    //! The composition root's own wiring is asserted in `voice-me-app`;
+    //! what is proven here is that the value and the view agree — the
+    //! report's `speech_engine_blocker` is exactly what the overlay refuses
+    //! input over.
+
+    use futures::channel::mpsc;
+    use gpui_kit::test::TestWindowExt as _;
+    use gpui_kit::{AppContext as _, TestAppContext, component::Root, px, size};
+    use voice_me_core::{AppEvent, Dependency, DependencyKind, DependencyReport, SpeechBackend};
+    use voice_me_ui::{PromptOverlayView, blocker_notice};
+
+    fn engine_rows(weights_missing: bool) -> Vec<Dependency> {
+        vec![
+            Dependency::ready(
+                DependencyKind::OnnxRuntime,
+                "ONNX Runtime",
+                "Loaded from /rt",
+            ),
+            if weights_missing {
+                Dependency::missing(
+                    DependencyKind::ModelWeights,
+                    "Speech model files (Q4)",
+                    "Missing: /cache/onnx/language_model_q4.onnx",
+                )
+            } else {
+                Dependency::ready(
+                    DependencyKind::ModelWeights,
+                    "Speech model files (Q4)",
+                    "All 9 files present in /cache.",
+                )
+            },
+        ]
+    }
+
+    /// Opens whichever overlay `report` implies, types a line, presses
+    /// Enter, and reports what reached the channel.
+    fn press_hotkey_and_speak(cx: &mut TestAppContext, report: &DependencyReport) -> Vec<AppEvent> {
+        cx.update(gpui_kit::init);
+        let (event_tx, mut event_rx) = mpsc::unbounded::<AppEvent>();
+        let blocker = report.speech_engine_blocker().map(blocker_notice);
+
+        let handle = cx.open_window(size(px(560.), px(84.)), |window, cx| {
+            let view = cx.new(|cx| match blocker.clone() {
+                Some(blocker) => PromptOverlayView::blocked(event_tx.clone(), blocker, window, cx),
+                None => PromptOverlayView::new(event_tx.clone(), window, cx),
+            });
+            Root::new(view, window, cx)
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.input("hello there", cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+
+        let mut sent = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            sent.push(event);
+        }
+        sent
+    }
+
+    #[gpui_kit::test]
+    fn a_missing_speech_engine_dependency_blocks_and_then_unblocks(cx: &mut TestAppContext) {
+        let blocked = DependencyReport::new(SpeechBackend::CPU, engine_rows(true));
+
+        assert!(
+            press_hotkey_and_speak(cx, &blocked).is_empty(),
+            "a blocked overlay refuses input — nothing reaches the Speak Action"
+        );
+
+        // The missing file is placed on disk and the check re-run: the same
+        // decision flips, with no restart in between.
+        let resolved = DependencyReport::new(SpeechBackend::CPU, engine_rows(false));
+
+        assert_eq!(
+            press_hotkey_and_speak(cx, &resolved),
+            vec![AppEvent::SpeakRequested {
+                text: "hello there".to_string()
+            }],
+            "the overlay accepts input normally once the report comes back all-ready"
+        );
+    }
+
+    /// The same report, read the way Settings reads it: a gap is still
+    /// *reported*, it just does not gate typing unless it is the engine's.
+    #[gpui_kit::test]
+    fn a_virtual_microphone_gap_is_reported_but_never_blocks(cx: &mut TestAppContext) {
+        let mut rows = engine_rows(false);
+        rows.push(Dependency::missing(
+            DependencyKind::VirtualMicrophone,
+            "Virtual Microphone",
+            "The device is not loaded.",
+        ));
+        let report = DependencyReport::new(SpeechBackend::CPU, rows);
+
+        assert!(report.has_missing(), "the row is still missing");
+        assert!(report.speech_engine_blocker().is_none());
+        assert_eq!(
+            press_hotkey_and_speak(cx, &report),
+            vec![AppEvent::SpeakRequested {
+                text: "hello there".to_string()
+            }],
+            "playback is what fails, later, through VirtualMicUnavailable"
+        );
+    }
+}

@@ -131,15 +131,44 @@ impl LinuxVirtualMicAdapter {
     /// Whether the Virtual Microphone is currently present as a capture
     /// source — i.e. whether another application can select it right now.
     pub fn is_present(&self) -> Result<bool, VoiceMeError> {
-        Ok(PulseSession::connect()?.source_count(DEVICE_NAME)? > 0)
+        virtual_microphone_available()
     }
 
     /// How many devices carry [`DEVICE_NAME`]. One is correct; two would
     /// mean an install duplicated the Virtual Microphone, which is the
     /// failure a user notices as two identical entries in Discord.
     pub fn device_count(&self) -> Result<usize, VoiceMeError> {
-        PulseSession::connect()?.source_count(DEVICE_NAME)
+        device_count()
     }
+}
+
+/// Whether the Virtual Microphone is available on this machine right now —
+/// the Dependency Check's question (Story 3.1, Decision 1).
+///
+/// A free function rather than a method because the caller has nothing to
+/// construct: `voice-me-deps` wants an answer, not an adapter, and building
+/// one would mean resolving a config directory it has no use for. It is
+/// also deliberately the *same* call [`LinuxVirtualMicAdapter::is_present`]
+/// makes — PipeWire detection is not re-implemented anywhere else, here or
+/// in `voice-me-deps`.
+///
+/// Cheap and non-mutating: one short-lived connection, one source
+/// enumeration, no module loaded and no file written. `Err` carries why the
+/// audio server could not be asked, which is itself the answer the user
+/// needs to read.
+pub fn virtual_microphone_available() -> Result<bool, VoiceMeError> {
+    Ok(device_count()? > 0)
+}
+
+/// How many devices carry [`DEVICE_NAME`]. One is correct; two would mean
+/// an install duplicated the Virtual Microphone, which is the failure a
+/// user notices as two identical entries in Discord.
+///
+/// The one enumeration in this crate: both the adapter's methods and the
+/// Dependency Check's question go through it, so "the same call" is a fact
+/// the compiler enforces rather than a claim in a doc comment.
+fn device_count() -> Result<usize, VoiceMeError> {
+    PulseSession::connect()?.source_count(DEVICE_NAME)
 }
 
 impl VirtualMicPort for LinuxVirtualMicAdapter {

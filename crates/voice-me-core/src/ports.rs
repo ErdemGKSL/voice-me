@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::AppEventSender;
 use crate::audio::AudioBuffer;
 use crate::error::VoiceMeError;
-use crate::state::AppState;
+use crate::state::{AppState, SpeechBackend};
 
 /// Driving adapter port: captures the configured global hotkey per OS.
 pub trait HotkeyPort {
@@ -154,9 +154,30 @@ pub trait NotificationPort: Send + Sync {
 }
 
 /// Driven adapter port: detects and provisions runtime dependencies.
-pub trait DependencyProvisioningPort {
-    /// Run the Dependency Check, reporting results via `AppEvent`.
-    fn check(&self) -> Result<(), VoiceMeError>;
+///
+/// `Send + Sync` for the same reason [`TtsPort`] is: every call is driven
+/// off the thread that asked for it — the startup check runs on GPUI's
+/// background executor, and so does the one Settings' "Check again" button
+/// triggers, because a detection call can block on an unresponsive audio
+/// server and freezing the Settings window is not an acceptable way to
+/// find that out.
+pub trait DependencyProvisioningPort: Send + Sync {
+    /// Run the Dependency Check for `backend`, sending
+    /// [`crate::AppEvent::DependencyCheckCompleted`] on `events`.
+    ///
+    /// Backend-relative by construction: there is no fixed dependency list
+    /// to ask for, because the CPU backend never needs a GPU provider
+    /// library and a GPU backend never needs the CPU's weights. `events` is
+    /// threaded the same way [`HotkeyPort::start_listening`] threads it —
+    /// the adapter reports only by sending, never by calling into
+    /// `voice-me-core` or `voice-me-ui`, and holds nothing afterwards.
+    ///
+    /// Detection only: this reads the filesystem and the environment and
+    /// changes neither. `Err` means the check itself could not run at all
+    /// (no cache directory to resolve, say), which is a different thing
+    /// from a check that ran and found something missing — the latter is a
+    /// perfectly successful call carrying a report full of `missing` rows.
+    fn check(&self, backend: SpeechBackend, events: AppEventSender) -> Result<(), VoiceMeError>;
 }
 
 /// Port for reading/writing persisted settings (implemented inside
