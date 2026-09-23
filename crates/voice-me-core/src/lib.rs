@@ -26,7 +26,7 @@ pub use speak::{
 pub use state::{
     AppState, DEFAULT_SPEECH_LANGUAGE, DEFAULT_UI_LANGUAGE, Dependency, DependencyKind,
     DependencyOutcome, DependencyReport, DependencyStatus, SpeechBackend, SpeechExecutionTarget,
-    SpeechWeights,
+    SpeechWeights, format_bytes,
 };
 
 /// Sender half of the shared `AppEvent` channel (AD-3). Adapters hold only

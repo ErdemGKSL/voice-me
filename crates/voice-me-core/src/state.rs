@@ -77,8 +77,11 @@ impl SpeechBackend {
 ///
 /// Two states only, and both are *words*: UX-DR-wise "missing" has to be
 /// readable, not inferred from a colour. There is deliberately no
-/// `Installing` here — Story 3.2 owns provisioning, and a report is a
-/// snapshot of the filesystem, not a progress channel.
+/// `Installing` here: a report is a snapshot of the filesystem, not a
+/// progress channel. Story 3.2 keeps install progress beside the report, in
+/// the Dependencies tab, so a row being installed is still `Missing` here —
+/// and the overlay gate, which reads only this, keeps treating it as a
+/// blocker until the re-run check says otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependencyStatus {
     /// Present and usable.
@@ -109,7 +112,7 @@ impl DependencyStatus {
 /// a report — "what do I show the user" (the label) and "does this stop the
 /// Speak Action" (this) — and matching on prose would be a bug waiting to
 /// happen. Decision 3: only the speech-engine kinds block the overlay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DependencyKind {
     /// The ONNX Runtime shared library.
     OnnxRuntime,
@@ -143,9 +146,14 @@ pub struct Dependency {
     /// difference between "Dependency check failed (code 3)" and something
     /// a person can act on.
     pub detail: String,
-    /// Whether Story 3.2 will be able to fetch this with one click. `false`
-    /// means the row gets short manual steps instead of an Install button.
+    /// Whether Story 3.2 can fetch this with one click. `false` means the
+    /// row gets short manual steps instead of an Install button.
     pub automatable: bool,
+    /// What the user does by hand when [`Self::automatable`] is `false`:
+    /// two to four short steps, shown inline under a "Show steps" toggle.
+    /// Never a link — the epic promises no external docs. Empty on an
+    /// automatable row.
+    pub manual_steps: Vec<String>,
 }
 
 impl Dependency {
@@ -161,6 +169,7 @@ impl Dependency {
             status: DependencyStatus::Ready,
             detail: detail.into(),
             automatable: true,
+            manual_steps: Vec::new(),
         }
     }
 
@@ -176,13 +185,37 @@ impl Dependency {
             status: DependencyStatus::Missing,
             detail: detail.into(),
             automatable: true,
+            manual_steps: Vec::new(),
         }
     }
 
-    /// Mark a row as one the app cannot fix for the user.
-    pub fn manual(mut self) -> Self {
+    /// Mark a row as one the app cannot fix for the user, with the short
+    /// steps the user follows instead.
+    pub fn manual<S: Into<String>>(mut self, steps: impl IntoIterator<Item = S>) -> Self {
         self.automatable = false;
+        self.manual_steps = steps.into_iter().map(Into::into).collect();
         self
+    }
+}
+
+/// A byte count the way the Dependencies tab and provisioning errors state
+/// it: decimal units, so "1.56 GB" matches what a file manager says.
+///
+/// Below a gigabyte, whole megabytes ("412 MB"); from a gigabyte up, two
+/// decimals ("1.56 GB"), because a whole-number figure would sit still for
+/// a hundred megabytes at a time and look frozen.
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1_000;
+    const MB: u64 = 1_000_000;
+    const GB: u64 = 1_000_000_000;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{} MB", bytes / MB)
+    } else if bytes >= KB {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -295,5 +328,27 @@ impl Default for AppState {
             speech_backend: SpeechBackend::default(),
             dependencies: DependencyOutcome::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_figures_read_the_way_the_spec_writes_them() {
+        assert_eq!(format_bytes(412_000_000), "412 MB");
+        assert_eq!(format_bytes(1_555_123_000), "1.56 GB");
+        assert_eq!(format_bytes(71_798), "71 KB");
+        assert_eq!(format_bytes(0), "0 B");
+    }
+
+    #[test]
+    fn a_manual_row_carries_its_steps_and_no_install() {
+        let row = Dependency::missing(DependencyKind::OnnxRuntime, "ONNX Runtime", "gone")
+            .manual(["one", "two"]);
+
+        assert!(!row.automatable);
+        assert_eq!(row.manual_steps, vec!["one".to_string(), "two".to_string()]);
     }
 }

@@ -28,6 +28,13 @@
 //! gate that decides whether the Prompt Overlay opens blocked — read that
 //! one value.
 //!
+//! Story 3.2 lets that tab fix what it found. Install on a row runs
+//! `DependencyProvisioningPort::provision` on Tokio's blocking pool; its
+//! progress and its end arrive here as `ProvisioningProgress` and
+//! `ProvisioningFinished`, this file keeps the one copy of each row's
+//! install state, and a finished install re-runs the check — so a row turns
+//! "ready" and the overlay unblocks without a restart.
+//!
 //! Story 2.9 closes the loop: the per-OS `VirtualMicPort` adapter is built
 //! here and handed to `speak`, which plays the generated buffer through the
 //! Virtual Microphone instead of dropping it. The device itself is ensured
@@ -35,6 +42,7 @@
 //! setup step (spec-2-9 Decision 1).
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -48,13 +56,15 @@ use gpui_kit::{
 #[cfg(target_os = "linux")]
 use voice_me_core::VoiceMeError;
 use voice_me_core::{
-    AppEvent, AppState, DependencyOutcome, DependencyProvisioningPort, FileSettingsStore,
-    HotkeyPort, NotificationPort, SettingsStore, SpeechBackend, TtsPort, VirtualMicPort,
-    tokio_bridge,
+    AppEvent, AppState, DependencyKind, DependencyOutcome, DependencyProvisioningPort,
+    DependencyReport, FileSettingsStore, HotkeyPort, NotificationPort, SettingsStore,
+    SpeechBackend, TtsPort, VirtualMicPort, tokio_bridge,
 };
 use voice_me_deps::DepsAdapter;
 use voice_me_tts::TtsAdapter;
-use voice_me_ui::{DependenciesTab, PromptOverlayView, SettingsView, blocker_notice};
+use voice_me_ui::{
+    DependenciesTab, PromptOverlayView, RowProvisioning, SettingsView, blocker_notice,
+};
 
 #[cfg(target_os = "linux")]
 use voice_me_audio_linux::LinuxVirtualMicAdapter;
@@ -163,6 +173,59 @@ fn overlay_blocker(outcome: &DependencyOutcome) -> Option<String> {
 /// dependency is still missing.
 fn should_auto_open_dependencies(already_auto_opened: bool, anything_missing: bool) -> bool {
     !already_auto_opened && anything_missing
+}
+
+/// Fold one provisioning event into the held per-row install state
+/// (Story 3.2). Returns whether the Dependency Check should run again —
+/// true for every `ProvisioningFinished`, success or failure, since either
+/// can have changed the files on disk.
+///
+/// Progress marks the row installing with its figure; a successful finish
+/// drops the row (the re-run check is what says "ready"); a failed one
+/// holds the sentence saying why. Any other event is ignored.
+fn apply_provisioning_event(
+    rows: &mut HashMap<DependencyKind, RowProvisioning>,
+    event: &AppEvent,
+) -> bool {
+    match event {
+        AppEvent::ProvisioningProgress {
+            kind,
+            done_bytes,
+            total_bytes,
+        } => {
+            rows.insert(
+                *kind,
+                RowProvisioning::Installing {
+                    done: *done_bytes,
+                    total: *total_bytes,
+                },
+            );
+            false
+        }
+        AppEvent::ProvisioningFinished { kind, result } => {
+            match result {
+                Ok(()) => rows.remove(kind),
+                Err(reason) => rows.insert(*kind, RowProvisioning::Failed(reason.clone())),
+            };
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Drop the install state of every row `report` no longer calls missing:
+/// a ready row has nothing left to install, so nothing held against it —
+/// progress or failure — should outlive the report that saw it ready.
+fn retain_missing_rows(
+    rows: &mut HashMap<DependencyKind, RowProvisioning>,
+    report: &DependencyReport,
+) {
+    rows.retain(|kind, _| {
+        report
+            .dependencies
+            .iter()
+            .any(|row| row.kind == *kind && row.status.is_missing())
+    });
 }
 
 /// The persisted settings, plus this run's resolved backend and the latest
@@ -331,6 +394,109 @@ mod tests {
     use super::*;
     use voice_me_core::{AppState, VoiceMeError};
     use voice_me_hotkey_linux::SessionKind;
+
+    fn progress_event(kind: DependencyKind, done: u64, total: u64) -> AppEvent {
+        AppEvent::ProvisioningProgress {
+            kind,
+            done_bytes: done,
+            total_bytes: total,
+        }
+    }
+
+    #[test]
+    fn progress_marks_the_row_installing_without_a_recheck() {
+        let mut rows = HashMap::new();
+
+        let recheck = apply_provisioning_event(
+            &mut rows,
+            &progress_event(DependencyKind::ModelWeights, 412, 1_560),
+        );
+
+        assert!(!recheck);
+        assert_eq!(
+            rows.get(&DependencyKind::ModelWeights),
+            Some(&RowProvisioning::Installing {
+                done: 412,
+                total: 1_560
+            })
+        );
+    }
+
+    #[test]
+    fn a_successful_finish_drops_the_row_and_asks_for_a_recheck() {
+        let mut rows = HashMap::new();
+        apply_provisioning_event(
+            &mut rows,
+            &progress_event(DependencyKind::ModelWeights, 1, 1),
+        );
+
+        let recheck = apply_provisioning_event(
+            &mut rows,
+            &AppEvent::ProvisioningFinished {
+                kind: DependencyKind::ModelWeights,
+                result: Ok(()),
+            },
+        );
+
+        assert!(recheck);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn a_failed_finish_holds_the_reason_and_asks_for_a_recheck() {
+        let mut rows = HashMap::new();
+
+        let recheck = apply_provisioning_event(
+            &mut rows,
+            &AppEvent::ProvisioningFinished {
+                kind: DependencyKind::OnnxRuntime,
+                result: Err("Download of x failed: reset".to_string()),
+            },
+        );
+
+        assert!(recheck);
+        assert_eq!(
+            rows.get(&DependencyKind::OnnxRuntime),
+            Some(&RowProvisioning::Failed(
+                "Download of x failed: reset".to_string()
+            ))
+        );
+        assert!(!apply_provisioning_event(
+            &mut rows,
+            &AppEvent::HotkeyPressed
+        ));
+    }
+
+    #[test]
+    fn a_report_drops_ready_rows_and_keeps_failures_on_missing_ones() {
+        let mut rows = HashMap::from([
+            (
+                DependencyKind::ModelWeights,
+                RowProvisioning::Installing { done: 5, total: 5 },
+            ),
+            (
+                DependencyKind::OnnxRuntime,
+                RowProvisioning::Failed("Extraction failed".to_string()),
+            ),
+        ]);
+        let report = DependencyReport::new(
+            SpeechBackend::CPU,
+            vec![
+                voice_me_core::Dependency::ready(DependencyKind::ModelWeights, "Model", "ok"),
+                voice_me_core::Dependency::missing(DependencyKind::OnnxRuntime, "Runtime", "gone"),
+            ],
+        );
+
+        retain_missing_rows(&mut rows, &report);
+
+        assert_eq!(
+            rows,
+            HashMap::from([(
+                DependencyKind::OnnxRuntime,
+                RowProvisioning::Failed("Extraction failed".to_string()),
+            )])
+        );
+    }
 
     /// A store whose Reference Voice Sample appears only on the second
     /// `load` — i.e. recorded in Settings after launch.
@@ -763,12 +929,11 @@ fn main() {
             }
         };
 
-        // Story 3.1: detection only — no network, nothing installed. The
-        // concrete adapter is kept alongside the port because the startup
-        // check runs on a background thread, and a `dyn` port would have to
-        // promise `Send` to every implementor for that one call site.
-        let deps_adapter = DepsAdapter::new();
-        let deps_port: Arc<dyn DependencyProvisioningPort> = Arc::new(deps_adapter);
+        // Stories 3.1/3.2: detection, and one-click provisioning. One
+        // adapter for the whole process — it remembers which rows are
+        // installing, so a second Install on the same row is refused
+        // rather than racing the first on one `.part` file.
+        let deps_port: Arc<dyn DependencyProvisioningPort> = Arc::new(DepsAdapter::new());
 
         #[cfg(target_os = "linux")]
         let notification_port: Arc<dyn NotificationPort> = Arc::new(LinuxNotificationAdapter);
@@ -855,6 +1020,16 @@ fn main() {
         // dependency is still missing.
         let dependencies_auto_opened = Rc::new(RefCell::new(false));
 
+        // Story 3.2: each row's install state — running with a byte figure,
+        // or failed with the sentence saying why. Kept here, beside the
+        // report rather than inside it, because the report must go on
+        // saying "missing" (and the overlay gate on blocking) until the
+        // re-run check has actually seen the files. A Settings window
+        // opened mid-download reads it, so it never offers a second
+        // Install on a row that is still downloading.
+        let provisioning: Rc<RefCell<HashMap<DependencyKind, RowProvisioning>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+
         // The same one-at-a-time guarantee for the Prompt Overlay: a press
         // while one is already open activates it instead of stacking a
         // second window on top.
@@ -873,6 +1048,7 @@ fn main() {
             let deps_port = deps_port.clone();
             let event_tx = event_tx.clone();
             let dependency_outcome = dependency_outcome.clone();
+            let provisioning = provisioning.clone();
             move |cx: &mut App| {
                 if let Some(handle) = window_slot.borrow().as_ref() {
                     let _ = handle.update(cx, |_, window, _| window.activate_window());
@@ -899,6 +1075,7 @@ fn main() {
                     events: event_tx.clone(),
                     speech_backend: resolved_speech_backend(),
                     outcome: dependency_outcome.borrow().clone(),
+                    provisioning: provisioning.borrow().clone(),
                 };
                 let view_slot = settings_view_slot.clone();
                 let handle = match cx.open_window(WindowOptions::default(), move |window, cx| {
@@ -1083,7 +1260,8 @@ fn main() {
         {
             let backend = resolved_speech_backend();
             let events = event_tx.clone();
-            let check = cx.background_spawn(async move { deps_adapter.check(backend, events) });
+            let deps_port = deps_port.clone();
+            let check = cx.background_spawn(async move { deps_port.check(backend, events) });
             let dependency_outcome = dependency_outcome.clone();
             let settings_view_slot = settings_view_slot.clone();
             let open_dependencies = open_dependencies.clone();
@@ -1153,6 +1331,10 @@ fn main() {
                     }
                     AppEvent::DependencyCheckCompleted { report } => {
                         let anything_missing = report.has_missing();
+                        // A row the check now calls ready has nothing left
+                        // to install; whatever was held against it goes.
+                        retain_missing_rows(&mut provisioning.borrow_mut(), &report);
+                        let rows = provisioning.borrow().clone();
                         let outcome = DependencyOutcome::Ready(report);
                         *dependency_outcome.borrow_mut() = outcome.clone();
 
@@ -1165,7 +1347,8 @@ fn main() {
                             // without the user leaving the window.
                             if let Some(view) = settings_view_slot.borrow().clone() {
                                 view.update(cx, |view, cx| {
-                                    view.set_dependency_outcome(outcome, cx)
+                                    view.set_dependency_outcome(outcome, cx);
+                                    view.replace_provisioning(rows, cx);
                                 });
                             }
 
@@ -1178,6 +1361,77 @@ fn main() {
                             if should_auto_open_dependencies(!first_check, anything_missing) {
                                 (*open_dependencies)(cx);
                             }
+                        });
+                    }
+                    event @ (AppEvent::ProvisioningProgress { .. }
+                    | AppEvent::ProvisioningFinished { .. }) => {
+                        let (kind, finished_ok) = match &event {
+                            AppEvent::ProvisioningProgress { kind, .. } => (*kind, false),
+                            AppEvent::ProvisioningFinished { kind, result } => {
+                                if let Err(reason) = result {
+                                    eprintln!("installing {kind:?} failed: {reason}");
+                                }
+                                (*kind, result.is_ok())
+                            }
+                            _ => unreachable!("matched above"),
+                        };
+                        let recheck =
+                            apply_provisioning_event(&mut provisioning.borrow_mut(), &event);
+
+                        // A successful finish is dropped from the held map
+                        // but deliberately not pushed: the open view keeps
+                        // showing "installing" until the re-run check
+                        // lands and replaces its map, so the row never
+                        // flashes back to "missing" with Install enabled
+                        // in between.
+                        if !finished_ok {
+                            let state = provisioning.borrow().get(&kind).cloned();
+                            cx.update(|cx| {
+                                if let Some(view) = settings_view_slot.borrow().clone() {
+                                    view.update(cx, |view, cx| {
+                                        view.set_provisioning(kind, state, cx)
+                                    });
+                                }
+                            });
+                        }
+                        if !recheck {
+                            continue;
+                        }
+
+                        // Either way the files on disk changed — a failed
+                        // run can still have completed some of them — so
+                        // the check runs again, on the same background
+                        // path as the startup one. It reports by event;
+                        // only a check that could not run lands here.
+                        let backend = resolved_speech_backend();
+                        let events = event_tx.clone();
+                        let deps_port = deps_port.clone();
+                        let dependency_outcome = dependency_outcome.clone();
+                        let settings_view_slot = settings_view_slot.clone();
+                        let provisioning = provisioning.clone();
+                        cx.update(|cx| {
+                            let check = cx
+                                .background_spawn(async move { deps_port.check(backend, events) });
+                            cx.spawn(async move |cx| {
+                                let Err(error) = check.await else { return };
+                                eprintln!("the dependency check could not run: {error}");
+                                let outcome = DependencyOutcome::Failed(error.to_string());
+                                *dependency_outcome.borrow_mut() = outcome.clone();
+                                cx.update(|cx| {
+                                    if let Some(view) = settings_view_slot.borrow().clone() {
+                                        // No report is coming to replace
+                                        // the view's map, so a row left
+                                        // "installing" after an `Ok` finish
+                                        // is resynced from the held one.
+                                        let rows = provisioning.borrow().clone();
+                                        view.update(cx, |view, cx| {
+                                            view.set_dependency_outcome(outcome, cx);
+                                            view.replace_provisioning(rows, cx);
+                                        });
+                                    }
+                                });
+                            })
+                            .detach();
                         });
                     }
                     AppEvent::SpeakRequested { text } => {

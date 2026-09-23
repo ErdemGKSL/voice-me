@@ -5,14 +5,34 @@ edition.workspace = true
 
 [dependencies]
 voice-me-core = { path = "../voice-me-core" }
+# Story 3.2: the only HTTP client in the workspace besides the future remote
+# TTS crate (AD-8). Plain HTTPS GETs against pinned, immutable URLs — no
+# Hugging Face Hub client. rustls with the bundled webpki roots, so a
+# download never depends on the machine's OpenSSL or certificate store.
+# Bodies are read with `Response::chunk`, which needs no `stream` feature.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Only to find the AD-5 runtime the blocking job runs on (or build a small
+# one when there is none, as in tests). The I/O and timer drivers reqwest
+# needs are enabled by reqwest's own tokio features.
+tokio = { version = "1.53", default-features = false, features = ["rt"] }
+# Every downloaded file is checked against a SHA-256 pinned in `sources.rs`
+# before it takes its final name.
+sha2 = "0.10"
+# The Linux ONNX Runtime ships as a `.tgz`; only its real shared library is
+# extracted.
+flate2 = "1.1"
+tar = { version = "0.4", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Decision 1: the Virtual Microphone's status is *asked of* the crate that
 # already owns every line of PipeWire knowledge, never detected a second
-# time here.
+# time here. Story 3.2's Install reuses its idempotent `install()`.
 voice-me-audio-linux = { path = "../voice-me-audio-linux" }
 
 [dev-dependencies]
 tempfile = "3.14"
 # The `AppEvent` channel the check reports on (AD-3).
 futures = "0.3"
+# A real multi-threaded AD-5 runtime, for the test that drives `provision`
+# the way the app does.
+tokio = { version = "1.53", default-features = false, features = ["rt", "rt-multi-thread"] }

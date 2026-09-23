@@ -1,4 +1,4 @@
-use crate::state::DependencyReport;
+use crate::state::{DependencyKind, DependencyReport};
 
 /// Events emitted by adapters onto the single shared `AppEvent` channel (AD-3).
 ///
@@ -31,5 +31,31 @@ pub enum AppEvent {
     SpeakRequested {
         /// The text the user typed, trimmed of surrounding whitespace.
         text: String,
+    },
+    /// Provisioning one dependency row moved forward (Story 3.2).
+    ///
+    /// Sent by `voice-me-deps` while it downloads, at most about ten times a
+    /// second per row, so the Dependencies tab can say "installing" with a
+    /// figure that grows. `total_bytes` is what *this* run has to fetch,
+    /// counting only what was still missing — and bytes a resumed `.part`
+    /// already held count as done from the first event. `0` means the step
+    /// has no byte count at all (the Virtual Microphone), which the UI
+    /// shows as "installing" with no figure.
+    ProvisioningProgress {
+        kind: DependencyKind,
+        done_bytes: u64,
+        total_bytes: u64,
+    },
+    /// Provisioning one dependency row ended, one way or the other.
+    ///
+    /// Exactly one per `provision` call that started, success *and*
+    /// failure alike: failures travel on the channel rather than only as a
+    /// return value, so there is one path from the adapter to the screen.
+    /// The error is already a sentence naming the file and the reason; the
+    /// composition root re-runs the Dependency Check either way, because a
+    /// failed run can still have completed some files.
+    ProvisioningFinished {
+        kind: DependencyKind,
+        result: Result<(), String>,
     },
 }

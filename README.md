@@ -73,51 +73,35 @@ Speech is generated **in this process**, by ONNX Runtime, from the
 Chatterbox-Multilingual V3 ONNX export. There is no sidecar process and no
 Python anywhere in the pipeline.
 
-The app never downloads model or runtime files (AD-8) — they are read from a
-cache directory. Until `voice-me-deps` exists (Story 3.2), provision them by
-hand with `curl`.
+The engine itself never downloads anything (AD-8) — it reads its files from
+a cache directory owned by `voice-me-deps`. You never fetch them by hand:
+open **Settings → Dependencies** and press **Install** on each missing row.
 
-### 1. ONNX Runtime
+- **Speech model files (Q4)** — the nine files the CPU backend needs, about
+  1.56 GB, with progress shown on the row. An interrupted download resumes
+  from the bytes already on disk the next time Install is pressed, and every
+  file is checked against a pinned SHA-256 before it is used.
+- **ONNX Runtime** (Linux x64) — the core library from Microsoft's
+  `onnxruntime-linux-x64-1.28.2.tgz` release, extracted to
+  `<cache>/runtime/libonnxruntime.so`. No execution-provider libraries are
+  fetched for the CPU backend. On other systems, or when `ORT_DYLIB_PATH`
+  points somewhere that does not exist, the row shows short manual steps
+  instead of an Install button.
 
-```bash
-mkdir -p ~/.cache/voice-me/onnxruntime
-curl -L -o /tmp/ort.tgz \
-  https://github.com/microsoft/onnxruntime/releases/download/v1.28.2/onnxruntime-linux-x64-1.28.2.tgz
-tar xzf /tmp/ort.tgz -C ~/.cache/voice-me/onnxruntime
-export ORT_DYLIB_PATH=~/.cache/voice-me/onnxruntime/onnxruntime-linux-x64-1.28.2/lib/libonnxruntime.so
-```
+When a row finishes, the check runs again by itself; the row turns "ready"
+and the Prompt Overlay accepts input without a restart.
 
-The tarball is 8.7 MB and ships the core library only — **no execution
-provider libraries at all**. That is the whole CPU path, which is the only
-one this machine can run; see "GPU" below for why the GPU path is deferred
-rather than absent by design.
+For reference, the weights come from
+`onnx-community/chatterbox-multilingual-ONNX` (MIT), pinned to revision
+`452d3f434aa592098f1eedac9099f33642ab2da5` — the tokenizer and the graphs
+have drifted against each other before, so the revision is not optional.
+The sources, sizes and checksums live in
+`crates/voice-me-deps/src/sources.rs`. Each `.onnx_data` holds its graph's
+weights and records its own location as a **bare relative filename**, so it
+sits next to its `.onnx`. The cache directory defaults to
+`$XDG_CACHE_HOME/voice-me`; `VOICE_ME_MODEL_CACHE` overrides it.
 
-### 2. Model files
-
-All from `onnx-community/chatterbox-multilingual-ONNX` (MIT), pinned to
-revision `452d3f434aa592098f1eedac9099f33642ab2da5` — the tokenizer and the
-graphs have drifted against each other before, so the revision is not
-optional.
-
-```bash
-REV=452d3f434aa592098f1eedac9099f33642ab2da5
-BASE=https://huggingface.co/onnx-community/chatterbox-multilingual-ONNX/resolve/$REV
-mkdir -p ~/.cache/voice-me/onnx
-curl -L -o ~/.cache/voice-me/tokenizer.json "$BASE/tokenizer.json"
-for f in speech_encoder.onnx speech_encoder.onnx_data \
-         embed_tokens.onnx embed_tokens.onnx_data \
-         conditional_decoder.onnx conditional_decoder.onnx_data \
-         language_model_q4.onnx language_model_q4.onnx_data; do
-  curl -L -o ~/.cache/voice-me/onnx/$f "$BASE/onnx/$f"
-done
-```
-
-Each `.onnx_data` holds its graph's weights and records its own location as a
-**bare relative filename**, so it must sit next to its `.onnx`. The cache
-directory defaults to `$XDG_CACHE_HOME/voice-me`; `VOICE_ME_MODEL_CACHE`
-overrides it.
-
-### 3. Run the spike
+### Run the spike
 
 ```bash
 cargo run --release -p voice-me-tts --example tts-spike -- tr "Merhaba, bugün nasılsın?"

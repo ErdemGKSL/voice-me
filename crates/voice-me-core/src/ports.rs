@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::AppEventSender;
 use crate::audio::AudioBuffer;
 use crate::error::VoiceMeError;
-use crate::state::{AppState, SpeechBackend};
+use crate::state::{AppState, DependencyKind, SpeechBackend};
 
 /// Driving adapter port: captures the configured global hotkey per OS.
 pub trait HotkeyPort {
@@ -178,6 +178,34 @@ pub trait DependencyProvisioningPort: Send + Sync {
     /// from a check that ran and found something missing — the latter is a
     /// perfectly successful call carrying a report full of `missing` rows.
     fn check(&self, backend: SpeechBackend, events: AppEventSender) -> Result<(), VoiceMeError>;
+
+    /// Fetch or install whatever `backend` still lacks for the `kind` row
+    /// (Story 3.2), blocking until it is done.
+    ///
+    /// Blocking and sync like [`Self::check`]: the caller dispatches it
+    /// through [`crate::tokio_bridge::spawn_blocking`] (AD-5), and an
+    /// adapter that needs async I/O drives it on the Tokio runtime it finds
+    /// itself on. It must never run on GPUI's main thread — a model
+    /// download is minutes long.
+    ///
+    /// Reports on `events` only: [`crate::AppEvent::ProvisioningProgress`]
+    /// while bytes arrive, and exactly one
+    /// [`crate::AppEvent::ProvisioningFinished`] at the end whatever the
+    /// outcome. The returned `Result` mirrors that event and exists for the
+    /// caller that has to tell "the adapter reported" from "the adapter
+    /// never ran" (a panicked job sends nothing). It does not re-run the
+    /// check; the composition root does that on `ProvisioningFinished`.
+    ///
+    /// Relative to `backend` exactly as [`Self::check`] is: it fetches the
+    /// selected backend's assets and nothing else. A second call for a
+    /// `kind` already being provisioned returns at once, sending nothing,
+    /// so the run already in flight stays the only one reporting.
+    fn provision(
+        &self,
+        kind: DependencyKind,
+        backend: SpeechBackend,
+        events: AppEventSender,
+    ) -> Result<(), VoiceMeError>;
 }
 
 /// Port for reading/writing persisted settings (implemented inside

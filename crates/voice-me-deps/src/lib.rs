@@ -1,40 +1,175 @@
 //! `voice-me-deps` — the `DependencyProvisioningPort` adapter.
 //!
-//! Story 3.1's half only: **detection**, never provisioning. This crate
-//! reads the filesystem and the environment, builds one
-//! [`DependencyReport`] for the selected backend, sends it on the shared
-//! `AppEvent` channel (AD-3) and holds nothing afterwards. Story 3.2 adds
-//! the downloading half; until then there is no HTTP client here and no
-//! network access of any kind.
+//! Two halves. **Detection** (Story 3.1) reads the filesystem and the
+//! environment, builds one [`DependencyReport`] for the selected backend,
+//! sends it on the shared `AppEvent` channel (AD-3) and holds nothing
+//! afterwards. **Provisioning** (Story 3.2) fetches what a row lacks into
+//! the deps-owned cache: resumable, checked against pinned SHA-256s, and
+//! reported on the same channel. This is the only crate in the workspace
+//! that opens a network connection (AD-8), and it does so with plain HTTPS
+//! GETs — no Hugging Face Hub client.
 //!
 //! Two rules shape everything below:
 //!
-//! * **Backend-relative.** The row list is derived from the selected
-//!   [`SpeechBackend`], never from a fixed list — a CPU selection reports
-//!   no GPU provider library and no FP16 weights, and FP16 files sitting in
-//!   the cache do not satisfy a Q4 selection.
+//! * **Backend-relative.** The row list — and the download plan — is
+//!   derived from the selected [`SpeechBackend`], never from a fixed list:
+//!   a CPU selection reports and fetches no GPU provider library and no
+//!   FP16 weights, and FP16 files sitting in the cache do not satisfy a Q4
+//!   selection.
 //! * **One list.** The model filenames come from `voice-me-core::assets`,
-//!   the same module `voice-me-tts`'s `ModelCache` reads, so the check and
-//!   the engine cannot disagree about what "provisioned" means. `deps`
-//!   never depends on `tts`.
+//!   the same module `voice-me-tts`'s `ModelCache` reads, so the check, the
+//!   provisioner and the engine cannot disagree about what "provisioned"
+//!   means. `deps` never depends on `tts`.
 
+pub mod provision;
+#[cfg(test)]
+mod provision_tests;
+pub mod sources;
+#[cfg(test)]
+mod test_support;
+
+use std::collections::HashSet;
+use std::future::Future;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use voice_me_core::{
     AppEvent, AppEventSender, Dependency, DependencyKind, DependencyProvisioningPort,
-    DependencyReport, SpeechBackend, SpeechWeights, VoiceMeError, assets,
+    DependencyReport, SpeechBackend, SpeechExecutionTarget, SpeechWeights, VoiceMeError, assets,
 };
+
+use crate::provision::ProgressReporter;
+use crate::sources::{PlannedDownload, Sources};
 
 /// `DependencyProvisioningPort` adapter.
 ///
-/// Stateless: every call re-reads the world, because the whole point of
-/// "Check again" is that the answer changed since last time.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct DepsAdapter;
+/// Detection is stateless: every check re-reads the world, because the
+/// whole point of "Check again" is that the answer changed since last time.
+/// The only thing held is which rows are being provisioned right now, so a
+/// second Install on the same row cannot start a second writer on the same
+/// `.part` file. Clones share that set.
+#[derive(Clone)]
+pub struct DepsAdapter {
+    sources: Arc<Sources>,
+    in_flight: Arc<Mutex<HashSet<DependencyKind>>>,
+    /// What Install on the Virtual Microphone row runs. The audio crate's
+    /// own `install()` in the app; injectable so the row's provisioning
+    /// path is testable without an audio server.
+    virtual_mic_installer: Arc<VirtualMicInstaller>,
+}
+
+type VirtualMicInstaller = dyn Fn() -> Result<(), VoiceMeError> + Send + Sync;
+
+impl std::fmt::Debug for DepsAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DepsAdapter")
+            .field("sources", &self.sources)
+            .field("in_flight", &self.in_flight)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for DepsAdapter {
+    fn default() -> Self {
+        Self::with_sources(Sources::default())
+    }
+}
 
 impl DepsAdapter {
+    /// The adapter over the real, pinned sources.
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// The adapter over an injected source table — how the tests point
+    /// every download at an in-process server.
+    pub fn with_sources(sources: Sources) -> Self {
+        Self {
+            sources: Arc::new(sources),
+            in_flight: Arc::default(),
+            virtual_mic_installer: Arc::new(install_virtual_microphone),
+        }
+    }
+
+    /// Replace what Install on the Virtual Microphone row runs.
+    pub fn with_virtual_mic_installer(
+        mut self,
+        installer: impl Fn() -> Result<(), VoiceMeError> + Send + Sync + 'static,
+    ) -> Self {
+        self.virtual_mic_installer = Arc::new(installer);
+        self
+    }
+
+    fn provision_row(
+        &self,
+        kind: DependencyKind,
+        backend: SpeechBackend,
+        events: &AppEventSender,
+    ) -> Result<(), VoiceMeError> {
+        match kind {
+            DependencyKind::ModelWeights => {
+                let root = assets::model_cache_root()?;
+                let plan = self.sources.model_plan(&root, backend.weights)?;
+                fetch(kind, &plan, events)
+            }
+            DependencyKind::OnnxRuntime => self.provision_runtime(backend, events),
+            DependencyKind::VirtualMicrophone => {
+                // No bytes to count; the row says "installing" with no
+                // figure until it finishes.
+                let _ = events.unbounded_send(AppEvent::ProvisioningProgress {
+                    kind,
+                    done_bytes: 0,
+                    total_bytes: 0,
+                });
+                (self.virtual_mic_installer)()
+            }
+        }
+    }
+
+    /// Decision 1: the runtime installs automatically on Linux x64 only,
+    /// and only into the cache — never over a path `ORT_DYLIB_PATH` names.
+    fn provision_runtime(
+        &self,
+        backend: SpeechBackend,
+        events: &AppEventSender,
+    ) -> Result<(), VoiceMeError> {
+        let root = assets::model_cache_root()?;
+        if backend.target != SpeechExecutionTarget::Cpu {
+            return Err(VoiceMeError::Other(gpu_runtime_unavailable(backend)));
+        }
+        let resolved = assets::resolve_runtime_dylib(&root);
+        if resolved.configured {
+            return Err(VoiceMeError::Other(format!(
+                "{} is set to {}; voice-me does not replace a runtime you configured. Unset it to \
+                 let Install place one in the cache.",
+                assets::RUNTIME_DYLIB_ENV,
+                resolved.path.display()
+            )));
+        }
+        if resolved.path.exists() {
+            return Ok(());
+        }
+        let Some(runtime) = self.sources.runtime.as_ref() else {
+            return Err(VoiceMeError::Other(
+                "voice-me cannot install ONNX Runtime on this system; follow the steps on the row."
+                    .to_string(),
+            ));
+        };
+
+        // A verified archive left by a run whose extraction failed is not
+        // fetched again.
+        let archive = runtime.archive.destination(&root);
+        if !archive.exists() {
+            let plan = [PlannedDownload {
+                asset: runtime.archive.clone(),
+                destination: archive.clone(),
+            }];
+            fetch(DependencyKind::OnnxRuntime, &plan, events)?;
+        }
+        provision::extract_runtime_library(&archive, &runtime.library_entry, &resolved.path)?;
+        // Our own download, of no further use once the library is out of it.
+        let _ = std::fs::remove_file(&archive);
+        Ok(())
     }
 }
 
@@ -47,7 +182,7 @@ impl DependencyProvisioningPort for DepsAdapter {
 
         let report = DependencyReport::new(
             backend,
-            speech_engine_rows(&root, backend.weights)
+            speech_engine_rows(&root, backend, &self.sources)
                 .into_iter()
                 .chain(virtual_microphone_row())
                 .collect(),
@@ -59,6 +194,98 @@ impl DependencyProvisioningPort for DepsAdapter {
         let _ = events.unbounded_send(AppEvent::DependencyCheckCompleted { report });
         Ok(())
     }
+
+    fn provision(
+        &self,
+        kind: DependencyKind,
+        backend: SpeechBackend,
+        events: AppEventSender,
+    ) -> Result<(), VoiceMeError> {
+        // A second Install on a row already being installed: the first run
+        // stays the only one reporting, and nothing is sent for this one.
+        let Some(claim) = InFlight::claim(&self.in_flight, kind) else {
+            return Ok(());
+        };
+
+        let result = self.provision_row(kind, backend, &events);
+        // Released before the event goes out: once the row reads "missing"
+        // again, the next Install must not be swallowed as a duplicate.
+        drop(claim);
+        let _ = events.unbounded_send(AppEvent::ProvisioningFinished {
+            kind,
+            result: result.as_ref().map(|_| ()).map_err(ToString::to_string),
+        });
+        result
+    }
+}
+
+/// Removes its row from the in-flight set when dropped — including when the
+/// provisioning job panics, so a crashed run never leaves Install dead.
+struct InFlight {
+    set: Arc<Mutex<HashSet<DependencyKind>>>,
+    kind: DependencyKind,
+}
+
+impl InFlight {
+    fn claim(set: &Arc<Mutex<HashSet<DependencyKind>>>, kind: DependencyKind) -> Option<Self> {
+        let mut rows = set.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        rows.insert(kind).then(|| Self {
+            set: set.clone(),
+            kind,
+        })
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.set
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.kind);
+    }
+}
+
+/// Download every file in `plan`, one after another, reporting progress
+/// for `kind`.
+fn fetch(
+    kind: DependencyKind,
+    plan: &[PlannedDownload],
+    events: &AppEventSender,
+) -> Result<(), VoiceMeError> {
+    // Nothing to fetch, nothing to report: the reporter's constructor
+    // would otherwise send a meaningless 0-of-0 figure.
+    if plan.is_empty() {
+        return Ok(());
+    }
+    let mut progress = ProgressReporter::for_plan(kind, events.clone(), plan);
+    block_on(async {
+        let client = provision::client()?;
+        for planned in plan {
+            provision::download(&client, planned, &mut progress).await?;
+        }
+        progress.finish();
+        Ok(())
+    })
+}
+
+/// Drive `future` to completion from this blocking thread.
+///
+/// In the app this runs on Tokio's blocking pool (the AD-5 bridge), so the
+/// multi-threaded runtime it belongs to is reused — no second runtime.
+/// Anywhere else (tests, or a current-thread runtime whose I/O driver only
+/// its own `block_on` can turn) a small runtime is built for the one call.
+fn block_on<T>(future: impl Future<Output = Result<T, VoiceMeError>>) -> Result<T, VoiceMeError> {
+    use tokio::runtime::{Builder, Handle, RuntimeFlavor};
+
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            handle.block_on(future)
+        }
+        _ => Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(future),
+    }
 }
 
 /// The rows a missing one of which blocks the Prompt Overlay (Decision 3):
@@ -67,20 +294,29 @@ impl DependencyProvisioningPort for DepsAdapter {
 ///
 /// Pure apart from `ORT_DYLIB_PATH` and `Path::exists`, and takes the cache
 /// root rather than resolving it, so the whole I/O matrix can be driven
-/// against temporary directories.
-pub fn speech_engine_rows(root: &Path, weights: SpeechWeights) -> Vec<Dependency> {
-    vec![runtime_row(root), model_weights_row(root, weights)]
+/// against temporary directories. `sources` decides only whether the
+/// runtime row can offer Install on this target.
+pub fn speech_engine_rows(
+    root: &Path,
+    backend: SpeechBackend,
+    sources: &Sources,
+) -> Vec<Dependency> {
+    vec![
+        runtime_row(root, backend, sources.runtime.is_some()),
+        model_weights_row(root, backend.weights),
+    ]
 }
 
 /// The ONNX Runtime row, reporting on exactly the rule the engine will
 /// apply when it loads the library: `ORT_DYLIB_PATH` if set, otherwise the
 /// cache root's own copy.
 ///
-/// The two missing cases are deliberately different sentences. "You
-/// configured a path and it is not there" is a stale setting the user has
-/// to fix themselves; "nothing is configured and nothing is in the cache"
-/// is a provisioning gap Story 3.2 will be able to fill with one click.
-fn runtime_row(root: &Path) -> Dependency {
+/// The missing cases are deliberately different sentences. "You configured
+/// a path and it is not there" is a stale setting the user has to fix
+/// themselves; "nothing is configured and nothing is in the cache" is a
+/// provisioning gap Install fills — where a runtime for this target and
+/// backend exists to be installed at all.
+fn runtime_row(root: &Path, backend: SpeechBackend, installable: bool) -> Dependency {
     let resolved = assets::resolve_runtime_dylib(root);
     let path = resolved.path.display();
 
@@ -96,7 +332,7 @@ fn runtime_row(root: &Path) -> Dependency {
     }
 
     if resolved.configured {
-        Dependency::missing(
+        return Dependency::missing(
             DependencyKind::OnnxRuntime,
             RUNTIME_LABEL,
             format!(
@@ -107,17 +343,63 @@ fn runtime_row(root: &Path) -> Dependency {
         )
         // Nothing can be downloaded to satisfy a path the user chose: the
         // fix is to correct or clear the variable.
-        .manual()
-    } else {
-        Dependency::missing(
-            DependencyKind::OnnxRuntime,
-            RUNTIME_LABEL,
+        .manual([
             format!(
-                "Not found at {path}. {} is unset, so that is where voice-me looks.",
+                "Find where {} is set — your shell profile, or the launcher that starts voice-me.",
                 assets::RUNTIME_DYLIB_ENV
             ),
-        )
+            format!(
+                "Point it at an ONNX Runtime library that exists, or remove it so voice-me can \
+                 install one into {}.",
+                assets::bundled_runtime_dylib(root).display()
+            ),
+            "Start voice-me again so it reads the change.".to_string(),
+        ]);
     }
+
+    // Decision 3: a GPU backend's runtime has no source until Story 3.8.
+    if backend.target != SpeechExecutionTarget::Cpu {
+        return Dependency::missing(
+            DependencyKind::OnnxRuntime,
+            RUNTIME_LABEL,
+            format!("Not found at {path}. {}", gpu_runtime_unavailable(backend)),
+        )
+        .manual([
+            "The GPU build of ONNX Runtime ships with a later voice-me release.",
+            "Until then, the CPU backend works on this machine and voice-me installs its runtime \
+             for you.",
+        ]);
+    }
+
+    let detail = format!(
+        "Not found at {path}. {} is unset, so that is where voice-me looks.",
+        assets::RUNTIME_DYLIB_ENV
+    );
+    if installable {
+        Dependency::missing(DependencyKind::OnnxRuntime, RUNTIME_LABEL, detail)
+    } else {
+        // Decision 1: only Linux x64 has an automatic runtime install.
+        Dependency::missing(DependencyKind::OnnxRuntime, RUNTIME_LABEL, detail).manual([
+            format!(
+                "Download ONNX Runtime {} for this system from Microsoft's onnxruntime releases.",
+                sources::RUNTIME_VERSION
+            ),
+            format!(
+                "Copy its {} into {}.",
+                assets::runtime_dylib_file_name(),
+                path
+            ),
+            "Press Check again.".to_string(),
+        ])
+    }
+}
+
+fn gpu_runtime_unavailable(backend: SpeechBackend) -> String {
+    let target = match backend.target {
+        SpeechExecutionTarget::Cpu => "CPU",
+        SpeechExecutionTarget::WebGpu => "WebGPU",
+    };
+    format!("The {target} backend's runtime is not yet available to install.")
 }
 
 /// The model-files row for the *selected* weight variant.
@@ -192,6 +474,8 @@ fn virtual_microphone_row() -> Option<Dependency> {
                 voice_me_audio_linux::DEVICE_DESCRIPTION
             ),
         ),
+        // The audio server answered and the device is not there: Install
+        // loads it again, no network involved.
         Ok(false) => Dependency::missing(
             DependencyKind::VirtualMicrophone,
             VIRTUAL_MIC_LABEL,
@@ -206,7 +490,11 @@ fn virtual_microphone_row() -> Option<Dependency> {
             VIRTUAL_MIC_LABEL,
             format!("Could not ask the audio server: {error}"),
         )
-        .manual(),
+        .manual([
+            "Make sure PipeWire (with pipewire-pulse) or PulseAudio is running in your session.",
+            "Log out and back in if it was just installed or restarted.",
+            "Press Check again — Install appears here once the audio server answers.",
+        ]),
     };
     Some(row)
 }
@@ -214,6 +502,25 @@ fn virtual_microphone_row() -> Option<Dependency> {
 #[cfg(not(target_os = "linux"))]
 fn virtual_microphone_row() -> Option<Dependency> {
     None
+}
+
+/// Install reuses the audio crate's own idempotent `install()`: it ends
+/// with exactly one device, whatever it started with.
+#[cfg(target_os = "linux")]
+fn install_virtual_microphone() -> Result<(), VoiceMeError> {
+    voice_me_audio_linux::LinuxVirtualMicAdapter::new()
+        .and_then(|adapter| adapter.install())
+        .map(|_| ())
+        .map_err(|error| {
+            VoiceMeError::Other(format!("Could not install the Virtual Microphone: {error}"))
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_virtual_microphone() -> Result<(), VoiceMeError> {
+    Err(VoiceMeError::Other(
+        "voice-me cannot install a Virtual Microphone on this system yet.".to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -227,65 +534,10 @@ mod tests {
     //! test in this process sees.
 
     use std::path::Path;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
     use voice_me_core::DependencyStatus;
 
     use super::*;
-
-    /// Holds the lock and restores every variable it touched.
-    ///
-    /// One type rather than one per variable because `std::sync::Mutex` is
-    /// not reentrant: a test that wanted both `ORT_DYLIB_PATH` and
-    /// `VOICE_ME_MODEL_CACHE` would deadlock against itself.
-    struct EnvGuard {
-        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
-        _guard: MutexGuard<'static, ()>,
-    }
-
-    impl EnvGuard {
-        fn new() -> Self {
-            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            let guard = LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Self {
-                previous: Vec::new(),
-                _guard: guard,
-            }
-        }
-
-        fn remember(&mut self, key: &'static str) {
-            if !self.previous.iter().any(|(seen, _)| *seen == key) {
-                self.previous.push((key, std::env::var_os(key)));
-            }
-        }
-
-        fn set(mut self, key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            self.remember(key);
-            // Every test that touches the environment holds this same lock,
-            // and `Drop` puts back what was there.
-            unsafe { std::env::set_var(key, value) };
-            self
-        }
-
-        fn unset(mut self, key: &'static str) -> Self {
-            self.remember(key);
-            unsafe { std::env::remove_var(key) };
-            self
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in self.previous.drain(..) {
-                match value {
-                    Some(value) => unsafe { std::env::set_var(key, value) },
-                    None => unsafe { std::env::remove_var(key) },
-                }
-            }
-        }
-    }
+    use crate::test_support::EnvGuard;
 
     /// The common starting point: no configured runtime path, so the check
     /// falls back to the cache root's own copy.
@@ -320,7 +572,7 @@ mod tests {
         let _env = no_configured_runtime();
         let dir = provisioned(SpeechWeights::Q4);
 
-        let rows = speech_engine_rows(dir.path(), SpeechWeights::Q4);
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, &Sources::pinned());
 
         assert!(
             rows.iter().all(|row| row.status == DependencyStatus::Ready),
@@ -338,7 +590,7 @@ mod tests {
         );
         std::fs::remove_file(&weights).unwrap();
 
-        let rows = speech_engine_rows(dir.path(), SpeechWeights::Q4);
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, &Sources::pinned());
         let model = row(&rows, DependencyKind::ModelWeights);
 
         assert_eq!(model.status, DependencyStatus::Missing);
@@ -360,7 +612,7 @@ mod tests {
             assets::graph_file(dir.path(), "speech_encoder.onnx").with_extension("onnx_data");
         std::fs::remove_file(&data).unwrap();
 
-        let rows = speech_engine_rows(dir.path(), SpeechWeights::Q4);
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, &Sources::pinned());
 
         assert_eq!(
             row(&rows, DependencyKind::ModelWeights).status,
@@ -374,7 +626,7 @@ mod tests {
         let dir = provisioned(SpeechWeights::Q4);
         std::fs::remove_file(assets::tokenizer_file(dir.path())).unwrap();
 
-        let rows = speech_engine_rows(dir.path(), SpeechWeights::Q4);
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, &Sources::pinned());
 
         assert_eq!(
             row(&rows, DependencyKind::ModelWeights).status,
@@ -388,7 +640,7 @@ mod tests {
         let dir = provisioned(SpeechWeights::Q4);
         std::fs::remove_file(assets::bundled_runtime_dylib(dir.path())).unwrap();
 
-        let rows = speech_engine_rows(dir.path(), SpeechWeights::Q4);
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, &Sources::pinned());
         let runtime = row(&rows, DependencyKind::OnnxRuntime);
 
         assert_eq!(runtime.status, DependencyStatus::Missing);
@@ -414,7 +666,7 @@ mod tests {
         let stale = dir.path().join("moved-away").join("libonnxruntime.so");
         let _env = EnvGuard::new().set(assets::RUNTIME_DYLIB_ENV, &stale);
 
-        let rows = speech_engine_rows(dir.path(), SpeechWeights::Q4);
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, &Sources::pinned());
         let runtime = row(&rows, DependencyKind::OnnxRuntime);
 
         assert_eq!(runtime.status, DependencyStatus::Missing);
@@ -427,6 +679,62 @@ mod tests {
             !runtime.automatable,
             "nothing can be downloaded to satisfy a path the user chose"
         );
+        assert!(
+            (2..=4).contains(&runtime.manual_steps.len()),
+            "a manual row carries two to four short steps instead: {:?}",
+            runtime.manual_steps
+        );
+    }
+
+    /// Decision 3: a GPU backend's runtime has no source until Story 3.8,
+    /// so its row is manual and says so rather than offering an Install
+    /// that would fetch the CPU runtime.
+    #[test]
+    fn a_gpu_backends_missing_runtime_is_manual() {
+        let _env = no_configured_runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let backend = SpeechBackend {
+            target: SpeechExecutionTarget::WebGpu,
+            device: None,
+            weights: SpeechWeights::Fp16,
+        };
+
+        let rows = speech_engine_rows(dir.path(), backend, &Sources::pinned());
+        let runtime = row(&rows, DependencyKind::OnnxRuntime);
+
+        assert!(!runtime.automatable);
+        assert!(
+            runtime.detail.contains("not yet available"),
+            "{}",
+            runtime.detail
+        );
+        assert!(!runtime.manual_steps.is_empty());
+    }
+
+    /// Decision 1: the runtime row offers Install only where a runtime
+    /// source exists for this target.
+    #[test]
+    fn a_runtime_with_no_source_for_this_target_is_manual() {
+        let _env = no_configured_runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let no_runtime = Sources {
+            runtime: None,
+            ..Sources::pinned()
+        };
+
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, &no_runtime);
+        let runtime = row(&rows, DependencyKind::OnnxRuntime);
+
+        assert!(!runtime.automatable);
+        assert!((2..=4).contains(&runtime.manual_steps.len()));
+        assert!(
+            !runtime
+                .manual_steps
+                .iter()
+                .any(|step| step.contains("http")),
+            "no external link: {:?}",
+            runtime.manual_steps
+        );
     }
 
     #[test]
@@ -436,7 +744,7 @@ mod tests {
         touch(&elsewhere);
         let _env = EnvGuard::new().set(assets::RUNTIME_DYLIB_ENV, &elsewhere);
 
-        let rows = speech_engine_rows(dir.path(), SpeechWeights::Q4);
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, &Sources::pinned());
 
         assert_eq!(
             row(&rows, DependencyKind::OnnxRuntime).status,
@@ -451,7 +759,7 @@ mod tests {
         let _env = no_configured_runtime();
         let dir = provisioned(SpeechWeights::Fp16);
 
-        let rows = speech_engine_rows(dir.path(), SpeechWeights::Q4);
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, &Sources::pinned());
         let model = row(&rows, DependencyKind::ModelWeights);
 
         assert_eq!(model.status, DependencyStatus::Missing);

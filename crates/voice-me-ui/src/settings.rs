@@ -6,6 +6,7 @@
 //! rather than as a later rewrite — this view owns nothing but which tab is
 //! showing; each section keeps its own state in its own entity.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui_kit::component::{
@@ -19,11 +20,11 @@ use gpui_kit::{
     div,
 };
 use voice_me_core::{
-    AppEventSender, DependencyOutcome, DependencyProvisioningPort, HotkeyPort, SettingsStore,
-    SpeechBackend,
+    AppEventSender, DependencyKind, DependencyOutcome, DependencyProvisioningPort, HotkeyPort,
+    SettingsStore, SpeechBackend,
 };
 
-use crate::dependencies::DependenciesView;
+use crate::dependencies::{DependenciesView, RowProvisioning};
 use crate::hotkey::HotkeyView;
 use crate::voice_setup::VoiceSetupView;
 
@@ -41,6 +42,10 @@ pub struct DependenciesTab {
     pub events: AppEventSender,
     pub speech_backend: SpeechBackend,
     pub outcome: DependencyOutcome,
+    /// Installs already running or already failed when the window opens
+    /// (Story 3.2), so a reopened window never offers a second Install on
+    /// a row that is still downloading.
+    pub provisioning: HashMap<DependencyKind, RowProvisioning>,
 }
 
 /// The tabbed Settings window.
@@ -94,6 +99,7 @@ impl SettingsView {
                 dependencies.speech_backend,
                 dependencies.outcome,
             )
+            .with_provisioning(dependencies.provisioning)
         });
 
         Self {
@@ -111,6 +117,27 @@ impl SettingsView {
     pub fn show_dependencies(&mut self, cx: &mut Context<Self>) {
         self.active_tab = DEPENDENCIES_TAB;
         cx.notify();
+    }
+
+    /// Push one row's install state into the Dependencies tab.
+    pub fn set_provisioning(
+        &mut self,
+        kind: DependencyKind,
+        state: Option<RowProvisioning>,
+        cx: &mut Context<Self>,
+    ) {
+        self.dependencies
+            .update(cx, |view, cx| view.set_provisioning(kind, state, cx));
+    }
+
+    /// Replace every row's install state in the Dependencies tab.
+    pub fn replace_provisioning(
+        &mut self,
+        provisioning: HashMap<DependencyKind, RowProvisioning>,
+        cx: &mut Context<Self>,
+    ) {
+        self.dependencies
+            .update(cx, |view, cx| view.replace_provisioning(provisioning, cx));
     }
 
     /// Push a fresh Dependency Check outcome into the Dependencies tab.
@@ -196,6 +223,15 @@ mod tests {
         ) -> Result<(), VoiceMeError> {
             Ok(())
         }
+
+        fn provision(
+            &self,
+            _kind: DependencyKind,
+            _backend: SpeechBackend,
+            _events: AppEventSender,
+        ) -> Result<(), VoiceMeError> {
+            Ok(())
+        }
     }
 
     struct StubHotkeyPort;
@@ -234,6 +270,7 @@ mod tests {
                         events: event_tx.clone(),
                         speech_backend: SpeechBackend::CPU,
                         outcome: DependencyOutcome::Pending,
+                        provisioning: HashMap::new(),
                     },
                     window,
                     cx,
@@ -301,6 +338,7 @@ mod tests {
                         events: event_tx.clone(),
                         speech_backend: SpeechBackend::CPU,
                         outcome: DependencyOutcome::Pending,
+                        provisioning: HashMap::new(),
                     },
                     window,
                     cx,

@@ -7,7 +7,7 @@ mod prompt_overlay;
 mod settings;
 mod voice_setup;
 
-pub use dependencies::{DependenciesView, backend_summary, blocker_notice};
+pub use dependencies::{DependenciesView, RowProvisioning, backend_summary, blocker_notice};
 pub use hotkey::{CaptureOutcome, HotkeyView, capture_keystroke, display_hotkey};
 pub use prompt_overlay::PromptOverlayView;
 pub use settings::{DependenciesTab, SettingsView};

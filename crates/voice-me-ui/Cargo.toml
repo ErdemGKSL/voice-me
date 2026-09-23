@@ -15,3 +15,6 @@ gpui-kit = { version = "0.6.4", features = ["test-support"] }
 # The `AppEvent` channel the Prompt Overlay tests drain (AD-3).
 futures = "0.3"
 tempfile = "3.14"
+# A real AD-5 runtime for the Install test, installed as the GPUI global
+# the way the composition root installs it.
+tokio = { version = "1.53", default-features = false, features = ["rt", "rt-multi-thread"] }
