@@ -143,3 +143,6 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-3-10-give-backends-their-own-settings-tab.md`
   summary: The tts-remote no-key error still says "add one under Settings → Dependencies"; since Story 3.10 it should say Settings → Backend.
   evidence: `crates/voice-me-tts-remote/src/lib.rs:235`; the capability row (`voice-me-deps/src/capability.rs:312`) already says Settings → Backend, so the two surfaces now disagree. It is reached only if the key vanishes between the Dependency Check and the Speak Action. Spec-3-10's frozen Never excluded `voice-me-tts-remote`; the test at `voice-me-tts-remote/src/tests.rs:503` checks only "no API key".
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-11-choose-the-speech-language-per-backend.md`
+  summary: The composition root's `backend_actions` dispatch (including 3.11's `SetSpeechLanguage` arm) lives inline in `fn main` and no test drives it.
+  evidence: The verification-gap review of 3.11 showed that dropping the arm's error removal or its `push_panel` would pass CI. Every other `BackendAction` arm has the same gap. Fixing it means pulling the dispatch into a testable function.

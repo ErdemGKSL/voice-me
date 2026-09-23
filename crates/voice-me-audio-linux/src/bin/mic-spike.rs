@@ -123,7 +123,6 @@ fn main() {
         let state = AppState {
             // The stub never opens it; `speak` only checks that one is set.
             reference_voice_sample: Some(PathBuf::from("/nonexistent/reference.wav")),
-            speech_language: "tr".to_string(),
             ..AppState::default()
         };
         match voice_me_core::speak("Merhaba", &state, &StubTts, &adapter, &StderrNotifier) {

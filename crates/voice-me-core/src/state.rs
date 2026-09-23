@@ -9,9 +9,8 @@ pub const DEFAULT_UI_LANGUAGE: &str = "en";
 /// yet (spec-2-6 Decision 2).
 ///
 /// Turkish, not the UI default of English: this is the language the user
-/// actually speaks into their voice chats. FR5 wants a *selected* language
-/// rather than a constant, and Epic 4 builds the Settings → Voice selector
-/// that sets it; until then the settings file is the only way to change it.
+/// actually speaks into their voice chats. Story 3.11 gives every backend
+/// with a speech language its own saved value, and each of them starts here.
 pub const DEFAULT_SPEECH_LANGUAGE: &str = "tr";
 
 /// Which execution provider the speech engine is placed on (AD-9).
@@ -151,6 +150,129 @@ impl RemoteProvider {
     }
 }
 
+/// Which *kind* of backend a speech language belongs to (Story 3.11).
+///
+/// Every local Chatterbox selection — the bundled CPU runtime and each added
+/// runtime's CPU/CUDA/WebGPU entry — is the same model, so they share one
+/// [`LanguageBackend::Local`] language. Each remote provider has its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LanguageBackend {
+    Local,
+    Remote(RemoteProvider),
+}
+
+impl LanguageBackend {
+    /// How the backend is named in a refusal: "local Chatterbox",
+    /// "DeepInfra".
+    pub fn label(self) -> &'static str {
+        match self {
+            LanguageBackend::Local => "local Chatterbox",
+            LanguageBackend::Remote(provider) => provider.label(),
+        }
+    }
+
+    /// The speech languages this backend generates in, in the order the UI
+    /// lists them. Empty for a backend whose set is not decided yet
+    /// (fal.ai, Story 3.7).
+    pub fn speech_languages(self) -> &'static [SpeechLanguage] {
+        match self {
+            LanguageBackend::Local => LOCAL_SPEECH_LANGUAGES,
+            LanguageBackend::Remote(RemoteProvider::DeepInfra) => DEEPINFRA_SPEECH_LANGUAGES,
+            LanguageBackend::Remote(RemoteProvider::FalAi) => &[],
+        }
+    }
+
+    /// Whether this backend has a speech language at all.
+    pub fn has_speech_language(self) -> bool {
+        !self.speech_languages().is_empty()
+    }
+
+    /// The entry a saved value names, if this backend speaks it. The value
+    /// is trimmed and lowercased first, so a hand-edited `"  EN \n"` still
+    /// names English; anything else outside the set is `None`, never a
+    /// default.
+    pub fn speech_language(self, saved: &str) -> Option<&'static SpeechLanguage> {
+        let code = saved.trim().to_lowercase();
+        self.speech_languages()
+            .iter()
+            .find(|language| language.code == code)
+    }
+}
+
+/// One speech language a backend generates in: the tag the model gets and
+/// the English name the UI shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SpeechLanguage {
+    pub code: &'static str,
+    pub label: &'static str,
+}
+
+const fn language(code: &'static str, label: &'static str) -> SpeechLanguage {
+    SpeechLanguage { code, label }
+}
+
+/// Local Chatterbox (AD-12): the languages that need no Python-only text
+/// normalization. Turkish first — the default.
+const LOCAL_SPEECH_LANGUAGES: &[SpeechLanguage] =
+    &[language("tr", "Turkish"), language("en", "English")];
+
+/// DeepInfra's `ResembleAI/chatterbox-multilingual`: its 23 languages,
+/// alphabetical by name.
+const DEEPINFRA_SPEECH_LANGUAGES: &[SpeechLanguage] = &[
+    language("ar", "Arabic"),
+    language("zh", "Chinese"),
+    language("da", "Danish"),
+    language("nl", "Dutch"),
+    language("en", "English"),
+    language("fi", "Finnish"),
+    language("fr", "French"),
+    language("de", "German"),
+    language("el", "Greek"),
+    language("he", "Hebrew"),
+    language("hi", "Hindi"),
+    language("it", "Italian"),
+    language("ja", "Japanese"),
+    language("ko", "Korean"),
+    language("ms", "Malay"),
+    language("no", "Norwegian"),
+    language("pl", "Polish"),
+    language("pt", "Portuguese"),
+    language("ru", "Russian"),
+    language("es", "Spanish"),
+    language("sw", "Swahili"),
+    language("sv", "Swedish"),
+    language("tr", "Turkish"),
+];
+
+/// The saved speech language of each backend that has one (Story 3.11).
+/// Persisted. Values are stored as written — a hand-edited value outside the
+/// backend's set is kept, and refused by name at the next Speak Action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpeechLanguages {
+    pub local: String,
+    pub deepinfra: String,
+}
+
+impl Default for SpeechLanguages {
+    fn default() -> Self {
+        Self {
+            local: DEFAULT_SPEECH_LANGUAGE.to_string(),
+            deepinfra: DEFAULT_SPEECH_LANGUAGE.to_string(),
+        }
+    }
+}
+
+impl SpeechLanguages {
+    /// `backend`'s saved language, or `None` for a backend that has none.
+    pub fn get(&self, backend: LanguageBackend) -> Option<&str> {
+        match backend {
+            LanguageBackend::Local => Some(&self.local),
+            LanguageBackend::Remote(RemoteProvider::DeepInfra) => Some(&self.deepinfra),
+            LanguageBackend::Remote(RemoteProvider::FalAi) => None,
+        }
+    }
+}
+
 /// Which backend the user chose to generate speech with (Story 3.5).
 ///
 /// Persisted. It is a *wish*, not a fact: whether it can run here is the
@@ -202,6 +324,15 @@ impl BackendSelection {
                 ..
             } => Some(path),
             _ => None,
+        }
+    }
+
+    /// Which backend's speech language this selection uses (Story 3.11):
+    /// every local entry shares the Local one.
+    pub fn language_backend(&self) -> LanguageBackend {
+        match self {
+            BackendSelection::Local { .. } => LanguageBackend::Local,
+            BackendSelection::Remote(provider) => LanguageBackend::Remote(*provider),
         }
     }
 
@@ -622,11 +753,10 @@ pub struct AppState {
     pub hotkey: Option<String>,
     pub reference_voice_sample: Option<PathBuf>,
     pub ui_language: String,
-    /// The language generated speech is produced in (FR5). Persisted, but
-    /// not yet settable from the UI — spec-2-6 Decision 2 defers the
-    /// Settings → Voice selector to Epic 4, where the UI-language selector
-    /// is built.
-    pub speech_language: String,
+    /// The language generated speech is produced in (FR5), per backend
+    /// (Story 3.11). Persisted, and set from Settings → Backend. Read on
+    /// every Speak Action through [`Self::speech_language`].
+    pub speech_languages: SpeechLanguages,
     pub selected_mic_device: Option<String>,
     /// The AD-9 resolved speech backend. Not persisted: the composition
     /// root derives it from [`Self::backend_selection`] on every read.
@@ -666,7 +796,7 @@ impl Default for AppState {
             hotkey: None,
             reference_voice_sample: None,
             ui_language: DEFAULT_UI_LANGUAGE.to_string(),
-            speech_language: DEFAULT_SPEECH_LANGUAGE.to_string(),
+            speech_languages: SpeechLanguages::default(),
             selected_mic_device: None,
             speech_backend: SpeechBackend::default(),
             backend_selection: BackendSelection::default(),
@@ -681,6 +811,13 @@ impl Default for AppState {
 }
 
 impl AppState {
+    /// The selected backend's saved speech language, as stored (not yet
+    /// normalised), or `None` when that backend has no speech language.
+    pub fn speech_language(&self) -> Option<&str> {
+        self.speech_languages
+            .get(self.backend_selection.language_backend())
+    }
+
     /// Whether `provider`'s disclosure has been confirmed.
     pub fn disclosure_confirmed(&self, provider: RemoteProvider) -> bool {
         self.confirmed_disclosures.contains(&provider)
@@ -808,6 +945,77 @@ mod tests {
             ActiveBackend::Failed("no driver".to_string()).summary(),
             "Active: none — no driver"
         );
+    }
+
+    #[test]
+    fn the_local_set_is_exactly_turkish_then_english() {
+        let codes: Vec<_> = LanguageBackend::Local
+            .speech_languages()
+            .iter()
+            .map(|language| language.code)
+            .collect();
+        assert_eq!(codes, vec!["tr", "en"]);
+        assert_eq!(
+            LanguageBackend::Local.speech_languages()[0].label,
+            "Turkish"
+        );
+    }
+
+    #[test]
+    fn deepinfra_has_23_unique_languages_alphabetical_by_name() {
+        let set = LanguageBackend::Remote(RemoteProvider::DeepInfra).speech_languages();
+        assert_eq!(set.len(), 23);
+        let codes: std::collections::HashSet<_> = set.iter().map(|l| l.code).collect();
+        assert_eq!(codes.len(), 23);
+        for code in
+            "ar da de el en es fi fr he hi it ja ko ms nl no pl pt ru sv sw tr zh".split(' ')
+        {
+            assert!(codes.contains(code), "{code}");
+        }
+        let labels: Vec<_> = set.iter().map(|l| l.label).collect();
+        let mut sorted = labels.clone();
+        sorted.sort();
+        assert_eq!(labels, sorted);
+    }
+
+    #[test]
+    fn fal_ai_has_no_speech_language() {
+        let fal = LanguageBackend::Remote(RemoteProvider::FalAi);
+        assert!(fal.speech_languages().is_empty());
+        assert!(!fal.has_speech_language());
+        assert_eq!(SpeechLanguages::default().get(fal), None);
+    }
+
+    #[test]
+    fn every_local_entry_shares_the_local_language() {
+        let runtime = LocalRuntime {
+            path: PathBuf::from("/opt/ort/libonnxruntime.so"),
+            targets: vec![SpeechExecutionTarget::Cuda, SpeechExecutionTarget::WebGpu],
+        };
+        let cpu_only = LocalRuntime {
+            path: PathBuf::from("/opt/cpu/libonnxruntime.so"),
+            targets: vec![SpeechExecutionTarget::Cpu],
+        };
+        for selection in backend_choices(&[runtime, cpu_only]) {
+            let expected = match &selection {
+                BackendSelection::Local { .. } => LanguageBackend::Local,
+                BackendSelection::Remote(provider) => LanguageBackend::Remote(*provider),
+            };
+            assert_eq!(selection.language_backend(), expected);
+        }
+
+        let state = AppState {
+            speech_languages: SpeechLanguages {
+                local: "en".to_string(),
+                deepinfra: "es".to_string(),
+            },
+            backend_selection: BackendSelection::Local {
+                runtime: Some(PathBuf::from("/opt/ort/libonnxruntime.so")),
+                target: SpeechExecutionTarget::Cuda,
+            },
+            ..AppState::default()
+        };
+        assert_eq!(state.speech_language(), Some("en"));
     }
 
     #[test]

@@ -15,8 +15,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::VoiceMeError;
 use crate::ports::SettingsStore;
 use crate::state::{
-    ActiveBackend, ApiKeys, AppState, BackendSelection, DependencyOutcome, LocalRuntime,
-    RemoteProvider, RemoteSample, SpeechBackend, SpeechExecutionTarget,
+    ActiveBackend, ApiKeys, AppState, BackendSelection, DEFAULT_SPEECH_LANGUAGE, DependencyOutcome,
+    LanguageBackend, LocalRuntime, RemoteProvider, RemoteSample, SpeechBackend,
+    SpeechExecutionTarget, SpeechLanguages,
 };
 
 const SETTINGS_FILE_NAME: &str = "settings.toml";
@@ -24,19 +25,6 @@ const REFERENCE_VOICE_SAMPLE_FILE_NAME: &str = "reference_voice_sample.wav";
 
 fn default_ui_language() -> String {
     crate::state::DEFAULT_UI_LANGUAGE.to_string()
-}
-
-/// The language generated speech is produced in, when the settings file
-/// does not say (spec-2-6 Decision 2).
-///
-/// Turkish, not the UI-language default of English: this is the language the
-/// user actually speaks into their voice chats, and FR5 wants a *selected*
-/// language rather than a constant. There is no Settings control for it yet
-/// — Epic 4 builds that alongside the UI-language selector — so until then
-/// the file is the only way to change it, and it round-trips through every
-/// other save.
-fn default_speech_language() -> String {
-    crate::state::DEFAULT_SPEECH_LANGUAGE.to_string()
 }
 
 /// The subset of `AppState` that is actually serialized to TOML. The active
@@ -48,8 +36,15 @@ struct SettingsFile {
     hotkey: Option<String>,
     #[serde(default = "default_ui_language")]
     ui_language: String,
-    #[serde(default = "default_speech_language")]
-    speech_language: String,
+    /// The single speech language written before Story 3.11. Read only: it
+    /// seeds whichever `[speech_languages]` entries the file lacks, and is
+    /// never written back.
+    #[serde(default, deserialize_with = "lenient", skip_serializing)]
+    speech_language: Option<String>,
+    /// Story 3.11: each backend's own speech language. Lenient per entry:
+    /// an unreadable one falls back to its default, not the whole file.
+    #[serde(default, deserialize_with = "lenient_languages")]
+    speech_languages: SpeechLanguagesFile,
     #[serde(default)]
     selected_mic_device: Option<String>,
     /// Story 3.5. Absent in files written before it — which load as the
@@ -88,6 +83,52 @@ struct SettingsFile {
         skip_serializing_if = "Vec::is_empty"
     )]
     remote_samples: Vec<RemoteSample>,
+}
+
+/// How [`SpeechLanguages`] is written to TOML, keyed by backend slug:
+///
+/// ```toml
+/// [speech_languages]
+/// local = "tr"
+/// deepinfra = "es"
+/// ```
+///
+/// fal.ai has no speech language yet (Story 3.7 decides its set), so it has
+/// no key here. `None` is an entry the file lacks, filled in by
+/// [`FileSettingsStore::read_settings_file`] before anything reads it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SpeechLanguagesFile {
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    local: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    deepinfra: Option<String>,
+}
+
+impl SpeechLanguagesFile {
+    fn entry(&mut self, backend: LanguageBackend) -> Option<&mut Option<String>> {
+        match backend {
+            LanguageBackend::Local => Some(&mut self.local),
+            LanguageBackend::Remote(RemoteProvider::DeepInfra) => Some(&mut self.deepinfra),
+            LanguageBackend::Remote(RemoteProvider::FalAi) => None,
+        }
+    }
+
+    fn to_state(&self) -> SpeechLanguages {
+        let or_default =
+            |entry: &Option<String>| entry.clone().unwrap_or(DEFAULT_SPEECH_LANGUAGE.to_string());
+        SpeechLanguages {
+            local: or_default(&self.local),
+            deepinfra: or_default(&self.deepinfra),
+        }
+    }
 }
 
 /// How a [`BackendSelection`] is written to TOML:
@@ -159,6 +200,15 @@ where
     Ok(lenient(deserializer)?.unwrap_or_default())
 }
 
+/// The same leniency for the speech-language table: an unreadable table
+/// reads as one with no entries, which the defaults then fill.
+fn lenient_languages<'de, D>(deserializer: D) -> Result<SpeechLanguagesFile, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(lenient(deserializer)?.unwrap_or_default())
+}
+
 /// The same leniency per entry: one unreadable runtime drops out of the
 /// list without taking the others with it.
 fn lenient_list<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
@@ -183,7 +233,11 @@ impl Default for SettingsFile {
         Self {
             hotkey: None,
             ui_language: default_ui_language(),
-            speech_language: default_speech_language(),
+            speech_language: None,
+            speech_languages: SpeechLanguagesFile {
+                local: Some(DEFAULT_SPEECH_LANGUAGE.to_string()),
+                deepinfra: Some(DEFAULT_SPEECH_LANGUAGE.to_string()),
+            },
             selected_mic_device: None,
             backend_selection: None,
             local_runtimes: Vec::new(),
@@ -236,8 +290,29 @@ impl FileSettingsStore {
             return Ok(SettingsFile::default());
         }
         let contents = fs::read_to_string(&path)?;
-        toml::from_str(&contents)
-            .map_err(|err| VoiceMeError::Other(format!("failed to parse settings file: {err}")))
+        let mut settings: SettingsFile = toml::from_str(&contents)
+            .map_err(|err| VoiceMeError::Other(format!("failed to parse settings file: {err}")))?;
+        // Story 3.11 migration: a legacy single `speech_language` seeds the
+        // Local and DeepInfra entries the table lacks — the table wins where
+        // both exist — and is then dropped, so the next write carries the
+        // table alone. Whatever is still missing gets the default, so every
+        // write makes the languages explicit in the file.
+        let legacy = settings.speech_language.take();
+        for backend in [
+            LanguageBackend::Local,
+            LanguageBackend::Remote(RemoteProvider::DeepInfra),
+        ] {
+            if let Some(entry) = settings.speech_languages.entry(backend)
+                && entry.is_none()
+            {
+                *entry = Some(
+                    legacy
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_SPEECH_LANGUAGE.to_string()),
+                );
+            }
+        }
+        Ok(settings)
     }
 
     fn write_settings_file(&self, settings: &SettingsFile) -> Result<(), VoiceMeError> {
@@ -262,7 +337,7 @@ impl FileSettingsStore {
             hotkey: settings.hotkey,
             reference_voice_sample: existing_path(&sample_path),
             ui_language: settings.ui_language,
-            speech_language: settings.speech_language,
+            speech_languages: settings.speech_languages.to_state(),
             selected_mic_device: settings.selected_mic_device,
             // Not persisted: the composition root overwrites it with the
             // backend the selection below resolves to (AD-9).
@@ -347,6 +422,23 @@ impl SettingsStore for FileSettingsStore {
     ) -> Result<AppState, VoiceMeError> {
         let mut settings = self.read_settings_file()?;
         settings.backend_selection = Some(SelectionFile::from(selection));
+        self.write_settings_file(&settings)?;
+        Ok(self.build_state(settings))
+    }
+
+    fn save_speech_language(
+        &self,
+        backend: LanguageBackend,
+        code: &str,
+    ) -> Result<AppState, VoiceMeError> {
+        let mut settings = self.read_settings_file()?;
+        let Some(entry) = settings.speech_languages.entry(backend) else {
+            return Err(VoiceMeError::Other(format!(
+                "{} has no speech language to save",
+                backend.label()
+            )));
+        };
+        *entry = Some(code.to_string());
         self.write_settings_file(&settings)?;
         Ok(self.build_state(settings))
     }
@@ -531,30 +623,27 @@ mod tests {
     }
 
     #[test]
-    fn the_speech_language_defaults_to_turkish_and_survives_an_unrelated_save() {
+    fn the_speech_languages_default_to_turkish_and_survive_an_unrelated_save() {
         let config_dir = tempfile::tempdir().unwrap();
         let data_dir = tempfile::tempdir().unwrap();
-        let store = FileSettingsStore::with_dirs(
-            config_dir.path().to_path_buf(),
-            data_dir.path().to_path_buf(),
-        );
+        let store = store_in(config_dir.path(), data_dir.path());
 
         // No settings file at all yet (first run).
-        assert_eq!(store.load().unwrap().speech_language, "tr");
+        let state = store.load().unwrap();
+        assert_eq!(state.speech_languages, SpeechLanguages::default());
+        assert_eq!(state.speech_language(), Some("tr"));
 
-        // Any save writes the whole file, so the default becomes explicit
-        // and stays put — this is how the setting is "persisted" with no UI
-        // control to set it (spec-2-6 Decision 2).
+        // Any save writes the whole file, so the defaults become explicit.
         store.save_hotkey(Some("Ctrl+Alt+KeyV")).unwrap();
         let written = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
-        assert!(
-            written.contains("speech_language = \"tr\""),
-            "the setting has to reach the file, or it cannot be edited: {written}"
-        );
+        assert!(written.contains("[speech_languages]"), "{written}");
+        assert!(written.contains("local = \"tr\""), "{written}");
+        assert!(written.contains("deepinfra = \"tr\""), "{written}");
     }
 
+    /// The I/O matrix's Migration row, across a fresh store.
     #[test]
-    fn a_speech_language_in_the_file_is_what_generation_gets() {
+    fn a_legacy_speech_language_seeds_local_and_deepinfra_and_is_not_written_back() {
         let config_dir = tempfile::tempdir().unwrap();
         let data_dir = tempfile::tempdir().unwrap();
         fs::write(
@@ -563,42 +652,117 @@ mod tests {
         )
         .unwrap();
 
-        let store = FileSettingsStore::with_dirs(
-            config_dir.path().to_path_buf(),
-            data_dir.path().to_path_buf(),
+        let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+        assert_eq!(state.speech_languages.local, "en");
+        assert_eq!(state.speech_languages.deepinfra, "en");
+        // A file that omits the other fields still gets their defaults.
+        assert_eq!(state.ui_language, "en");
+
+        store_in(config_dir.path(), data_dir.path())
+            .save_hotkey(Some("Ctrl+Alt+KeyV"))
+            .unwrap();
+        let written = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
+        assert!(written.contains("[speech_languages]"), "{written}");
+        assert!(
+            !written.contains("speech_language ="),
+            "the legacy key is not written back: {written}"
         );
 
-        assert_eq!(store.load().unwrap().speech_language, "en");
-        // A file that omits the other fields still gets their defaults
-        // rather than empty strings.
-        assert_eq!(store.load().unwrap().ui_language, "en");
+        let reloaded = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+        assert_eq!(reloaded.speech_languages.local, "en");
+        assert_eq!(reloaded.speech_languages.deepinfra, "en");
+        assert_eq!(reloaded.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
+    }
+
+    #[test]
+    fn the_table_wins_over_the_legacy_key() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_dir.path().join(SETTINGS_FILE_NAME),
+            "speech_language = \"en\"\n\n[speech_languages]\ndeepinfra = \"es\"\n",
+        )
+        .unwrap();
+
+        let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+
+        assert_eq!(state.speech_languages.deepinfra, "es", "the table wins");
+        assert_eq!(
+            state.speech_languages.local, "en",
+            "the legacy key fills only the entry the table lacks"
+        );
+    }
+
+    #[test]
+    fn saving_one_backends_language_leaves_the_others_alone() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = store_in(config_dir.path(), data_dir.path());
+        store
+            .save_speech_language(LanguageBackend::Local, "en")
+            .unwrap();
+
+        let state = store
+            .save_speech_language(LanguageBackend::Remote(RemoteProvider::DeepInfra), "es")
+            .unwrap();
+
+        assert_eq!(state.speech_languages.deepinfra, "es");
+        assert_eq!(state.speech_languages.local, "en");
+        assert_eq!(state.ui_language, "en", "the UI language is untouched");
+        let reloaded = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+        assert_eq!(reloaded.speech_languages, state.speech_languages);
+        assert_eq!(reloaded.ui_language, "en");
+
+        // fal.ai has no speech language to save.
+        assert!(
+            store
+                .save_speech_language(LanguageBackend::Remote(RemoteProvider::FalAi), "en")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn an_unreadable_speech_language_falls_back_without_losing_the_file() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_dir.path().join(SETTINGS_FILE_NAME),
+            "hotkey = \"Ctrl+Alt+KeyV\"\n\n[speech_languages]\nlocal = 42\ndeepinfra = \"es\"\n",
+        )
+        .unwrap();
+
+        let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+
+        assert_eq!(state.speech_languages.local, "tr");
+        assert_eq!(state.speech_languages.deepinfra, "es");
+        assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
+
+        // A table that is not a table at all loses the entries, not the file.
+        fs::write(
+            config_dir.path().join(SETTINGS_FILE_NAME),
+            "hotkey = \"Ctrl+Alt+KeyV\"\nspeech_languages = 7\n",
+        )
+        .unwrap();
+        let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+        assert_eq!(state.speech_languages, SpeechLanguages::default());
+        assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
     }
 
     #[test]
     fn save_hotkey_leaves_the_other_settings_intact() {
         let config_dir = tempfile::tempdir().unwrap();
         let data_dir = tempfile::tempdir().unwrap();
-        let store = FileSettingsStore::with_dirs(
-            config_dir.path().to_path_buf(),
-            data_dir.path().to_path_buf(),
-        );
-
-        // A speech language the user chose by hand — the only way to set it
-        // until Epic 4 builds the selector, so an unrelated save silently
-        // resetting it to the default would be invisible until they next
-        // heard the wrong language.
-        fs::write(
-            config_dir.path().join(SETTINGS_FILE_NAME),
-            "speech_language = \"en\"\n",
-        )
-        .unwrap();
+        let store = store_in(config_dir.path(), data_dir.path());
+        store
+            .save_speech_language(LanguageBackend::Local, "en")
+            .unwrap();
 
         store.save_selected_mic_device(Some("USB Mic")).unwrap();
         let state = store.save_hotkey(Some("Ctrl+Alt+KeyV")).unwrap();
 
         assert_eq!(state.selected_mic_device, Some("USB Mic".to_string()));
         assert_eq!(state.hotkey, Some("Ctrl+Alt+KeyV".to_string()));
-        assert_eq!(state.speech_language, "en");
+        assert_eq!(state.speech_languages.local, "en");
     }
 
     fn store_in(config_dir: &Path, data_dir: &Path) -> FileSettingsStore {

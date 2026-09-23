@@ -32,11 +32,6 @@ use crate::state::{AppState, BackendSelection};
 /// heard in full", and this is what keeps that promise.
 static PLAYBACK: Mutex<()> = Mutex::new(());
 
-/// The speech languages v1 generates in (AD-12): the ones that need no
-/// Python-only text normalization. Chinese, Japanese, Hebrew and Korean are
-/// out until that normalization has a Rust path.
-const SUPPORTED_SPEECH_LANGUAGES: [&str; 2] = ["tr", "en"];
-
 /// The title every failure notification carries.
 ///
 /// One fixed sentence, with the specifics in the body: the user reads the
@@ -116,21 +111,25 @@ fn speak_inner(
         return Err(VoiceMeError::EmptyText);
     }
 
-    // Decision 2 makes hand-editing `settings.toml` the only way to set the
-    // speech language until Epic 4 builds the selector, so a typo is the
-    // expected failure mode rather than a remote one. Unchecked, it reaches
-    // the model as a literal `[turkish]` tag and comes back as plausible
-    // audio in the wrong language — a failure nobody can diagnose from the
-    // result. Checked here, it is a sentence naming the value and the two
-    // languages v1 supports (AD-12).
-    let language = state.speech_language.trim().to_lowercase();
-    if !SUPPORTED_SPEECH_LANGUAGES.contains(&language.as_str()) {
+    // Story 3.11: the language is the *selected* backend's own, checked
+    // against that backend's set (AD-12 for local Chatterbox, the provider's
+    // model for a remote one). A value outside it — a hand-edited typo, or a
+    // DeepInfra-only language saved for Local by hand — would otherwise reach
+    // the model as a literal tag and come back as plausible audio in the
+    // wrong language. It is refused by name, never replaced by a default.
+    let backend = state.backend_selection.language_backend();
+    let Some(stored) = state.speech_language() else {
         return Err(VoiceMeError::Other(format!(
-            "unsupported speech language {:?} in settings.toml — voice-me speaks {}",
-            state.speech_language,
-            SUPPORTED_SPEECH_LANGUAGES.join(" and ")
+            "{} has no speech language yet — choose another backend in Settings → Backend",
+            backend.label()
         )));
-    }
+    };
+    let Some(language) = backend.speech_language(stored) else {
+        return Err(VoiceMeError::Other(format!(
+            "{} can't speak the speech language {stored:?} — choose one in Settings → Backend",
+            backend.label()
+        )));
+    };
 
     // Story 3.6: nothing leaves the machine for a provider whose disclosure
     // the user has not confirmed. Enforced here, in the use case, rather
@@ -157,7 +156,7 @@ fn speak_inner(
         eprintln!("could not show the still-working notification: {delivery}");
     }
 
-    let audio = tts.generate(text, reference_clip, &language)?;
+    let audio = tts.generate(text, reference_clip, language.code)?;
 
     // The AD-11 buffer crosses straight from one port to the other,
     // unconverted: 24 kHz mono f32 is what the decoder emits and what the
@@ -180,6 +179,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::state::{RemoteProvider, SpeechLanguages};
 
     #[derive(Default)]
     struct FakeNotifier {
@@ -335,7 +335,6 @@ mod tests {
     fn state_with_a_sample() -> AppState {
         AppState {
             reference_voice_sample: Some(PathBuf::from("/data/reference_voice_sample.wav")),
-            speech_language: "tr".to_string(),
             ..AppState::default()
         }
     }
@@ -369,10 +368,7 @@ mod tests {
         let tts = FakeTts::default();
         let notifier = FakeNotifier::default();
         let mic = FakeMic::default();
-        let state = AppState {
-            speech_language: "tr".to_string(),
-            ..AppState::default()
-        };
+        let state = AppState::default();
 
         let error = speak("Merhaba", &state, &tts, &mic, &notifier).unwrap_err();
 
@@ -447,28 +443,123 @@ mod tests {
         );
     }
 
+    fn with_languages(state: AppState, local: &str, deepinfra: &str) -> AppState {
+        AppState {
+            speech_languages: SpeechLanguages {
+                local: local.to_string(),
+                deepinfra: deepinfra.to_string(),
+            },
+            ..state
+        }
+    }
+
+    fn deepinfra_confirmed(state: AppState) -> AppState {
+        AppState {
+            backend_selection: BackendSelection::Remote(RemoteProvider::DeepInfra),
+            confirmed_disclosures: vec![RemoteProvider::DeepInfra],
+            ..state
+        }
+    }
+
+    /// The I/O matrix's Out of set row: a value outside the *selected*
+    /// backend's set is refused by name before the engine, naming the
+    /// backend, the value and where to fix it.
     #[test]
-    fn an_unsupported_speech_language_is_refused_by_name_before_the_engine() {
+    fn a_language_outside_the_selected_backends_set_is_refused_by_name() {
+        for bad in ["es", "turkish"] {
+            let tts = FakeTts::default();
+            let notifier = FakeNotifier::default();
+            let mic = FakeMic::default();
+            let state = with_languages(state_with_a_sample(), bad, "tr");
+
+            let error = speak("Merhaba", &state, &tts, &mic, &notifier).unwrap_err();
+
+            assert!(
+                tts.calls.lock().unwrap().is_empty(),
+                "{bad} must not reach the model as a literal tag"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains(bad)
+                    && message.contains("local Chatterbox")
+                    && message.contains("Settings → Backend"),
+                "the message names the value, the backend and the fix: {message}"
+            );
+            assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
+        }
+    }
+
+    /// The same `es` that Local refuses is one DeepInfra speaks.
+    #[test]
+    fn a_language_is_checked_against_the_selected_backend_not_a_global_list() {
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+        let state = deepinfra_confirmed(with_languages(state_with_a_sample(), "en", "es"));
+
+        speak("Hola", &state, &tts, &mic, &notifier).unwrap();
+
+        assert_eq!(tts.calls.lock().unwrap()[0].2, "es");
+        assert!(notifier.summaries().is_empty());
+    }
+
+    /// The I/O matrix's Switch backends row: each backend's own language
+    /// reaches `generate`, and switching rewrites neither.
+    #[test]
+    fn switching_backends_switches_the_language_that_reaches_generate() {
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+        let languages = with_languages(state_with_a_sample(), "en", "es");
+
+        speak(
+            "One",
+            &deepinfra_confirmed(languages.clone()),
+            &tts,
+            &mic,
+            &notifier,
+        )
+        .unwrap();
+        let cpu = AppState {
+            backend_selection: BackendSelection::BUNDLED_CPU,
+            ..deepinfra_confirmed(languages.clone())
+        };
+        speak("Two", &cpu, &tts, &mic, &notifier).unwrap();
+        speak(
+            "Three",
+            &deepinfra_confirmed(languages),
+            &tts,
+            &mic,
+            &notifier,
+        )
+        .unwrap();
+
+        let tags: Vec<_> = tts
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| call.2.clone())
+            .collect();
+        assert_eq!(tags, vec!["es", "en", "es"]);
+    }
+
+    /// fal.ai has no speech language yet: refused by name, never given one.
+    #[test]
+    fn fal_ai_is_refused_rather_than_given_a_language() {
         let tts = FakeTts::default();
         let notifier = FakeNotifier::default();
         let mic = FakeMic::default();
         let state = AppState {
-            speech_language: "turkish".to_string(),
+            backend_selection: BackendSelection::Remote(RemoteProvider::FalAi),
+            confirmed_disclosures: vec![RemoteProvider::FalAi],
             ..state_with_a_sample()
         };
 
         let error = speak("Merhaba", &state, &tts, &mic, &notifier).unwrap_err();
 
-        assert!(
-            tts.calls.lock().unwrap().is_empty(),
-            "a typo must not reach the model as a literal [turkish] tag"
-        );
-        let message = error.to_string();
-        assert!(
-            message.contains("turkish") && message.contains("tr") && message.contains("en"),
-            "the message has to name the bad value and the supported ones: {message}"
-        );
-        assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
+        assert!(tts.calls.lock().unwrap().is_empty());
+        assert!(error.to_string().contains("fal.ai"), "{error}");
     }
 
     #[test]
@@ -476,10 +567,7 @@ mod tests {
         let tts = FakeTts::default();
         let notifier = FakeNotifier::default();
         let mic = FakeMic::default();
-        let state = AppState {
-            speech_language: "  EN \n".to_string(),
-            ..state_with_a_sample()
-        };
+        let state = with_languages(state_with_a_sample(), "  EN \n", "tr");
 
         speak("Hello", &state, &tts, &mic, &notifier).unwrap();
 

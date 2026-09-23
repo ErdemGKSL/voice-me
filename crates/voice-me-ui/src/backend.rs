@@ -4,7 +4,8 @@
 //! The tab is two-step. The user first chooses **Local** or **Remote**, then
 //! one backend of that kind from a `Select`. Below that it shows only the
 //! *saved* backend's options: the provider's masked key and held voice
-//! sample for a remote one. Last come the *Selected* and *Active* lines,
+//! sample for a remote one, each below that backend's speech language
+//! (Story 3.11). Last come the *Selected* and *Active* lines,
 //! kept as two separate facts, the "CPU mode" tag and the restart line.
 //!
 //! Flipping Local ↔ Remote only changes what the tab shows (Decision 1):
@@ -44,8 +45,8 @@ use gpui_kit::{
     px,
 };
 use voice_me_core::{
-    ActiveBackend, ApiKeys, BackendSelection, CheckRequest, LocalRuntime, RemoteProvider,
-    RemoteSample, backend_choices,
+    ActiveBackend, ApiKeys, BackendSelection, CheckRequest, LanguageBackend, LocalRuntime,
+    RemoteProvider, RemoteSample, SpeechLanguages, backend_choices,
 };
 
 /// Something the user asked of the backend. The views only *ask*; the
@@ -69,6 +70,8 @@ pub enum BackendAction {
     Restart,
     /// Delete the Reference Voice Sample this provider holds (Story 3.6).
     DeleteRemoteSample(RemoteProvider),
+    /// Save this backend's speech language (Story 3.11).
+    SetSpeechLanguage(LanguageBackend, String),
 }
 
 /// Written by hand so a key typed into a key field can never reach a log
@@ -91,6 +94,11 @@ impl std::fmt::Debug for BackendAction {
             BackendAction::DeleteRemoteSample(provider) => {
                 f.debug_tuple("DeleteRemoteSample").field(provider).finish()
             }
+            BackendAction::SetSpeechLanguage(backend, code) => f
+                .debug_tuple("SetSpeechLanguage")
+                .field(backend)
+                .field(code)
+                .finish(),
         }
     }
 }
@@ -109,6 +117,8 @@ pub enum BackendArea {
     Restart,
     /// The voice sample a provider holds (Story 3.6).
     RemoteSample(RemoteProvider),
+    /// The saved backend's speech language (Story 3.11).
+    SpeechLanguage,
 }
 
 /// Everything the Backend and Dependencies tabs show about the backend, as
@@ -132,6 +142,8 @@ pub struct BackendPanel {
     pub remote_samples: Vec<RemoteSample>,
     /// Providers whose held sample is being deleted right now.
     pub deleting_samples: Vec<RemoteProvider>,
+    /// Each backend's saved speech language (Story 3.11).
+    pub speech_languages: SpeechLanguages,
 }
 
 impl Default for BackendPanel {
@@ -147,6 +159,7 @@ impl Default for BackendPanel {
             errors: HashMap::new(),
             remote_samples: Vec::new(),
             deleting_samples: Vec::new(),
+            speech_languages: SpeechLanguages::default(),
         }
     }
 }
@@ -227,6 +240,49 @@ impl gpui_kit::component::searchable_list::SearchableListItem for BackendChoice 
     }
 }
 
+/// One entry of the speech-language `Select`: the code the model gets, and
+/// the English name the user reads.
+#[derive(Clone)]
+struct LanguageChoice {
+    code: &'static str,
+    label: SharedString,
+}
+
+impl gpui_kit::component::searchable_list::SearchableListItem for LanguageChoice {
+    type Value = &'static str;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.code
+    }
+}
+
+/// The speech languages `backend` lists, in its own order.
+fn language_choices(backend: LanguageBackend) -> Vec<LanguageChoice> {
+    backend
+        .speech_languages()
+        .iter()
+        .map(|language| LanguageChoice {
+            code: language.code,
+            label: language.label.into(),
+        })
+        .collect()
+}
+
+/// The code of `backend`'s saved language, if it is one `backend` speaks.
+/// A value outside the set is `None` — the `Select` then shows its
+/// placeholder — never a stand-in.
+fn saved_language_code(panel: &BackendPanel, backend: LanguageBackend) -> Option<&'static str> {
+    panel
+        .speech_languages
+        .get(backend)
+        .and_then(|saved| backend.speech_language(saved))
+        .map(|language| language.code)
+}
+
 /// The existing backends of one kind: the bundled CPU entry and each added
 /// runtime's entries, or every remote provider.
 fn choices(kind: BackendKind, runtimes: &[LocalRuntime]) -> Vec<BackendChoice> {
@@ -248,6 +304,10 @@ pub struct BackendView {
     /// flipped it and has not picked an entry yet (Decision 1).
     kind: BackendKind,
     backend_select: Entity<SelectState<Vec<BackendChoice>>>,
+    /// The saved backend's speech language (Story 3.11).
+    language_select: Entity<SelectState<Vec<LanguageChoice>>>,
+    /// Whose languages `language_select` currently lists.
+    language_backend: LanguageBackend,
     key_inputs: Vec<(RemoteProvider, Entity<InputState>)>,
     /// A panel (or kind) change since the last render that still has to
     /// reach the `Select` and the inputs — which need the window, and so
@@ -255,6 +315,9 @@ pub struct BackendView {
     panel_stale: bool,
     keys_stale: bool,
     items_stale: bool,
+    /// The language `Select` needs its items or value brought in line with
+    /// the panel at the next render.
+    language_stale: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -281,6 +344,34 @@ impl BackendView {
             }
         });
 
+        let language_backend = panel.selection.language_backend();
+        let language_items = language_choices(language_backend);
+        let language_selected = saved_language_code(&panel, language_backend).and_then(|code| {
+            language_items
+                .iter()
+                .position(|choice| choice.code == code)
+                .map(IndexPath::new)
+        });
+        let language_select =
+            cx.new(|cx| SelectState::new(language_items, language_selected, window, cx));
+        let language_subscription = cx.subscribe(&language_select, |this, _select, event, cx| {
+            let SelectEvent::Confirm(Some(code)) = event else {
+                return;
+            };
+            let backend = this.panel.selection.language_backend();
+            // Items of a backend that is no longer the saved one are
+            // never saved under the new one.
+            if backend != this.language_backend {
+                return;
+            }
+            if Some(*code) != saved_language_code(&this.panel, backend) {
+                this.act(
+                    BackendAction::SetSpeechLanguage(backend, code.to_string()),
+                    cx,
+                );
+            }
+        });
+
         let key_inputs = RemoteProvider::ALL
             .into_iter()
             .map(|provider| {
@@ -300,11 +391,14 @@ impl BackendView {
             actions,
             kind,
             backend_select,
+            language_select,
+            language_backend,
             key_inputs,
             panel_stale: false,
             keys_stale: false,
             items_stale: false,
-            _subscriptions: vec![subscription],
+            language_stale: false,
+            _subscriptions: vec![subscription, language_subscription],
         }
     }
 
@@ -320,6 +414,11 @@ impl BackendView {
         // A failed save leaves the selection unchanged, but the `Select`
         // still shows the entry the user picked: resync it to what is saved.
         let selection_failed = panel.errors.contains_key(&BackendArea::Selection);
+        // The same for the language `Select`: a failed save leaves the
+        // picked language showing until it is resynced to the saved one.
+        self.language_stale |= panel.speech_languages != self.panel.speech_languages
+            || panel.selection.language_backend() != self.language_backend
+            || panel.errors.contains_key(&BackendArea::SpeechLanguage);
 
         // Decision 1: the kind follows the saved selection when it changes.
         if selection_changed {
@@ -356,8 +455,39 @@ impl BackendView {
         }
     }
 
+    /// The saved backend's language backend, while its kind is shown and it
+    /// has a speech language — the only case in which the language `Select`
+    /// appears (3.10 Decision 1).
+    fn shown_language_backend(&self) -> Option<LanguageBackend> {
+        let backend = self.panel.selection.language_backend();
+        (BackendKind::of(&self.panel.selection) == self.kind && backend.has_speech_language())
+            .then_some(backend)
+    }
+
+    /// Bring the language `Select` in line with the panel: the saved
+    /// backend's list, with its saved language chosen, or the placeholder.
+    fn sync_language(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.language_stale) {
+            return;
+        }
+        let backend = self.panel.selection.language_backend();
+        let items = (backend != self.language_backend).then(|| language_choices(backend));
+        self.language_backend = backend;
+        let saved = saved_language_code(&self.panel, backend);
+        self.language_select.update(cx, |select, cx| {
+            if let Some(items) = items {
+                select.set_items(items, window, cx);
+            }
+            match saved {
+                Some(code) => select.set_selected_value(&code, window, cx),
+                None => select.set_selected_index(None, window, cx),
+            }
+        });
+    }
+
     /// Bring the `Select` and the key inputs in line with the panel.
     fn sync_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_language(window, cx);
         if !self.panel_stale {
             return;
         }
@@ -495,8 +625,19 @@ impl BackendView {
     /// is of the other kind (Decision 1) — then one short line for every
     /// other provider holding a key or the voice sample (Decision 2).
     fn options_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // Story 3.11: the saved backend's speech language sits above its
+        // other options.
+        let language = self
+            .shown_language_backend()
+            .map(|backend| self.speech_language_section(backend, cx));
         match self.kind {
-            BackendKind::Local => Some(self.runtimes_section(cx)),
+            BackendKind::Local => Some(
+                v_flex()
+                    .gap_6()
+                    .children(language)
+                    .child(self.runtimes_section(cx))
+                    .into_any_element(),
+            ),
             BackendKind::Remote => {
                 let saved = self.shown_saved_provider();
                 let others: Vec<AnyElement> = RemoteProvider::ALL
@@ -504,12 +645,13 @@ impl BackendView {
                     .filter(|provider| Some(*provider) != saved)
                     .filter_map(|provider| self.other_provider_line(provider, cx))
                     .collect();
-                if saved.is_none() && others.is_empty() {
+                if saved.is_none() && others.is_empty() && language.is_none() {
                     return None;
                 }
                 Some(
                     v_flex()
                         .gap_6()
+                        .children(language)
                         .when_some(saved, |el, provider| {
                             el.child(self.api_key_section(provider, cx))
                                 .when(SAMPLE_HOLDING_PROVIDERS.contains(&provider), |el| {
@@ -529,6 +671,55 @@ impl BackendView {
                 )
             }
         }
+    }
+
+    /// Story 3.11: the saved backend's speech language — only the languages
+    /// that backend speaks — with a note when the saved value is none of
+    /// them, and a failed save inline.
+    fn speech_language_section(
+        &self,
+        backend: LanguageBackend,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let saved = self.panel.speech_languages.get(backend).unwrap_or_default();
+        let unknown = backend.speech_language(saved).is_none();
+
+        v_flex()
+            .id("backend-speech-language")
+            .test_support()
+            .gap_1()
+            .child(
+                div()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child("Speech language"),
+            )
+            .child(
+                Select::new(&self.language_select)
+                    .id("backend-speech-language-select")
+                    .accessibility_label("Speech language")
+                    .placeholder("Choose a speech language")
+                    .menu_width(px(360.))
+                    .w(px(360.)),
+            )
+            .when(unknown, |el| {
+                el.child(
+                    div()
+                        .id("backend-speech-language-note")
+                        .test_support()
+                        .text_size(px(12.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "The saved speech language {saved:?} is not one {} speaks. \
+                             Choose one to speak again.",
+                            backend.label()
+                        )),
+                )
+            })
+            .when_some(
+                self.panel.errors.get(&BackendArea::SpeechLanguage).cloned(),
+                |el, error| el.child(error_line("backend-speech-language-error", error, cx)),
+            )
+            .into_any_element()
     }
 
     /// Decision 2: a provider that is not the saved one but holds a saved
@@ -1674,6 +1865,234 @@ mod tests {
                 Some("Delete from DeepInfra")
             );
             assert!(window.try_find("backend-other-fal-ai").is_none());
+        })
+        .unwrap();
+    }
+
+    fn with_languages(panel: BackendPanel, local: &str, deepinfra: &str) -> BackendPanel {
+        BackendPanel {
+            speech_languages: SpeechLanguages {
+                local: local.to_string(),
+                deepinfra: deepinfra.to_string(),
+            },
+            ..panel
+        }
+    }
+
+    fn codes(backend: LanguageBackend) -> Vec<&'static str> {
+        language_choices(backend)
+            .into_iter()
+            .map(|choice| choice.code)
+            .collect()
+    }
+
+    /// Story 3.11, Local saved: the language `Select` lists Turkish then
+    /// English, with the saved one chosen, above the runtimes.
+    #[gpui_kit::test]
+    fn a_local_backend_lists_its_two_languages_with_the_saved_one_selected(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, view, _recorded) = open_backend_tab(cx, BackendPanel::default());
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("backend-speech-language").is_some());
+            assert!(window.try_find("backend-speech-language-note").is_none());
+            assert_eq!(view.read(cx).language_backend, LanguageBackend::Local);
+            assert_eq!(codes(LanguageBackend::Local), vec!["tr", "en"]);
+            let select = view.read(cx).language_select.clone();
+            assert_eq!(select.read(cx).selected_value(), Some(&"tr"));
+
+            // Only Local's languages are among the items.
+            select.update(cx, |select, cx| {
+                select.set_selected_value(&"es", window, cx)
+            });
+            assert_eq!(select.read(cx).selected_value(), None);
+        })
+        .unwrap();
+
+        // Every local entry shares the Local language.
+        let (window, view, _recorded) =
+            open_backend_tab(cx, with_languages(cuda_panel(), "en", "tr"));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                view.read(cx).language_select.read(cx).selected_value(),
+                Some(&"en")
+            );
+        })
+        .unwrap();
+    }
+
+    /// Story 3.11, DeepInfra saved: 23 languages, the saved one chosen, and
+    /// the section sits with DeepInfra's key field.
+    #[gpui_kit::test]
+    fn deepinfra_lists_its_23_languages_with_the_saved_one_selected(cx: &mut TestAppContext) {
+        let panel = with_languages(remote_panel(RemoteProvider::DeepInfra), "tr", "en");
+        let (window, view, _recorded) = open_backend_tab(cx, panel);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("backend-speech-language").is_some());
+            assert!(window.try_find("api-key-save-deepinfra").is_some());
+            let backend = LanguageBackend::Remote(RemoteProvider::DeepInfra);
+            assert_eq!(view.read(cx).language_backend, backend);
+            assert_eq!(codes(backend).len(), 23);
+            let select = view.read(cx).language_select.clone();
+            assert_eq!(select.read(cx).selected_value(), Some(&"en"));
+            select.update(cx, |select, cx| {
+                select.set_selected_value(&"es", window, cx)
+            });
+            assert_eq!(select.read(cx).selected_value(), Some(&"es"));
+        })
+        .unwrap();
+    }
+
+    /// Switching the saved backend swaps the list and the chosen language.
+    #[gpui_kit::test]
+    fn a_new_saved_backend_brings_its_own_languages(cx: &mut TestAppContext) {
+        let (window, view, _recorded) =
+            open_backend_tab(cx, with_languages(BackendPanel::default(), "en", "es"));
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            view.update(cx, |view, cx| {
+                view.set_backend_panel(
+                    with_languages(remote_panel(RemoteProvider::DeepInfra), "en", "es"),
+                    cx,
+                )
+            });
+            window.render_frame(cx);
+            assert_eq!(
+                view.read(cx).language_backend,
+                LanguageBackend::Remote(RemoteProvider::DeepInfra)
+            );
+            assert_eq!(
+                view.read(cx).language_select.read(cx).selected_value(),
+                Some(&"es")
+            );
+
+            view.update(cx, |view, cx| {
+                view.set_backend_panel(with_languages(BackendPanel::default(), "en", "es"), cx)
+            });
+            window.render_frame(cx);
+            assert_eq!(
+                view.read(cx).language_select.read(cx).selected_value(),
+                Some(&"en")
+            );
+        })
+        .unwrap();
+    }
+
+    /// Picking a language asks the root once; re-confirming the saved one
+    /// sends nothing.
+    #[gpui_kit::test]
+    fn picking_a_language_asks_the_root_once(cx: &mut TestAppContext) {
+        let panel = with_languages(remote_panel(RemoteProvider::DeepInfra), "tr", "en");
+        let (window, view, recorded) = open_backend_tab(cx, panel);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let select = view.read(cx).language_select.clone();
+            select.update(cx, |_, cx| {
+                cx.emit(SelectEvent::Confirm(Some("en")));
+                cx.emit(SelectEvent::Confirm(Some("es")));
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            *recorded.borrow(),
+            vec![BackendAction::SetSpeechLanguage(
+                LanguageBackend::Remote(RemoteProvider::DeepInfra),
+                "es".to_string()
+            )]
+        );
+    }
+
+    /// 3.10 Decision 1: after a flip the saved backend's options, its
+    /// language included, are not shown. fal.ai has no language at all.
+    #[gpui_kit::test]
+    fn no_language_select_after_a_flip_or_for_fal_ai(cx: &mut TestAppContext) {
+        let (window, _view, _recorded) = open_backend_tab(cx, BackendPanel::default());
+        cx.update_window(window.into(), |_, window, cx| {
+            flip_to(window, BackendKind::Remote, cx);
+            assert!(window.try_find("backend-speech-language").is_none());
+            flip_to(window, BackendKind::Local, cx);
+            assert!(window.try_find("backend-speech-language").is_some());
+        })
+        .unwrap();
+
+        let (window, _view, _recorded) =
+            open_backend_tab(cx, remote_panel(RemoteProvider::DeepInfra));
+        cx.update_window(window.into(), |_, window, cx| {
+            flip_to(window, BackendKind::Local, cx);
+            assert!(window.try_find("backend-speech-language").is_none());
+            assert!(window.try_find("backend-runtimes").is_some());
+        })
+        .unwrap();
+
+        let (window, _view, _recorded) = open_backend_tab(cx, remote_panel(RemoteProvider::FalAi));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("backend-speech-language").is_none());
+            assert!(window.try_find("api-key-save-fal-ai").is_some());
+        })
+        .unwrap();
+    }
+
+    /// The Out of set row: a hand-edited value outside the set leaves the
+    /// `Select` on its placeholder, with a note naming the value.
+    #[gpui_kit::test]
+    fn a_saved_language_outside_the_set_shows_the_placeholder_and_a_note(cx: &mut TestAppContext) {
+        let (window, view, recorded) =
+            open_backend_tab(cx, with_languages(BackendPanel::default(), "es", "tr"));
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                view.read(cx).language_select.read(cx).selected_value(),
+                None
+            );
+            assert!(window.try_find("backend-speech-language-note").is_some());
+
+            // Picking a real one is a change, and is sent.
+            let select = view.read(cx).language_select.clone();
+            select.update(cx, |_, cx| cx.emit(SelectEvent::Confirm(Some("tr"))));
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            *recorded.borrow(),
+            vec![BackendAction::SetSpeechLanguage(
+                LanguageBackend::Local,
+                "tr".to_string()
+            )]
+        );
+    }
+
+    /// A failed save is shown under the `Select`, which resyncs to the
+    /// saved language.
+    #[gpui_kit::test]
+    fn a_failed_language_save_is_inline_and_resyncs_the_select(cx: &mut TestAppContext) {
+        let (window, view, _recorded) = open_backend_tab(cx, BackendPanel::default());
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let select = view.read(cx).language_select.clone();
+            select.update(cx, |select, cx| {
+                select.set_selected_value(&"en", window, cx)
+            });
+            let mut panel = BackendPanel::default();
+            panel
+                .errors
+                .insert(BackendArea::SpeechLanguage, "Could not save.".to_string());
+            view.update(cx, |view, cx| view.set_backend_panel(panel, cx));
+            window.render_frame(cx);
+            assert!(window.try_find("backend-speech-language-error").is_some());
+            assert_eq!(select.read(cx).selected_value(), Some(&"tr"));
         })
         .unwrap();
     }

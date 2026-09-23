@@ -5,7 +5,8 @@ use crate::audio::AudioBuffer;
 use crate::error::VoiceMeError;
 use crate::state::LocalRuntime;
 use crate::state::{
-    AppState, BackendSelection, DependencyKind, RemoteProvider, RemoteSample, SpeechBackend,
+    AppState, BackendSelection, DependencyKind, LanguageBackend, RemoteProvider, RemoteSample,
+    SpeechBackend,
 };
 
 /// What one Dependency Check is asked about (Story 3.3).
@@ -274,6 +275,15 @@ pub trait SettingsStore {
     fn save_backend_selection(
         &self,
         selection: &BackendSelection,
+    ) -> Result<AppState, VoiceMeError>;
+
+    /// Persist `backend`'s speech language (Story 3.11), leaving every
+    /// other backend's untouched. An error for a backend that has no
+    /// speech language. Returns the resulting `AppState`.
+    fn save_speech_language(
+        &self,
+        backend: LanguageBackend,
+        code: &str,
     ) -> Result<AppState, VoiceMeError>;
 
     /// Persist the list of ONNX Runtime libraries the user added, replacing

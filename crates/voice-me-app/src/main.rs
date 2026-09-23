@@ -884,6 +884,14 @@ mod tests {
             unimplemented!("not exercised by these tests")
         }
 
+        fn save_speech_language(
+            &self,
+            _backend: voice_me_core::LanguageBackend,
+            _code: &str,
+        ) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
         fn save_api_key(
             &self,
             _provider: voice_me_core::RemoteProvider,
@@ -1761,6 +1769,7 @@ fn main() {
                     errors: backend_errors.borrow().clone(),
                     remote_samples: state.remote_samples,
                     deleting_samples: deleting_samples.borrow().clone(),
+                    speech_languages: state.speech_languages,
                 }
             }
         });
@@ -1853,6 +1862,7 @@ fn main() {
                         let mut errors = backend_errors.borrow_mut();
                         errors.remove(&BackendArea::Selection);
                         errors.remove(&BackendArea::Capability);
+                        errors.remove(&BackendArea::SpeechLanguage);
                         drop(errors);
                         let committed = voice_me_tts::sessions::committed_runtime();
                         let wanted = selection_library(&selection);
@@ -2029,6 +2039,25 @@ fn main() {
                         cx.update(|cx| (*push_panel)(cx));
                     })
                     .detach();
+                }
+                // Story 3.11: saved and pushed back, nothing else. The
+                // language is read from settings on every Speak Action, so
+                // there is no check to re-run and no engine to rebuild.
+                BackendAction::SetSpeechLanguage(backend, code) => {
+                    match settings_store.save_speech_language(backend, &code) {
+                        Ok(_) => {
+                            backend_errors
+                                .borrow_mut()
+                                .remove(&BackendArea::SpeechLanguage);
+                        }
+                        Err(error) => {
+                            backend_errors.borrow_mut().insert(
+                                BackendArea::SpeechLanguage,
+                                format!("Couldn't save the speech language: {error}"),
+                            );
+                        }
+                    }
+                    (*push_panel)(cx);
                 }
                 BackendAction::Restart => match relaunch() {
                     Ok(()) => cx.quit(),
