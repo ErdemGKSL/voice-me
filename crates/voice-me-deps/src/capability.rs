@@ -309,7 +309,7 @@ pub fn capability_row(request: &CheckRequest, probe: &dyn GpuProbe) -> Option<De
                 return Some(cannot_run(
                     selection,
                     &format!(
-                        "{} has no API key — add one under API keys.",
+                        "{} has no API key — add one in Settings → Backend.",
                         provider.label()
                     ),
                 ));
@@ -642,10 +642,13 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_provider_with_no_key_points_at_api_keys() {
+    fn a_remote_provider_with_no_key_points_at_the_backend_tab() {
         let row = capability_row(&remote(false), &good_gpu()).unwrap();
 
-        assert_blocks(&row, "DeepInfra has no API key — add one under API keys");
+        assert_blocks(
+            &row,
+            "DeepInfra has no API key — add one in Settings → Backend",
+        );
     }
 
     #[test]

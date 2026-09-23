@@ -79,7 +79,7 @@ pub const DISCLOSURE_ITEMS: [&str; 3] = [
     "the text you type",
     "the language tag of your speech language",
     "your Reference Voice Sample (uploaded once, then kept on their servers until you delete it \
-     in Settings → Dependencies or record a new sample)",
+     in Settings → Backend or record a new sample)",
 ];
 
 /// Called once when the user confirms the disclosure (Story 3.6).

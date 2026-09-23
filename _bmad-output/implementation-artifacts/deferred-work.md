@@ -140,3 +140,6 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-3-6-generate-through-a-remote-provider.md`
   summary: Nothing tests that the overlay's confirm callback in `main()` actually persists the selected provider's disclosure, so a regression there would lock DeepInfra behind a repeating confirm loop.
   evidence: The callback is built inline in `main()` (`save_disclosure_confirmed` has no other non-test caller). The view tests use a counter closure, and `disclosure_needed` and the store round-trip are tested separately. Closing the gap means extracting a `disclosure_confirm_callback(store, provider)` helper and testing it against a temp-dir `FileSettingsStore`.
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-10-give-backends-their-own-settings-tab.md`
+  summary: The tts-remote no-key error still says "add one under Settings → Dependencies"; since Story 3.10 it should say Settings → Backend.
+  evidence: `crates/voice-me-tts-remote/src/lib.rs:235`; the capability row (`voice-me-deps/src/capability.rs:312`) already says Settings → Backend, so the two surfaces now disagree. It is reached only if the key vanishes between the Dependency Check and the Speak Action. Spec-3-10's frozen Never excluded `voice-me-tts-remote`; the test at `voice-me-tts-remote/src/tests.rs:503` checks only "no API key".

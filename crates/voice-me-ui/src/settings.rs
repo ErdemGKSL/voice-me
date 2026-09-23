@@ -16,23 +16,30 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _, Window,
-    div,
+    AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
+    Subscription, Window, div,
 };
 use voice_me_core::{
     AppEventSender, DependencyKind, DependencyOutcome, DependencyProvisioningPort, HotkeyPort,
     SettingsStore,
 };
 
-use crate::dependencies::{BackendActions, BackendPanel, DependenciesView, RowProvisioning};
+use crate::backend::{BackendActions, BackendPanel, BackendView};
+use crate::dependencies::{DependenciesView, OpenBackendTab, RowProvisioning};
 use crate::hotkey::HotkeyView;
 use crate::voice_setup::VoiceSetupView;
 
 const VOICE_TAB: usize = 0;
 const HOTKEY_TAB: usize = 1;
-const DEPENDENCIES_TAB: usize = 2;
+const BACKEND_TAB: usize = 2;
+const DEPENDENCIES_TAB: usize = 3;
 
-/// Everything the Dependencies tab needs, as one argument.
+/// Everything the Backend and Dependencies tabs need, as one argument.
+///
+/// Both tabs are fed the same [`BackendPanel`] and ask through the same
+/// [`BackendActions`] (Story 3.10): the Backend tab shows and changes the
+/// selection, and the Dependencies tab reads `check_request` and the
+/// capability row's error from it.
 ///
 /// Grouped rather than spread across four more parameters: `SettingsView`
 /// already takes the startup state of two other tabs, and a twelve-argument
@@ -40,9 +47,9 @@ const DEPENDENCIES_TAB: usize = 2;
 pub struct DependenciesTab {
     pub deps_port: Arc<dyn DependencyProvisioningPort>,
     pub events: AppEventSender,
-    /// The backend section's state (Story 3.3).
+    /// The backend's state (Story 3.3), shown by both tabs.
     pub backend: BackendPanel,
-    /// Where the backend section's requests go — the composition root.
+    /// Where both tabs' backend requests go — the composition root.
     pub actions: BackendActions,
     pub outcome: DependencyOutcome,
     /// Installs already running or already failed when the window opens
@@ -55,8 +62,10 @@ pub struct DependenciesTab {
 pub struct SettingsView {
     voice: Entity<VoiceSetupView>,
     hotkey: Entity<HotkeyView>,
+    backend: Entity<BackendView>,
     dependencies: Entity<DependenciesView>,
     active_tab: usize,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl SettingsView {
@@ -95,24 +104,38 @@ impl SettingsView {
             )
         });
 
-        let dependencies = cx.new(|cx| {
+        let backend = cx.new(|cx| {
+            BackendView::new(
+                dependencies.backend.clone(),
+                dependencies.actions.clone(),
+                window,
+                cx,
+            )
+        });
+
+        let dependencies = cx.new(|_| {
             DependenciesView::new(
                 dependencies.deps_port,
                 dependencies.events,
                 dependencies.backend,
                 dependencies.outcome,
                 dependencies.actions,
-                window,
-                cx,
             )
             .with_provisioning(dependencies.provisioning)
+        });
+        // The capability row's "Open Backend tab".
+        let open_backend = cx.subscribe(&dependencies, |this, _, _: &OpenBackendTab, cx| {
+            this.active_tab = BACKEND_TAB;
+            cx.notify();
         });
 
         Self {
             voice,
             hotkey,
+            backend,
             dependencies,
             active_tab: VOICE_TAB,
+            _subscriptions: vec![open_backend],
         }
     }
 
@@ -146,8 +169,12 @@ impl SettingsView {
             .update(cx, |view, cx| view.replace_provisioning(provisioning, cx));
     }
 
-    /// Push the backend section's new state into the Dependencies tab.
+    /// Push the backend's new state into both the Backend tab and the
+    /// Dependencies tab, which still reads `check_request` and the
+    /// capability row's error from it.
     pub fn set_backend_panel(&mut self, panel: BackendPanel, cx: &mut Context<Self>) {
+        self.backend
+            .update(cx, |view, cx| view.set_backend_panel(panel.clone(), cx));
         self.dependencies
             .update(cx, |view, cx| view.set_backend_panel(panel, cx));
     }
@@ -169,6 +196,7 @@ impl Render for SettingsView {
                     .selected_index(self.active_tab)
                     .child(Tab::new().label("Voice"))
                     .child(Tab::new().label("Hotkey"))
+                    .child(Tab::new().label("Backend"))
                     .child(Tab::new().label("Dependencies"))
                     .on_click(cx.listener(|this, index: &usize, _window, cx| {
                         this.active_tab = *index;
@@ -181,6 +209,7 @@ impl Render for SettingsView {
                     .overflow_hidden()
                     .map(|el| match self.active_tab {
                         HOTKEY_TAB => el.child(self.hotkey.clone()),
+                        BACKEND_TAB => el.child(self.backend.clone()),
                         DEPENDENCIES_TAB => el.child(self.dependencies.clone()),
                         _ => el.child(self.voice.clone()),
                     }),
@@ -351,12 +380,21 @@ mod tests {
             window.render_frame(cx);
             assert!(window.try_find("voice-setup-record").is_some());
 
+            window.click(BACKEND_TAB, cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("backend-surface").is_some(),
+                "the third tab must route to the Backend section"
+            );
+            assert!(window.try_find("dependencies-surface").is_none());
+
             window.click(DEPENDENCIES_TAB, cx);
             window.render_frame(cx);
             assert!(
                 window.try_find("dependencies-surface").is_some(),
-                "the third tab must route to the Dependencies section"
+                "the fourth tab must route to the Dependencies section"
             );
+            assert!(window.try_find("backend-surface").is_none());
         })
         .unwrap();
     }
@@ -434,6 +472,125 @@ mod tests {
                 "the row says the word `missing`, in text"
             );
             assert!(window.try_find("dependencies-pending").is_none());
+        })
+        .unwrap();
+    }
+
+    /// Opens Settings over `backend` and `outcome`, returning the shell.
+    fn open_settings(
+        cx: &mut TestAppContext,
+        backend: BackendPanel,
+        outcome: DependencyOutcome,
+    ) -> (gpui_kit::WindowHandle<Root>, Entity<SettingsView>) {
+        cx.update(gpui_kit::init);
+        let settings_store: Arc<dyn SettingsStore> = Arc::new(StubSettingsStore);
+        let hotkey_port: Arc<dyn HotkeyPort> = Arc::new(StubHotkeyPort);
+        let (event_tx, _event_rx) = futures::channel::mpsc::unbounded::<AppEvent>();
+        let mut slot = None;
+        let handle = cx.open_window(size(px(900.), px(900.)), |window, cx| {
+            let view = cx.new(|cx| {
+                SettingsView::new(
+                    settings_store.clone(),
+                    hotkey_port.clone(),
+                    true,
+                    None,
+                    None,
+                    None,
+                    DependenciesTab {
+                        deps_port: Arc::new(StubDepsPort),
+                        events: event_tx.clone(),
+                        backend,
+                        actions: std::rc::Rc::new(|_, _| {}),
+                        outcome,
+                        provisioning: HashMap::new(),
+                    },
+                    window,
+                    cx,
+                )
+            });
+            slot = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        (handle, slot.unwrap())
+    }
+
+    /// Story 3.10: the capability row's "Open Backend tab" switches the
+    /// shell to the Backend tab.
+    #[gpui_kit::test]
+    fn the_capability_link_switches_to_the_backend_tab(cx: &mut TestAppContext) {
+        let mut row = voice_me_core::Dependency::missing(
+            DependencyKind::BackendCapability,
+            "Selected backend",
+            "CUDA can't run here: No NVIDIA driver found.",
+        );
+        row.automatable = false;
+        let outcome = DependencyOutcome::Ready(voice_me_core::DependencyReport::new(
+            voice_me_core::SpeechBackend::CPU,
+            vec![row],
+        ));
+        let (handle, view) = open_settings(cx, BackendPanel::default(), outcome);
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            view.update(cx, |view, cx| view.show_dependencies(cx));
+            window.render_frame(cx);
+            assert!(window.try_find("dependencies-surface").is_some());
+            window.click("backend-open-tab", cx);
+        })
+        .unwrap();
+        // The tab switch is a subscription, delivered once the click's
+        // update has finished.
+        cx.run_until_parked();
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("backend-surface").is_some(),
+                "the link lands on the Backend tab"
+            );
+            assert!(window.try_find("dependencies-surface").is_none());
+        })
+        .unwrap();
+    }
+
+    /// A new panel reaches both tabs: the Backend tab shows the new
+    /// selection, and Dependencies reads the capability error from it.
+    #[gpui_kit::test]
+    fn a_backend_panel_reaches_both_tabs(cx: &mut TestAppContext) {
+        let mut row = voice_me_core::Dependency::missing(
+            DependencyKind::BackendCapability,
+            "Selected backend",
+            "CUDA can't run here: No NVIDIA driver found.",
+        );
+        row.automatable = false;
+        let outcome = DependencyOutcome::Ready(voice_me_core::DependencyReport::new(
+            voice_me_core::SpeechBackend::CPU,
+            vec![row],
+        ));
+        let (handle, view) = open_settings(cx, BackendPanel::default(), outcome);
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let mut panel = BackendPanel {
+                selection: voice_me_core::BackendSelection::Remote(
+                    voice_me_core::RemoteProvider::DeepInfra,
+                ),
+                ..BackendPanel::default()
+            };
+            panel.errors.insert(
+                crate::backend::BackendArea::Capability,
+                "Could not save.".to_string(),
+            );
+            view.update(cx, |view, cx| view.set_backend_panel(panel, cx));
+
+            view.update(cx, |view, cx| view.show_dependencies(cx));
+            window.render_frame(cx);
+            assert!(window.try_find("backend-error-capability").is_some());
+
+            window.click(BACKEND_TAB, cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("api-key-save-deepinfra").is_some(),
+                "the Backend tab shows the new selection's options"
+            );
         })
         .unwrap();
     }

@@ -1,16 +1,17 @@
 //! `voice-me-ui` — gpui-kit views (Prompt Overlay, settings, voice setup,
 //! tray menu).
 
+mod backend;
 mod dependencies;
 mod hotkey;
 mod prompt_overlay;
 mod settings;
 mod voice_setup;
 
-pub use dependencies::{
-    API_KEY_STORAGE_NOTICE, BackendAction, BackendActions, BackendArea, BackendPanel,
-    DependenciesView, RowProvisioning, blocker_notice,
+pub use backend::{
+    API_KEY_STORAGE_NOTICE, BackendAction, BackendActions, BackendArea, BackendPanel, BackendView,
 };
+pub use dependencies::{DependenciesView, OpenBackendTab, RowProvisioning, blocker_notice};
 pub use hotkey::{CaptureOutcome, HotkeyView, capture_keystroke, display_hotkey};
 pub use prompt_overlay::{ConfirmDisclosure, DISCLOSURE_ITEMS, PromptOverlayView};
 pub use settings::{DependenciesTab, SettingsView};

@@ -445,7 +445,7 @@ fn build_engine(
     if let BackendSelection::Remote(provider) = &state.backend_selection {
         return unavailable(format!(
             "{} is selected, and remote generation through it arrives in a later voice-me \
-             release. Choose a local backend under Settings → Dependencies.",
+             release. Choose a local backend under Settings → Backend.",
             provider.label()
         ));
     }
