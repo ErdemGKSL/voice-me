@@ -1,6 +1,10 @@
 //! Against the real `espeak-ng`, when this machine has it. Skips itself
 //! (passing) when it does not, so it needs no `#[ignore]`.
 
+// The library is Linux-only, so on any other target this compiles to
+// nothing.
+#![cfg(target_os = "linux")]
+
 use voice_me_core::{SAMPLE_RATE, TtsPort as _};
 use voice_me_tts_system_linux::{SystemVoiceLinux, find_program, list_voices};
 

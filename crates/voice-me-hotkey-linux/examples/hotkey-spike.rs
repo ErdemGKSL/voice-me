@@ -17,11 +17,25 @@
 //! must report the missing `input`-group membership rather than hang or
 //! silently do nothing.
 
+// The library body is `#![cfg(target_os = "linux")]`, so on any other
+// target it compiles to an empty crate and these imports would not resolve
+// — and `cargo test --workspace` on Windows builds this example.
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("the Linux hotkey spike is Linux-only");
+}
+
+#[cfg(target_os = "linux")]
 use futures::StreamExt as _;
+#[cfg(target_os = "linux")]
 use futures::channel::mpsc;
+#[cfg(target_os = "linux")]
 use voice_me_core::{AppEvent, HotkeyPort as _};
+#[cfg(target_os = "linux")]
 use voice_me_hotkey_linux::{LinuxHotkeyAdapter, SessionKind, session_kind};
 
+#[cfg(target_os = "linux")]
 fn main() {
     let hotkey = std::env::args()
         .nth(1)

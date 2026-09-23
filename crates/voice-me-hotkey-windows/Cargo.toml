@@ -5,3 +5,15 @@ edition.workspace = true
 
 [dependencies]
 voice-me-core = { path = "../voice-me-core" }
+# Windows backend: `RegisterHotKey` on a hidden window — never a low-level
+# keyboard hook (see the crate docs). A combination another process already
+# holds fails with `ERROR_HOTKEY_ALREADY_REGISTERED`, which `global-hotkey`
+# reports as `Error::AlreadyRegistered`: the inline conflict signal. Same
+# crate and accelerator syntax (`Ctrl+Alt+KeyV`) as the Linux X11 backend, so
+# the persisted hotkey string is shared.
+global-hotkey = "0.8"
+
+[dev-dependencies]
+# For a test `AppEventSender` channel — already resolved to 0.3.34 in
+# Cargo.lock via gpui's own dependency graph.
+futures = "0.3"

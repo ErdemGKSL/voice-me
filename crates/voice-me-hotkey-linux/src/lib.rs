@@ -18,6 +18,11 @@
 //! Presses are signalled only through the shared `AppEvent` channel (AD-3):
 //! this crate never depends on `voice-me-ui` and never touches a window.
 
+// This crate *is* the Linux capability (AD-2): its `evdev` backend does not
+// build on Windows, so the whole body is gated rather than the workspace
+// being made unbuildable there. Windows is `voice-me-hotkey-windows`.
+#![cfg(target_os = "linux")]
+
 mod evdev;
 mod x11;
 

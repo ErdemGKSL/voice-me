@@ -82,10 +82,18 @@ pub fn capture_keystroke(key: &str, modifiers: Modifiers) -> CaptureOutcome {
     CaptureOutcome::Captured(parts.join("+"))
 }
 
+/// The platform-native name of the Super/Windows key, as the chip shows it
+/// (UX-DR21). Display only: the persisted accelerator always says `Super`.
+const SUPER_LABEL: &str = if cfg!(target_os = "windows") {
+    "Win"
+} else {
+    "Super"
+};
+
 /// The chip's display form of a persisted accelerator string:
-/// `Ctrl+Alt+KeyV` → `Ctrl+Alt+V`, `Super` rather than `Meta`. Derived for
-/// rendering only — never persisted, so the stored string always stays
-/// parseable by the adapters.
+/// `Ctrl+Alt+KeyV` → `Ctrl+Alt+V`, `Super` (`Win` on Windows) rather than
+/// `Meta`. Derived for rendering only — never persisted, so the stored
+/// string always stays parseable by the adapters.
 pub fn display_hotkey(accelerator: &str) -> String {
     let mut ctrl = false;
     let mut alt = false;
@@ -116,7 +124,7 @@ pub fn display_hotkey(accelerator: &str) -> String {
         parts.push("Shift".to_string());
     }
     if super_ {
-        parts.push("Super".to_string());
+        parts.push(SUPER_LABEL.to_string());
     }
     if !key.is_empty() {
         parts.push(key);
@@ -1082,9 +1090,18 @@ mod tests {
     #[test]
     fn display_form_is_derived_not_persisted() {
         assert_eq!(display_hotkey("Ctrl+Alt+KeyV"), "Ctrl+Alt+V");
-        assert_eq!(display_hotkey("shift+super+Digit1"), "Shift+Super+1");
-        // `Meta` is shown as `Super`, the platform-native name on Linux.
-        assert_eq!(display_hotkey("meta+F5"), "Super+F5");
+        // The platform-native name: `Win` on Windows (UX-DR21), `Super`
+        // elsewhere. `Meta` is shown the same way.
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(display_hotkey("shift+super+Digit1"), "Shift+Win+1");
+            assert_eq!(display_hotkey("meta+F5"), "Win+F5");
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(display_hotkey("shift+super+Digit1"), "Shift+Super+1");
+            assert_eq!(display_hotkey("meta+F5"), "Super+F5");
+        }
         // Canonical modifier order regardless of how it was written.
         assert_eq!(display_hotkey("alt+ctrl+KeyB"), "Ctrl+Alt+B");
     }

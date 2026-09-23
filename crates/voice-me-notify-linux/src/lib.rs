@@ -42,7 +42,9 @@ impl NotificationPort for LinuxNotificationAdapter {
     }
 }
 
-#[cfg(test)]
+// Linux only: on Windows `notify-rust` shows a toast instead of using D-Bus,
+// so the unreachable-bus address below does not make delivery fail there.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 

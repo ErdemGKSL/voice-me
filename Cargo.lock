@@ -8738,6 +8738,8 @@ dependencies = [
 name = "voice-me-hotkey-windows"
 version = "0.1.0"
 dependencies = [
+ "futures",
+ "global-hotkey",
  "voice-me-core",
 ]
 
@@ -8790,6 +8792,7 @@ name = "voice-me-tray-windows"
 version = "0.1.0"
 dependencies = [
  "gpui-kit",
+ "gpui-tray",
  "voice-me-core",
 ]
 

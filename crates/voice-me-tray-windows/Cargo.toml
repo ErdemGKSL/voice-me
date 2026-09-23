@@ -6,3 +6,9 @@ edition.workspace = true
 [dependencies]
 voice-me-core = { path = "../voice-me-core" }
 gpui-kit = { version = "0.6.4", default-features = false }
+# Same crate and design as `voice-me-tray-linux`; its Windows backend is
+# `Shell_NotifyIconW` on a hidden window whose messages GPUI's own
+# `GetMessageW` loop delivers, and it re-adds the icon on `TaskbarCreated`
+# (Explorer restart). The gpui-kit feature uses gpui-kit's own gpui re-export
+# instead of gpui-tray's default pinned Zed git dependency.
+gpui-tray = { version = "0.1", default-features = false, features = ["gpui-kit"] }

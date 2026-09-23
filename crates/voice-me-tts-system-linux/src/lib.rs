@@ -9,6 +9,11 @@
 //!
 //! Offline: this crate opens no socket (AD-8).
 
+// This crate *is* the Linux capability (AD-2): it uses `std::os::unix`,
+// which does not exist on Windows, so the whole body is gated rather than
+// the workspace being made unbuildable there. Windows is Story 3.13.
+#![cfg(target_os = "linux")]
+
 mod os_release;
 mod process;
 mod voices;

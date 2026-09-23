@@ -1771,8 +1771,13 @@ fn main() {
         // no `input`-group membership).
         #[cfg(target_os = "linux")]
         let hotkey_port: Arc<dyn HotkeyPort> = Arc::new(LinuxHotkeyAdapter::new(event_tx.clone()));
+        // Not `Send`: the Windows manager owns a window handle, and must
+        // stay on GPUI's main thread, whose message loop delivers
+        // `WM_HOTKEY`. `Arc<dyn HotkeyPort>` is never sent across threads.
         #[cfg(target_os = "windows")]
-        let hotkey_port: Arc<dyn HotkeyPort> = Arc::new(WindowsHotkeyAdapter);
+        #[allow(clippy::arc_with_non_send_sync)]
+        let hotkey_port: Arc<dyn HotkeyPort> =
+            Arc::new(WindowsHotkeyAdapter::new(event_tx.clone()));
 
         // A failed `start_listening` (most importantly: no read access to
         // `/dev/input` on Wayland) must not stop the app — it starts

@@ -146,3 +146,18 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-3-11-choose-the-speech-language-per-backend.md`
   summary: The composition root's `backend_actions` dispatch (including 3.11's `SetSpeechLanguage` arm) lives inline in `fn main` and no test drives it.
   evidence: The verification-gap review of 3.11 showed that dropping the arm's error removal or its `push_panel` would pass CI. Every other `BackendAction` arm has the same gap. Fixing it means pulling the dispatch into a testable function.
+- source_spec: none
+  summary: Implement the Windows `NotificationPort` (toast notifications) in `voice-me-notify-windows`, which still returns "not implemented on Windows yet".
+  evidence: Split from the 2026-09-23 "build all unimplemented Windows parts" intent; the user chose to do the Windows tray and hotkey first. A toast also needs a registered AppUserModelID, which is an installer concern.
+- source_spec: none
+  summary: Story 3.13, speak instantly with the Windows speech engine (`voice-me-tts-system-windows` over WinRT `SpeechSynthesizer`).
+  evidence: Split from the 2026-09-23 "build all unimplemented Windows parts" intent; deferred until the Windows tray and hotkey let the app start on Windows, so it can be verified by hand.
+- source_spec: none
+  summary: Story 2.8, the Windows Virtual Microphone control-surface spike (`voice-me-audio-windows` over the signed Virtual-Audio-Driver).
+  evidence: Split from the 2026-09-23 "build all unimplemented Windows parts" intent; it needs the kernel driver installed by hand on a Windows test machine, and it comes last in the agreed order (tray+hotkey, notifications, 3.13, 2.8).
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-2-2-3-windows-tray-and-global-hotkey.md`
+  summary: No test checks that the tray's "Settings…" action sends `AppEvent::SettingsRequested`, on Windows or Linux.
+  evidence: `voice-me-tray-windows`'s tests cover only the menu labels and action names. `voice-me-tray-linux` has no tests. Dropping `cx.on_action(on_settings)` would pass CI. Closing the gap needs a GPUI `TestAppContext` harness that dispatches the action and reads the channel, for both adapters.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-2-2-3-windows-tray-and-global-hotkey.md`
+  summary: Unverified: the Windows-only real-registration hotkey tests may fail if the `windows-latest` CI runner refuses `RegisterHotKey` (medium if true).
+  evidence: They pass on an interactive Windows 10 desktop. The first `build-windows` CI run settles it. If they fail, gate them behind an env var or `#[ignore]`.
