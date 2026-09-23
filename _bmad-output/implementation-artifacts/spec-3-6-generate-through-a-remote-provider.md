@@ -95,6 +95,8 @@ context: ['{project-root}/_bmad-output/implementation-artifacts/epic-3-context.m
 - **Unknown voice detection.** A 404, or a 4xx whose `detail` mentions a voice together with "not found"/"unknown"/"does not exist"/"invalid", counts as "stored voice gone" on inference and delete. A delete of a voice that is already gone counts as success.
 - **Delete runs** on GPUI's background executor, not the Tokio bridge, so it works even when the runtime failed to start. The Settings panel is also pushed after every Speak Action, so a sample uploaded by a line shows up as held.
 
+- **Live API corrections (2026-09-23, after a real-key test).** Two things the docs got wrong, confirmed against the live API. (1) `POST /v1/voices/add` wants the sample as the multipart field `files`: `audio`, as DeepInfra's own curl sample shows, fails with 422 "Field required". Validation errors now also name the field ("Field required (files)"). (2) Inference with an unknown `voice_id` does not fail; it succeeds in a stock voice. So `SpeechProvider::confirm_sample` (`GET /v1/voices/{id}`, under the 30 s delete deadline) runs before every line with a held voice. A 404 there is the matrix's "Stored voice gone" row, so a voice deleted elsewhere is never silently replaced by a stock one. Also confirmed live: the reply is a `data:audio/wav;base64,` 24 kHz mono 16-bit WAV, DELETE returns 200, and a second DELETE returns 404 `{"detail":{"error":"voice not found"}}`.
+
 ## Spec Change Log
 
 ## Review Triage Log

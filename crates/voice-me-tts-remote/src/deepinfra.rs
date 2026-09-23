@@ -43,6 +43,8 @@ enum Call {
     Inference,
     /// Names a stored voice by path, so a 404 means it is gone.
     Delete,
+    /// Looks a stored voice up by path; a 404 means it is gone.
+    Lookup,
 }
 
 /// How long each call may take.
@@ -162,7 +164,7 @@ fn classify(status: StatusCode, body: &[u8], call: Call) -> ProviderError {
                 .any(|phrase| lower.contains(phrase))
     });
     match call {
-        Call::Delete if status == StatusCode::NOT_FOUND || names_missing_voice => {
+        Call::Delete | Call::Lookup if status == StatusCode::NOT_FOUND || names_missing_voice => {
             return ProviderError::VoiceGone;
         }
         Call::Inference if names_missing_voice => return ProviderError::VoiceGone,
@@ -178,13 +180,27 @@ fn classify(status: StatusCode, body: &[u8], call: Call) -> ProviderError {
 }
 
 /// The `detail` of an error body, shortened: a string as it is, a list of
-/// validation errors as the first one's `msg`.
+/// validation errors as the first one's `msg` with the field it names
+/// ("Field required (files)").
 fn detail(body: &[u8]) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let detail = value.get("detail")?;
     let text = match detail {
         serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Array(items) => items.first()?.get("msg")?.as_str()?.to_string(),
+        serde_json::Value::Array(items) => {
+            let first = items.first()?;
+            let msg = first.get("msg")?.as_str()?;
+            match first
+                .get("loc")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|loc| loc.last())
+                .and_then(serde_json::Value::as_str)
+                .filter(|field| *field != "body")
+            {
+                Some(field) => format!("{msg} ({field})"),
+                None => msg.to_string(),
+            }
+        }
         serde_json::Value::Object(object) => object
             .get("error")
             .or_else(|| object.get("message"))?
@@ -235,7 +251,10 @@ impl SpeechProvider for DeepInfra {
             .mime_str("audio/wav")
             .map_err(|error| ProviderError::Transport(error.without_url().to_string()))?;
         let form = reqwest::multipart::Form::new()
-            .part("audio", part)
+            // `files`, as DeepInfra's ElevenLabs-compatible clone endpoint
+            // names it; its curl sample says `audio`, which the live API
+            // rejects with "Field required".
+            .part("files", part)
             .text("name", UPLOAD_NAME)
             .text("description", UPLOAD_DESCRIPTION);
         let request = Self::client()?
@@ -254,6 +273,18 @@ impl SpeechProvider for DeepInfra {
             .ok_or_else(|| {
                 ProviderError::Failed("the upload response carried no voice id.".to_string())
             })
+    }
+
+    /// `GET /v1/voices/{id}`, under the delete deadline. Needed because
+    /// inference with an unknown `voice_id` does not fail: DeepInfra
+    /// answers in a stock voice (seen against the live API, 2026-09-23).
+    async fn confirm_sample(&self, key: &str, voice_id: &str) -> Result<(), ProviderError> {
+        let request = Self::client()?
+            .get(self.url(&format!("/v1/voices/{voice_id}")))
+            .bearer_auth(key);
+        Self::send(request, self.deadlines.delete, Call::Lookup)
+            .await
+            .map(|_| ())
     }
 
     async fn delete_sample(&self, key: &str, voice_id: &str) -> Result<(), ProviderError> {
@@ -324,6 +355,11 @@ mod tests {
         assert_eq!(
             classify(StatusCode::UNPROCESSABLE_ENTITY, body, Call::Upload),
             ProviderError::Failed("field required".to_string())
+        );
+        let named = br#"{"detail": [{"loc": ["body", "files"], "msg": "Field required"}]}"#;
+        assert_eq!(
+            classify(StatusCode::UNPROCESSABLE_ENTITY, named, Call::Upload),
+            ProviderError::Failed("Field required (files)".to_string())
         );
     }
 

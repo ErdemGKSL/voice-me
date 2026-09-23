@@ -76,6 +76,12 @@ pub trait SpeechProvider: Send + Sync {
     /// provider's id for it.
     async fn upload_sample(&self, key: &str, wav: Vec<u8>) -> Result<String, ProviderError>;
 
+    /// Check that the provider still holds `voice_id`:
+    /// [`ProviderError::VoiceGone`] when it does not. Asked before every
+    /// line, because a provider may answer an unknown voice in a stock one
+    /// rather than failing — a silent substitution (AD-9).
+    async fn confirm_sample(&self, key: &str, voice_id: &str) -> Result<(), ProviderError>;
+
     /// Delete a previously uploaded voice. A voice the provider no longer
     /// has is [`ProviderError::VoiceGone`].
     async fn delete_sample(&self, key: &str, voice_id: &str) -> Result<(), ProviderError>;

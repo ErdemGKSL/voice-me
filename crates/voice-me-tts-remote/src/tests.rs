@@ -19,6 +19,8 @@ use crate::{Deadlines, DeepInfra, RemoteTtsAdapter, delete_held_sample_with, sha
 const KEY: &str = "sk-di-very-secret";
 const UPLOAD: &str = "POST /v1/voices/add";
 const INFER: &str = "POST /v1/inference/ResembleAI/chatterbox-multilingual";
+/// The check before every line that the held voice still exists.
+const LOOKUP: &str = "GET /v1/voices/v-held";
 
 struct Fixture {
     store: Arc<FileSettingsStore>,
@@ -112,6 +114,7 @@ fn happy(request: &Recorded) -> Reply {
         ("POST", "/v1/voices/add") => Reply::json(200, r#"{"voice_id": "v-new"}"#),
         ("POST", _) => audio_reply(SAMPLE_RATE),
         ("DELETE", _) => Reply::json(200, "{}"),
+        ("GET", _) => Reply::json(200, r#"{"voice_id": "v-held"}"#),
         _ => Reply::json(404, "{}"),
     }
 }
@@ -154,7 +157,7 @@ fn the_first_line_uploads_stores_the_id_then_generates() {
 
     // The upload: the sample and the two fixed strings, nothing else.
     let upload = requests[0].body_text();
-    assert!(upload.contains(r#"name="audio""#), "{upload}");
+    assert!(upload.contains(r#"name="files""#), "{upload}");
     assert!(upload.contains("voice-me reference sample"));
     assert!(upload.contains("Uploaded by voice-me"));
     assert_eq!(upload.matches("Content-Disposition").count(), 3, "{upload}");
@@ -181,8 +184,8 @@ fn a_later_line_references_the_stored_voice_only() {
 
     fixture.speak(&fixture.adapter(&server)).unwrap();
 
-    assert_eq!(server.calls(), vec![INFER]);
-    let body: serde_json::Value = serde_json::from_slice(&server.requests()[0].body).unwrap();
+    assert_eq!(server.calls(), vec![LOOKUP, INFER]);
+    let body: serde_json::Value = serde_json::from_slice(&server.requests()[1].body).unwrap();
     assert_eq!(body["voice_id"], "v-held");
 }
 
@@ -244,7 +247,11 @@ fn a_rejected_key_is_named_and_never_re_sent() {
     let error = fixture.speak(&fixture.adapter(&server)).unwrap_err();
 
     assert_eq!(error.to_string(), "DeepInfra rejected the API key.");
-    assert_eq!(server.calls(), vec![INFER]);
+    assert_eq!(
+        server.calls(),
+        vec![LOOKUP],
+        "stopped before any text is sent"
+    );
     assert_key_absent(&error);
     assert_eq!(
         fixture.held().unwrap().voice_id,
@@ -271,7 +278,7 @@ fn a_provider_that_does_not_answer_in_time_is_named_with_the_deadline() {
         error.to_string(),
         "DeepInfra did not answer within 1 second."
     );
-    assert_eq!(server.calls(), vec![INFER], "no re-send");
+    assert_eq!(server.calls(), vec![LOOKUP, INFER], "no re-send");
 }
 
 #[test]
@@ -347,12 +354,15 @@ fn a_line_through_the_tokio_bridge_uploads_and_generates() {
 fn an_inference_404_that_does_not_name_the_voice_keeps_the_id() {
     let fixture = Fixture::new();
     fixture.hold(&fixture.sample_hash(), "v-held");
-    let server = MockServer::start(|_| Reply::json(404, r#"{"detail": "Model not found"}"#));
+    let server = MockServer::start(|request| match request.method.as_str() {
+        "GET" => happy(request),
+        _ => Reply::json(404, r#"{"detail": "Model not found"}"#),
+    });
 
     let error = fixture.speak(&fixture.adapter(&server)).unwrap_err();
 
     assert_eq!(error.to_string(), "DeepInfra: Model not found");
-    assert_eq!(server.calls(), vec![INFER]);
+    assert_eq!(server.calls(), vec![LOOKUP, INFER]);
     assert_eq!(
         fixture.held().unwrap().voice_id,
         "v-held",
@@ -411,11 +421,12 @@ fn the_default_deadlines_are_the_specs() {
 fn a_provider_error_carries_its_shortened_detail() {
     let fixture = Fixture::new();
     fixture.hold(&fixture.sample_hash(), "v-held");
-    let server = MockServer::start(|_| {
-        Reply::json(
+    let server = MockServer::start(|request| match request.method.as_str() {
+        "GET" => happy(request),
+        _ => Reply::json(
             503,
             r#"{"detail": "Model is\n   currently overloaded", "request_id": "abc"}"#,
-        )
+        ),
     });
 
     let error = fixture.speak(&fixture.adapter(&server)).unwrap_err();
@@ -424,7 +435,7 @@ fn a_provider_error_carries_its_shortened_detail() {
         error.to_string(),
         "DeepInfra: Model is currently overloaded"
     );
-    assert_eq!(server.calls(), vec![INFER]);
+    assert_eq!(server.calls(), vec![LOOKUP, INFER]);
 }
 
 #[test]
@@ -446,7 +457,35 @@ fn a_stored_voice_the_provider_lost_is_dropped_and_not_re_sent() {
             .contains("uploaded again with the next line"),
         "{error}"
     );
-    assert_eq!(server.calls(), vec![INFER], "no automatic re-send");
+    assert_eq!(
+        server.calls(),
+        vec!["GET /v1/voices/v-gone", INFER],
+        "no automatic re-send"
+    );
+    assert_eq!(fixture.held(), None, "the next line uploads afresh");
+}
+
+/// Against the live API an unknown `voice_id` does not fail inference — it
+/// is spoken in a stock voice. The lookup before the line is what keeps a
+/// voice deleted elsewhere from being silently replaced.
+#[test]
+fn a_held_voice_deleted_elsewhere_is_caught_before_any_text_is_sent() {
+    let fixture = Fixture::new();
+    fixture.hold(&fixture.sample_hash(), "v-held");
+    let server = MockServer::start(|request| match request.method.as_str() {
+        "GET" => Reply::json(404, r#"{"detail": {"error": "voice not found"}}"#),
+        _ => happy(request),
+    });
+
+    let error = fixture.speak(&fixture.adapter(&server)).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("uploaded again with the next line"),
+        "{error}"
+    );
+    assert_eq!(server.calls(), vec![LOOKUP], "no text, no stock voice");
     assert_eq!(fixture.held(), None, "the next line uploads afresh");
 }
 

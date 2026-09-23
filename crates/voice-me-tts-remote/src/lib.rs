@@ -71,6 +71,15 @@ impl<P: SpeechProvider> RemoteTtsAdapter<P> {
         error.into_domain(self.provider.provider())
     }
 
+    /// The held voice is gone: forget its id so the next line uploads
+    /// again — never re-sent automatically.
+    fn voice_gone(&self, provider: RemoteProvider) -> VoiceMeError {
+        if let Err(error) = self.store.save_remote_sample(provider, None) {
+            eprintln!("could not forget the missing voice id: {error}");
+        }
+        self.domain(ProviderError::VoiceGone)
+    }
+
     fn generate_locked(
         &self,
         text: &str,
@@ -87,7 +96,16 @@ impl<P: SpeechProvider> RemoteTtsAdapter<P> {
 
         block_on(async {
             let voice_id = match self.store.load_remote_sample(provider)? {
-                Some(held) if held.sample_sha256 == sha256 => held.voice_id,
+                Some(held) if held.sample_sha256 == sha256 => {
+                    // An unknown voice id does not fail inference — the
+                    // provider speaks in a stock voice instead — so the
+                    // held voice is confirmed before every line.
+                    match self.provider.confirm_sample(&key, &held.voice_id).await {
+                        Ok(()) => held.voice_id,
+                        Err(ProviderError::VoiceGone) => return Err(self.voice_gone(provider)),
+                        Err(error) => return Err(self.domain(error)),
+                    }
+                }
                 stale => {
                     // Re-recorded: the old voice is removed first, best
                     // effort. A failed delete is logged and forgotten — the
@@ -135,14 +153,7 @@ impl<P: SpeechProvider> RemoteTtsAdapter<P> {
                         self.label()
                     ),
                 }),
-                Err(ProviderError::VoiceGone) => {
-                    // Dropped so the next line uploads again — never
-                    // re-sent automatically.
-                    if let Err(error) = self.store.save_remote_sample(provider, None) {
-                        eprintln!("could not forget the missing voice id: {error}");
-                    }
-                    Err(self.domain(ProviderError::VoiceGone))
-                }
+                Err(ProviderError::VoiceGone) => Err(self.voice_gone(provider)),
                 Err(error) => Err(self.domain(error)),
             }
         })
