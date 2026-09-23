@@ -135,7 +135,12 @@ pub trait TtsPort: Send + Sync {
     fn is_ready(&self) -> bool;
 
     /// Generate speech for `text` in `language`, cloning the voice in the
-    /// Reference Voice Sample at `reference_clip`.
+    /// Reference Voice Sample at `reference_clip` — or, for a stock-voice
+    /// backend (Story 3.12), in the engine's `voice`.
+    ///
+    /// A cloning adapter needs `reference_clip` and returns
+    /// [`VoiceMeError::NoReferenceVoiceSample`] on `None`; it ignores
+    /// `voice`. A stock-voice adapter is given `None` and the voice id.
     ///
     /// `language` is a lowercase ISO code (`"tr"`, `"en"`) — the model
     /// takes it as a literal bracketed tag prepended to the text, so it is
@@ -155,8 +160,9 @@ pub trait TtsPort: Send + Sync {
     fn generate(
         &self,
         text: &str,
-        reference_clip: &Path,
+        reference_clip: Option<&Path>,
         language: &str,
+        voice: Option<&str>,
     ) -> Result<AudioBuffer, VoiceMeError>;
 }
 
@@ -284,6 +290,15 @@ pub trait SettingsStore {
         &self,
         backend: LanguageBackend,
         code: &str,
+    ) -> Result<AppState, VoiceMeError>;
+
+    /// Persist `backend`'s voice (Story 3.12), or `None` for the language's
+    /// top-priority one. An error for a backend with no voice choice.
+    /// Returns the resulting `AppState`.
+    fn save_speech_voice(
+        &self,
+        backend: LanguageBackend,
+        voice: Option<&str>,
     ) -> Result<AppState, VoiceMeError>;
 
     /// Persist the list of ONNX Runtime libraries the user added, replacing

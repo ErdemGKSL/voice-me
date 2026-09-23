@@ -8670,6 +8670,7 @@ dependencies = [
  "voice-me-tray-windows",
  "voice-me-tts",
  "voice-me-tts-remote",
+ "voice-me-tts-system-linux",
  "voice-me-ui",
 ]
 
@@ -8720,6 +8721,7 @@ dependencies = [
  "tokio",
  "voice-me-audio-linux",
  "voice-me-core",
+ "voice-me-tts-system-linux",
 ]
 
 [[package]]
@@ -8823,6 +8825,15 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "voice-me-core",
+]
+
+[[package]]
+name = "voice-me-tts-system-linux"
+version = "0.1.0"
+dependencies = [
+ "rubato",
+ "tempfile",
  "voice-me-core",
 ]
 

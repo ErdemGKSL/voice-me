@@ -77,7 +77,7 @@ use voice_me_core::{
     ActiveBackend, AppEvent, AppState, BackendSelection, CheckRequest, DependencyKind,
     DependencyOutcome, DependencyProvisioningPort, DependencyReport, FileSettingsStore, HotkeyPort,
     LocalRuntime, NotificationPort, RemoteProvider, SettingsStore, SpeechBackend,
-    SpeechExecutionTarget, TtsPort, VirtualMicPort, tokio_bridge,
+    SpeechExecutionTarget, SystemVoice, TtsPort, VirtualMicPort, tokio_bridge,
 };
 use voice_me_deps::DepsAdapter;
 use voice_me_tts::TtsAdapter;
@@ -322,9 +322,10 @@ fn run_probe(
 /// The AD-9 resolved backend for `selection`: the target, and the weights
 /// the target implies (CPU → Q4, a GPU → FP16).
 ///
-/// A remote selection never reaches the ONNX engine — no adapter is built
-/// for it — so it resolves to the CPU backend only so that a report has a
-/// backend to carry; its capability row is what the user sees.
+/// A remote selection — and the System voice (Story 3.12) — never reaches
+/// the ONNX engine; no ONNX adapter is built for either, so they resolve to
+/// the CPU backend only so that a report has a backend to carry; their
+/// capability or engine row is what the user sees.
 fn resolve_backend(selection: &BackendSelection) -> SpeechBackend {
     match selection.local_target() {
         Some(target) => SpeechBackend::for_target(target),
@@ -339,7 +340,7 @@ fn check_request(state: &AppState) -> CheckRequest {
         selection: state.backend_selection.clone(),
         has_api_key: match &state.backend_selection {
             BackendSelection::Remote(provider) => state.api_keys.has(*provider),
-            BackendSelection::Local { .. } => false,
+            BackendSelection::Local { .. } | BackendSelection::SystemVoice => false,
         },
     }
 }
@@ -441,6 +442,22 @@ fn build_engine(
             unavailable: None,
             generation,
         };
+    }
+    // Story 3.12: the System voice is eSpeak NG as a child process on
+    // Linux, and has no engine elsewhere yet.
+    if let BackendSelection::SystemVoice = &state.backend_selection {
+        #[cfg(target_os = "linux")]
+        return Engine {
+            port: Some(Arc::new(voice_me_tts_system_linux::SystemVoiceLinux::new())),
+            unavailable: None,
+            generation,
+        };
+        #[cfg(not(target_os = "linux"))]
+        return unavailable(
+            "The System voice on this system arrives in a later voice-me release. Choose \
+             another backend under Settings → Backend."
+                .to_string(),
+        );
     }
     if let BackendSelection::Remote(provider) = &state.backend_selection {
         return unavailable(format!(
@@ -591,8 +608,8 @@ fn retain_missing_rows(
     });
 }
 
-/// The persisted settings, plus this run's resolved backend and the latest
-/// Dependency Check.
+/// The persisted settings, plus this run's resolved backend, the latest
+/// Dependency Check and the System voice's latest voice list.
 ///
 /// Re-read per Speak Action rather than snapshotted at startup: a Reference
 /// Voice Sample recorded in Settings since launch has to count, and so would
@@ -600,6 +617,7 @@ fn retain_missing_rows(
 fn current_state(
     settings_store: &Arc<dyn SettingsStore>,
     dependencies: &DependencyOutcome,
+    system_voices: &[SystemVoice],
 ) -> AppState {
     let mut state = settings_store.load().unwrap_or_else(|error| {
         // Falling back to defaults keeps the Speak Action reaching a real
@@ -615,6 +633,9 @@ fn current_state(
     // filesystem, not a preference), and merged into the state every other
     // reader already receives.
     state.dependencies = dependencies.clone();
+    // Story 3.12: held beside the report for the same reason — it is what
+    // the engine listed on this machine a moment ago, not a preference.
+    state.system_voices = system_voices.to_vec();
     state
 }
 
@@ -892,6 +913,14 @@ mod tests {
             unimplemented!("not exercised by these tests")
         }
 
+        fn save_speech_voice(
+            &self,
+            _backend: voice_me_core::LanguageBackend,
+            _voice: Option<&str>,
+        ) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
         fn save_api_key(
             &self,
             _provider: voice_me_core::RemoteProvider,
@@ -961,17 +990,36 @@ mod tests {
         });
 
         assert!(
-            current_state(&store, &DependencyOutcome::Pending)
+            current_state(&store, &DependencyOutcome::Pending, &[])
                 .reference_voice_sample
                 .is_none(),
             "nothing recorded yet at launch"
         );
         assert!(
-            current_state(&store, &DependencyOutcome::Pending)
+            current_state(&store, &DependencyOutcome::Pending, &[])
                 .reference_voice_sample
                 .is_some(),
             "a sample recorded in Settings since launch has to count — \
              snapshotting state at startup would fail every later Speak Action"
+        );
+    }
+
+    /// Story 3.12: the held voice list rides along with every read.
+    #[test]
+    fn the_system_voice_list_is_merged_into_every_read() {
+        let store: Arc<dyn SettingsStore> = Arc::new(SampleAppearsLater {
+            loads: AtomicUsize::new(0),
+        });
+        let voices = vec![SystemVoice {
+            id: "trk/tr".to_string(),
+            language: "tr".to_string(),
+            name: "Turkish".to_string(),
+            priority: 5,
+        }];
+
+        assert_eq!(
+            current_state(&store, &DependencyOutcome::Pending, &voices).system_voices,
+            voices
         );
     }
 
@@ -982,7 +1030,7 @@ mod tests {
         });
 
         assert_eq!(
-            current_state(&store, &DependencyOutcome::Pending).speech_backend,
+            current_state(&store, &DependencyOutcome::Pending, &[]).speech_backend,
             SpeechBackend::CPU,
             "AD-9: the engine reads its backend off AppState, so it has to be written there"
         );
@@ -1381,6 +1429,42 @@ mod tests {
             assert!(port.is_ready(), "a remote engine has no sessions to build");
         }
 
+        /// Story 3.12: the System voice is never an ONNX target — it
+        /// resolves to the CPU placeholder, needs no key, no library and no
+        /// restart — and on Linux gets the eSpeak NG engine.
+        #[test]
+        fn the_system_voice_gets_its_own_engine_and_no_onnx_runtime() {
+            let selection = BackendSelection::SystemVoice;
+            assert_eq!(resolve_backend(&selection), SpeechBackend::CPU);
+            assert_eq!(selection_library(&selection), None);
+            let state = AppState {
+                backend_selection: selection.clone(),
+                ..AppState::default()
+            };
+            let request = check_request(&state);
+            assert_eq!(request.selection, selection);
+            assert!(!request.has_api_key);
+            assert_eq!(disclosure_needed(&state), None);
+
+            let (tx, _rx) = mpsc::unbounded();
+            let engine = build_engine(&state, None, &tx, &unused_store());
+            #[cfg(target_os = "linux")]
+            {
+                assert!(engine.unavailable.is_none());
+                assert!(engine.port.expect("an engine in the slot").is_ready());
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                assert!(engine.port.is_none());
+                assert!(
+                    engine
+                        .unavailable
+                        .unwrap()
+                        .contains("later voice-me release")
+                );
+            }
+        }
+
         /// No silent fallback: fal.ai (Story 3.7) gets no engine at all —
         /// never a CPU one — and a sentence naming the provider.
         #[test]
@@ -1623,7 +1707,7 @@ fn main() {
         // cause is exactly the unactionable message the rest of this story
         // works to avoid.
         let engine: Rc<RefCell<Engine>> = Rc::new(RefCell::new(build_engine(
-            &current_state(&settings_store, &DependencyOutcome::Pending),
+            &current_state(&settings_store, &DependencyOutcome::Pending, &[]),
             runtime_error.as_deref(),
             &event_tx,
             &remote_store,
@@ -1746,6 +1830,10 @@ fn main() {
         // Story 3.6: providers whose held sample is being deleted now, so a
         // second click does not send a second DELETE.
         let deleting_samples: Rc<RefCell<Vec<RemoteProvider>>> = Rc::new(RefCell::new(Vec::new()));
+        // Story 3.12: the voices eSpeak NG listed at the last check run with
+        // the System voice selected. Held here, never persisted, and merged
+        // into `AppState` and the panel like the dependency outcome.
+        let system_voices: Rc<RefCell<Vec<SystemVoice>>> = Rc::new(RefCell::new(Vec::new()));
 
         // What the backend section shows, from the settings file and the
         // state above.
@@ -1756,6 +1844,7 @@ fn main() {
             let probing = probing.clone();
             let backend_errors = backend_errors.clone();
             let deleting_samples = deleting_samples.clone();
+            let system_voices = system_voices.clone();
             move || {
                 let state = settings_store.load().unwrap_or_default();
                 BackendPanel {
@@ -1770,6 +1859,8 @@ fn main() {
                     remote_samples: state.remote_samples,
                     deleting_samples: deleting_samples.borrow().clone(),
                     speech_languages: state.speech_languages,
+                    speech_voices: state.speech_voices,
+                    system_voices: system_voices.borrow().clone(),
                 }
             }
         });
@@ -1791,6 +1882,42 @@ fn main() {
             }
         });
 
+        // Story 3.12: with the System voice selected, every Dependency Check
+        // also re-reads eSpeak NG's voice list, in the background, and
+        // pushes it into an open Backend tab. A list that cannot be read is
+        // an empty one — the engine row already says why.
+        let refresh_system_voices: Rc<dyn Fn(&mut App)> = Rc::new({
+            let settings_store = settings_store.clone();
+            let system_voices = system_voices.clone();
+            let push_panel = push_panel.clone();
+            move |cx: &mut App| {
+                let selected = settings_store
+                    .load()
+                    .is_ok_and(|state| state.backend_selection.is_stock_voice());
+                if !selected {
+                    return;
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let list = cx
+                        .background_spawn(async move { voice_me_tts_system_linux::list_voices() });
+                    let system_voices = system_voices.clone();
+                    let push_panel = push_panel.clone();
+                    cx.spawn(async move |cx| {
+                        let voices = list.await.unwrap_or_else(|error| {
+                            eprintln!("could not list the System voice's voices: {error}");
+                            Vec::new()
+                        });
+                        *system_voices.borrow_mut() = voices;
+                        cx.update(|cx| (*push_panel)(cx));
+                    })
+                    .detach();
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = (&system_voices, &push_panel, cx);
+            }
+        });
+
         // Re-run the Dependency Check for whatever is selected now, in the
         // background. A check that ran reports by event; only one that
         // could not run lands here.
@@ -1801,10 +1928,13 @@ fn main() {
             let dependency_outcome = dependency_outcome.clone();
             let settings_view_slot = settings_view_slot.clone();
             let provisioning = provisioning.clone();
+            let refresh_system_voices = refresh_system_voices.clone();
             move |cx: &mut App| {
+                (*refresh_system_voices)(cx);
                 let request = check_request(&current_state(
                     &settings_store,
                     &dependency_outcome.borrow(),
+                    &[],
                 ));
                 let events = event_tx.clone();
                 let deps_port = deps_port.clone();
@@ -1863,6 +1993,7 @@ fn main() {
                         errors.remove(&BackendArea::Selection);
                         errors.remove(&BackendArea::Capability);
                         errors.remove(&BackendArea::SpeechLanguage);
+                        errors.remove(&BackendArea::SpeechVoice);
                         drop(errors);
                         let committed = voice_me_tts::sessions::committed_runtime();
                         let wanted = selection_library(&selection);
@@ -1871,7 +2002,7 @@ fn main() {
                         } else {
                             restart_pending.set(false);
                             let state =
-                                current_state(&settings_store, &dependency_outcome.borrow());
+                                current_state(&settings_store, &dependency_outcome.borrow(), &[]);
                             *engine.borrow_mut() = build_engine(
                                 &state,
                                 runtime_error.as_deref(),
@@ -2046,14 +2177,33 @@ fn main() {
                 BackendAction::SetSpeechLanguage(backend, code) => {
                     match settings_store.save_speech_language(backend, &code) {
                         Ok(_) => {
-                            backend_errors
-                                .borrow_mut()
-                                .remove(&BackendArea::SpeechLanguage);
+                            let mut errors = backend_errors.borrow_mut();
+                            errors.remove(&BackendArea::SpeechLanguage);
+                            // A new System voice language clears the voice,
+                            // and with it any failed save of one.
+                            errors.remove(&BackendArea::SpeechVoice);
                         }
                         Err(error) => {
                             backend_errors.borrow_mut().insert(
                                 BackendArea::SpeechLanguage,
                                 format!("Couldn't save the speech language: {error}"),
+                            );
+                        }
+                    }
+                    (*push_panel)(cx);
+                }
+                // Story 3.12: the same, for the System voice's voice.
+                BackendAction::SetSpeechVoice(backend, voice) => {
+                    match settings_store.save_speech_voice(backend, voice.as_deref()) {
+                        Ok(_) => {
+                            backend_errors
+                                .borrow_mut()
+                                .remove(&BackendArea::SpeechVoice);
+                        }
+                        Err(error) => {
+                            backend_errors.borrow_mut().insert(
+                                BackendArea::SpeechVoice,
+                                format!("Couldn't save the voice: {error}"),
                             );
                         }
                     }
@@ -2187,6 +2337,7 @@ fn main() {
                     disclosure_needed(&current_state(
                         &settings_store,
                         &dependency_outcome.borrow(),
+                        &[],
                     ))
                 } else {
                     None
@@ -2331,8 +2482,12 @@ fn main() {
         // reason the virtual-microphone ensure uses it: this must happen
         // even on a run where the Tokio runtime would not start.
         {
-            let request =
-                check_request(&current_state(&settings_store, &DependencyOutcome::Pending));
+            (*refresh_system_voices)(cx);
+            let request = check_request(&current_state(
+                &settings_store,
+                &DependencyOutcome::Pending,
+                &[],
+            ));
             let events = event_tx.clone();
             let deps_port = deps_port.clone();
             let check = cx.background_spawn(async move { deps_port.check(request, events) });
@@ -2410,7 +2565,7 @@ fn main() {
                         // not start a warm-up for the current one.
                         let for_current_selection = report.backend
                             == resolve_backend(
-                                &current_state(&settings_store, &DependencyOutcome::Pending)
+                                &current_state(&settings_store, &DependencyOutcome::Pending, &[])
                                     .backend_selection,
                             );
                         // A row the check now calls ready has nothing left
@@ -2565,8 +2720,11 @@ fn main() {
                             continue;
                         };
                         cx.update(|cx| {
-                            let state =
-                                current_state(&settings_store, &dependency_outcome.borrow());
+                            let state = current_state(
+                                &settings_store,
+                                &dependency_outcome.borrow(),
+                                &system_voices.borrow(),
+                            );
                             let work = tokio_bridge::spawn_blocking(cx, move || {
                                 // Generation *and* playback, on the blocking
                                 // pool: `play` blocks until the audio server

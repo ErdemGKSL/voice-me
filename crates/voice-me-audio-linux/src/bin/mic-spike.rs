@@ -176,8 +176,9 @@ impl TtsPort for StubTts {
     fn generate(
         &self,
         _text: &str,
-        _reference_clip: &Path,
+        _reference_clip: Option<&Path>,
         _language: &str,
+        _voice: Option<&str>,
     ) -> Result<AudioBuffer, VoiceMeError> {
         Ok(utterance_shaped())
     }

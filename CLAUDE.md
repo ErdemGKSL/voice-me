@@ -17,3 +17,7 @@ Project scaffold in progress — being defined step by step with BMAD-METHOD.
 ## Asking the user
 
 - Whenever a workflow or skill (BMAD checkpoints, HALTs with choices, Open Questions, split/keep decisions) asks the user to choose, use the `AskUserQuestion` tool — the Claude app's interactive question UI — instead of listing options in plain text. Put the recommended option first, marked "(Recommended)". Keep any summary or context in the message text; the choice itself goes through the tool.
+
+## Next run
+
+- **Read [`_bmad-output/implementation-artifacts/NEXT-RUN.md`](_bmad-output/implementation-artifacts/NEXT-RUN.md) before starting any work.** It lists what to fix to finish Story 3.12, which was stopped mid-review. Delete that file, and this section, once it is done.

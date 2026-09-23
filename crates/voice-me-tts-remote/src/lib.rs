@@ -174,9 +174,12 @@ impl<P: SpeechProvider> TtsPort for RemoteTtsAdapter<P> {
     fn generate(
         &self,
         text: &str,
-        reference_clip: &Path,
+        reference_clip: Option<&Path>,
         language: &str,
+        _voice: Option<&str>,
     ) -> Result<AudioBuffer, VoiceMeError> {
+        // A cloning provider: with no sample there is nothing to upload.
+        let reference_clip = reference_clip.ok_or(VoiceMeError::NoReferenceVoiceSample)?;
         let _held = lock_samples();
         self.generate_locked(text, reference_clip, language)
     }

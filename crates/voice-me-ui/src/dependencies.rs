@@ -553,6 +553,7 @@ fn slug(kind: DependencyKind) -> &'static str {
         DependencyKind::ModelWeights => "model-weights",
         DependencyKind::VirtualMicrophone => "virtual-microphone",
         DependencyKind::BackendCapability => "backend-capability",
+        DependencyKind::SystemVoiceEngine => "system-voice-engine",
     }
 }
 

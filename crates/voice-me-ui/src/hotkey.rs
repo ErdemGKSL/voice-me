@@ -657,6 +657,14 @@ mod tests {
             unimplemented!("not exercised by these tests")
         }
 
+        fn save_speech_voice(
+            &self,
+            _backend: voice_me_core::LanguageBackend,
+            _voice: Option<&str>,
+        ) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
         fn save_api_key(
             &self,
             _provider: voice_me_core::RemoteProvider,

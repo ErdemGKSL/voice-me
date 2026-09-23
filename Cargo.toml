@@ -15,6 +15,7 @@ members = [
   "crates/voice-me-notify-windows",
   "crates/voice-me-tts",
   "crates/voice-me-tts-remote",
+  "crates/voice-me-tts-system-linux",
   "crates/voice-me-deps",
   "crates/voice-me-tests",
 ]

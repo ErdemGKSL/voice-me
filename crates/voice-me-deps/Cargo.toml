@@ -36,6 +36,9 @@ ash = { version = "0.38", default-features = false, features = ["loaded", "std"]
 # already owns every line of PipeWire knowledge, never detected a second
 # time here. Story 3.2's Install reuses its idempotent `install()`.
 voice-me-audio-linux = { path = "../voice-me-audio-linux" }
+# Story 3.12: whether `espeak-ng` is on PATH, and the distribution's install
+# command, are *asked of* the crate that runs it — the same rule as above.
+voice-me-tts-system-linux = { path = "../voice-me-tts-system-linux" }
 
 [dev-dependencies]
 tempfile = "3.14"

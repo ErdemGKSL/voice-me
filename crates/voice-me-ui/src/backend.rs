@@ -5,7 +5,8 @@
 //! one backend of that kind from a `Select`. Below that it shows only the
 //! *saved* backend's options: the provider's masked key and held voice
 //! sample for a remote one, each below that backend's speech language
-//! (Story 3.11). Last come the *Selected* and *Active* lines,
+//! (Story 3.11), and for the System voice a voice picker when its language
+//! has several voices (Story 3.12). Last come the *Selected* and *Active* lines,
 //! kept as two separate facts, the "CPU mode" tag and the restart line.
 //!
 //! Flipping Local ↔ Remote only changes what the tab shows (Decision 1):
@@ -46,7 +47,8 @@ use gpui_kit::{
 };
 use voice_me_core::{
     ActiveBackend, ApiKeys, BackendSelection, CheckRequest, LanguageBackend, LocalRuntime,
-    RemoteProvider, RemoteSample, SpeechLanguages, backend_choices,
+    RemoteProvider, RemoteSample, SpeechLanguages, SpeechVoices, SystemVoice, backend_choices,
+    system_voices_of,
 };
 
 /// Something the user asked of the backend. The views only *ask*; the
@@ -72,6 +74,9 @@ pub enum BackendAction {
     DeleteRemoteSample(RemoteProvider),
     /// Save this backend's speech language (Story 3.11).
     SetSpeechLanguage(LanguageBackend, String),
+    /// Save this backend's voice, or `None` for its language's top-priority
+    /// one (Story 3.12).
+    SetSpeechVoice(LanguageBackend, Option<String>),
 }
 
 /// Written by hand so a key typed into a key field can never reach a log
@@ -99,6 +104,11 @@ impl std::fmt::Debug for BackendAction {
                 .field(backend)
                 .field(code)
                 .finish(),
+            BackendAction::SetSpeechVoice(backend, voice) => f
+                .debug_tuple("SetSpeechVoice")
+                .field(backend)
+                .field(voice)
+                .finish(),
         }
     }
 }
@@ -119,6 +129,8 @@ pub enum BackendArea {
     RemoteSample(RemoteProvider),
     /// The saved backend's speech language (Story 3.11).
     SpeechLanguage,
+    /// The saved backend's voice (Story 3.12).
+    SpeechVoice,
 }
 
 /// Everything the Backend and Dependencies tabs show about the backend, as
@@ -144,6 +156,11 @@ pub struct BackendPanel {
     pub deleting_samples: Vec<RemoteProvider>,
     /// Each backend's saved speech language (Story 3.11).
     pub speech_languages: SpeechLanguages,
+    /// Each backend's saved voice (Story 3.12).
+    pub speech_voices: SpeechVoices,
+    /// The voices the System voice's engine listed at the last check that
+    /// had it selected (Story 3.12). Not persisted; held by the root.
+    pub system_voices: Vec<SystemVoice>,
 }
 
 impl Default for BackendPanel {
@@ -160,6 +177,8 @@ impl Default for BackendPanel {
             remote_samples: Vec::new(),
             deleting_samples: Vec::new(),
             speech_languages: SpeechLanguages::default(),
+            speech_voices: SpeechVoices::default(),
+            system_voices: Vec::new(),
         }
     }
 }
@@ -184,7 +203,7 @@ impl BackendKind {
 
     fn of(selection: &BackendSelection) -> Self {
         match selection {
-            BackendSelection::Local { .. } => BackendKind::Local,
+            BackendSelection::Local { .. } | BackendSelection::SystemVoice => BackendKind::Local,
             BackendSelection::Remote(_) => BackendKind::Remote,
         }
     }
@@ -244,12 +263,12 @@ impl gpui_kit::component::searchable_list::SearchableListItem for BackendChoice 
 /// the English name the user reads.
 #[derive(Clone)]
 struct LanguageChoice {
-    code: &'static str,
+    code: String,
     label: SharedString,
 }
 
 impl gpui_kit::component::searchable_list::SearchableListItem for LanguageChoice {
-    type Value = &'static str;
+    type Value = String;
 
     fn title(&self) -> SharedString {
         self.label.clone()
@@ -260,11 +279,15 @@ impl gpui_kit::component::searchable_list::SearchableListItem for LanguageChoice
     }
 }
 
-/// The speech languages `backend` lists, in its own order.
-fn language_choices(backend: LanguageBackend) -> Vec<LanguageChoice> {
+/// The speech languages `backend` lists, in its own order — for the System
+/// voice, the languages of the voices its engine listed.
+fn language_choices(
+    backend: LanguageBackend,
+    system_voices: &[SystemVoice],
+) -> Vec<LanguageChoice> {
     backend
-        .speech_languages()
-        .iter()
+        .language_options(system_voices)
+        .into_iter()
         .map(|language| LanguageChoice {
             code: language.code,
             label: language.label.into(),
@@ -275,12 +298,67 @@ fn language_choices(backend: LanguageBackend) -> Vec<LanguageChoice> {
 /// The code of `backend`'s saved language, if it is one `backend` speaks.
 /// A value outside the set is `None` — the `Select` then shows its
 /// placeholder — never a stand-in.
-fn saved_language_code(panel: &BackendPanel, backend: LanguageBackend) -> Option<&'static str> {
+fn saved_language_code(panel: &BackendPanel, backend: LanguageBackend) -> Option<String> {
     panel
         .speech_languages
         .get(backend)
-        .and_then(|saved| backend.speech_language(saved))
-        .map(|language| language.code)
+        .and_then(|saved| backend.resolve_language(saved, &panel.system_voices))
+}
+
+/// One entry of the voice `Select` (Story 3.12).
+#[derive(Clone)]
+struct VoiceChoice {
+    id: String,
+    label: SharedString,
+}
+
+impl gpui_kit::component::searchable_list::SearchableListItem for VoiceChoice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.id
+    }
+}
+
+/// What the voice picker shows for the saved System voice language: its
+/// voices, top priority first, and which one is in effect — the stored one
+/// if it is one of them, the top-priority one when none is stored, and
+/// `None` (the placeholder) for a stored voice that is not the language's.
+/// `None` altogether when the saved language is not one listed.
+struct VoicePick {
+    choices: Vec<VoiceChoice>,
+    selected: Option<String>,
+}
+
+fn voice_pick(panel: &BackendPanel) -> Option<VoicePick> {
+    let backend = LanguageBackend::SystemVoice;
+    if panel.selection.language_backend() != backend {
+        return None;
+    }
+    let code = saved_language_code(panel, backend)?;
+    let voices = system_voices_of(&panel.system_voices, &code);
+    let stored = panel.speech_voices.get(backend);
+    let selected = match stored {
+        None => voices.first().map(|voice| voice.id.clone()),
+        Some(id) => voices
+            .iter()
+            .find(|voice| voice.id == id)
+            .map(|voice| voice.id.clone()),
+    };
+    Some(VoicePick {
+        choices: voices
+            .into_iter()
+            .map(|voice| VoiceChoice {
+                id: voice.id.clone(),
+                label: voice.name.clone().into(),
+            })
+            .collect(),
+        selected,
+    })
 }
 
 /// The existing backends of one kind: the bundled CPU entry and each added
@@ -308,6 +386,9 @@ pub struct BackendView {
     language_select: Entity<SelectState<Vec<LanguageChoice>>>,
     /// Whose languages `language_select` currently lists.
     language_backend: LanguageBackend,
+    /// The System voice's voice (Story 3.12), shown when its language has
+    /// several voices.
+    voice_select: Entity<SelectState<Vec<VoiceChoice>>>,
     key_inputs: Vec<(RemoteProvider, Entity<InputState>)>,
     /// A panel (or kind) change since the last render that still has to
     /// reach the `Select` and the inputs — which need the window, and so
@@ -318,6 +399,11 @@ pub struct BackendView {
     /// The language `Select` needs its items or value brought in line with
     /// the panel at the next render.
     language_stale: bool,
+    /// The System voice's list changed, so the language items are rebuilt
+    /// even though the backend did not change.
+    language_items_stale: bool,
+    /// The voice `Select` needs its items and value brought in line.
+    voice_stale: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -345,7 +431,7 @@ impl BackendView {
         });
 
         let language_backend = panel.selection.language_backend();
-        let language_items = language_choices(language_backend);
+        let language_items = language_choices(language_backend, &panel.system_voices);
         let language_selected = saved_language_code(&panel, language_backend).and_then(|code| {
             language_items
                 .iter()
@@ -364,9 +450,40 @@ impl BackendView {
             if backend != this.language_backend {
                 return;
             }
-            if Some(*code) != saved_language_code(&this.panel, backend) {
+            if Some(code) != saved_language_code(&this.panel, backend).as_ref() {
+                this.act(BackendAction::SetSpeechLanguage(backend, code.clone()), cx);
+            }
+        });
+
+        let pick = voice_pick(&panel);
+        let (voice_items, voice_selected) = match pick {
+            Some(pick) => {
+                let index = pick.selected.as_ref().and_then(|id| {
+                    pick.choices
+                        .iter()
+                        .position(|choice| &choice.id == id)
+                        .map(IndexPath::new)
+                });
+                (pick.choices, index)
+            }
+            None => (Vec::new(), None),
+        };
+        let voice_select = cx.new(|cx| SelectState::new(voice_items, voice_selected, window, cx));
+        let voice_subscription = cx.subscribe(&voice_select, |this, _select, event, cx| {
+            let SelectEvent::Confirm(Some(id)) = event else {
+                return;
+            };
+            // The voice in effect — the stored one, or the top-priority one
+            // with none stored — is not a change.
+            let Some(pick) = voice_pick(&this.panel) else {
+                return;
+            };
+            if !pick.choices.iter().any(|choice| &choice.id == id) {
+                return;
+            }
+            if pick.selected.as_ref() != Some(id) {
                 this.act(
-                    BackendAction::SetSpeechLanguage(backend, code.to_string()),
+                    BackendAction::SetSpeechVoice(LanguageBackend::SystemVoice, Some(id.clone())),
                     cx,
                 );
             }
@@ -393,12 +510,15 @@ impl BackendView {
             backend_select,
             language_select,
             language_backend,
+            voice_select,
             key_inputs,
             panel_stale: false,
             keys_stale: false,
             items_stale: false,
             language_stale: false,
-            _subscriptions: vec![subscription, language_subscription],
+            language_items_stale: false,
+            voice_stale: false,
+            _subscriptions: vec![subscription, language_subscription, voice_subscription],
         }
     }
 
@@ -416,9 +536,19 @@ impl BackendView {
         let selection_failed = panel.errors.contains_key(&BackendArea::Selection);
         // The same for the language `Select`: a failed save leaves the
         // picked language showing until it is resynced to the saved one.
+        let voices_changed = panel.system_voices != self.panel.system_voices;
+        self.language_items_stale |= voices_changed;
         self.language_stale |= panel.speech_languages != self.panel.speech_languages
             || panel.selection.language_backend() != self.language_backend
+            || voices_changed
             || panel.errors.contains_key(&BackendArea::SpeechLanguage);
+        // Story 3.12: the same for the voice `Select`, which follows the
+        // language as well as the stored voice.
+        self.voice_stale |= panel.speech_voices != self.panel.speech_voices
+            || panel.speech_languages != self.panel.speech_languages
+            || panel.selection != self.panel.selection
+            || voices_changed
+            || panel.errors.contains_key(&BackendArea::SpeechVoice);
 
         // Decision 1: the kind follows the saved selection when it changes.
         if selection_changed {
@@ -471,7 +601,9 @@ impl BackendView {
             return;
         }
         let backend = self.panel.selection.language_backend();
-        let items = (backend != self.language_backend).then(|| language_choices(backend));
+        let rebuild =
+            backend != self.language_backend || std::mem::take(&mut self.language_items_stale);
+        let items = rebuild.then(|| language_choices(backend, &self.panel.system_voices));
         self.language_backend = backend;
         let saved = saved_language_code(&self.panel, backend);
         self.language_select.update(cx, |select, cx| {
@@ -485,9 +617,41 @@ impl BackendView {
         });
     }
 
+    /// Bring the voice `Select` in line with the panel: the saved System
+    /// voice language's voices, with the one in effect chosen.
+    fn sync_voice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.voice_stale) {
+            return;
+        }
+        let (items, selected) = match voice_pick(&self.panel) {
+            Some(pick) => (pick.choices, pick.selected),
+            None => (Vec::new(), None),
+        };
+        self.voice_select.update(cx, |select, cx| {
+            select.set_items(items, window, cx);
+            match selected {
+                Some(id) => select.set_selected_value(&id, window, cx),
+                None => select.set_selected_index(None, window, cx),
+            }
+        });
+    }
+
+    /// Whether the voice picker is shown: the System voice is the saved
+    /// backend, its kind is shown, and its language has several voices —
+    /// or a stored voice that is not the language's, which has to be
+    /// fixable from here.
+    fn shows_voice_picker(&self) -> bool {
+        if self.shown_language_backend() != Some(LanguageBackend::SystemVoice) {
+            return false;
+        }
+        voice_pick(&self.panel)
+            .is_some_and(|pick| pick.choices.len() > 1 || pick.selected.is_none())
+    }
+
     /// Bring the `Select` and the key inputs in line with the panel.
     fn sync_controls(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_language(window, cx);
+        self.sync_voice(window, cx);
         if !self.panel_stale {
             return;
         }
@@ -630,11 +794,16 @@ impl BackendView {
         let language = self
             .shown_language_backend()
             .map(|backend| self.speech_language_section(backend, cx));
+        // Story 3.12: the System voice's voice, under its language.
+        let voice = self
+            .shows_voice_picker()
+            .then(|| self.speech_voice_section(cx));
         match self.kind {
             BackendKind::Local => Some(
                 v_flex()
                     .gap_6()
                     .children(language)
+                    .children(voice)
                     .child(self.runtimes_section(cx))
                     .into_any_element(),
             ),
@@ -682,7 +851,18 @@ impl BackendView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let saved = self.panel.speech_languages.get(backend).unwrap_or_default();
-        let unknown = backend.speech_language(saved).is_none();
+        let unknown = saved_language_code(&self.panel, backend).is_none();
+        let note = if backend == LanguageBackend::SystemVoice && self.panel.system_voices.is_empty()
+        {
+            // Nothing listed is not the same as a wrong value.
+            "eSpeak NG has not listed its voices yet. See Settings → Dependencies.".to_string()
+        } else {
+            format!(
+                "The saved speech language {saved:?} is not one {} speaks. Choose one to speak \
+                 again.",
+                backend.label()
+            )
+        };
 
         v_flex()
             .id("backend-speech-language")
@@ -708,16 +888,57 @@ impl BackendView {
                         .test_support()
                         .text_size(px(12.))
                         .text_color(cx.theme().muted_foreground)
-                        .child(format!(
-                            "The saved speech language {saved:?} is not one {} speaks. \
-                             Choose one to speak again.",
-                            backend.label()
-                        )),
+                        .child(note),
                 )
             })
             .when_some(
                 self.panel.errors.get(&BackendArea::SpeechLanguage).cloned(),
                 |el, error| el.child(error_line("backend-speech-language-error", error, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// Story 3.12: the System voice's voice for its saved language, with a
+    /// note when the stored voice is not one of that language's, and a
+    /// failed save inline.
+    fn speech_voice_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        let stored = self
+            .panel
+            .speech_voices
+            .get(LanguageBackend::SystemVoice)
+            .map(str::to_string);
+        let unknown = voice_pick(&self.panel).is_some_and(|pick| pick.selected.is_none());
+
+        v_flex()
+            .id("backend-speech-voice")
+            .test_support()
+            .gap_1()
+            .child(div().font_weight(FontWeight::MEDIUM).child("Voice"))
+            .child(
+                Select::new(&self.voice_select)
+                    .id("backend-speech-voice-select")
+                    .accessibility_label("Voice")
+                    .placeholder("Choose a voice")
+                    .menu_width(px(360.))
+                    .w(px(360.)),
+            )
+            .when(unknown, |el| {
+                el.child(
+                    div()
+                        .id("backend-speech-voice-note")
+                        .test_support()
+                        .text_size(px(12.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!(
+                            "The saved voice {:?} is not one of this language's. Choose one to \
+                             speak again.",
+                            stored.unwrap_or_default()
+                        )),
+                )
+            })
+            .when_some(
+                self.panel.errors.get(&BackendArea::SpeechVoice).cloned(),
+                |el, error| el.child(error_line("backend-speech-voice-error", error, cx)),
             )
             .into_any_element()
     }
@@ -844,6 +1065,15 @@ impl BackendView {
                                 .id("backend-cpu-mode")
                                 .test_support()
                                 .child(Tag::secondary().small().child("CPU mode")),
+                        )
+                    })
+                    // Story 3.12: speech in a stock voice, not the user's.
+                    .when(panel.selection.is_stock_voice(), |el| {
+                        el.child(
+                            div()
+                                .id("backend-stock-voice")
+                                .test_support()
+                                .child(Tag::secondary().small().child("Stock voice")),
                         )
                     }),
             )
@@ -1552,7 +1782,8 @@ mod tests {
             .map(|choice| choice.selection)
             .collect();
         assert_eq!(local[0], BackendSelection::BUNDLED_CPU);
-        assert_eq!(local[1..], runtimes[0].entries()[..]);
+        assert_eq!(local[1..local.len() - 1], runtimes[0].entries()[..]);
+        assert_eq!(local.last(), Some(&BackendSelection::SystemVoice));
         let remote: Vec<_> = choices(BackendKind::Remote, &runtimes)
             .into_iter()
             .map(|choice| choice.selection)
@@ -1874,13 +2105,14 @@ mod tests {
             speech_languages: SpeechLanguages {
                 local: local.to_string(),
                 deepinfra: deepinfra.to_string(),
+                ..SpeechLanguages::default()
             },
             ..panel
         }
     }
 
-    fn codes(backend: LanguageBackend) -> Vec<&'static str> {
-        language_choices(backend)
+    fn codes(backend: LanguageBackend) -> Vec<String> {
+        language_choices(backend, &[])
             .into_iter()
             .map(|choice| choice.code)
             .collect()
@@ -1901,11 +2133,11 @@ mod tests {
             assert_eq!(view.read(cx).language_backend, LanguageBackend::Local);
             assert_eq!(codes(LanguageBackend::Local), vec!["tr", "en"]);
             let select = view.read(cx).language_select.clone();
-            assert_eq!(select.read(cx).selected_value(), Some(&"tr"));
+            assert_eq!(select.read(cx).selected_value(), Some(&"tr".to_string()));
 
             // Only Local's languages are among the items.
             select.update(cx, |select, cx| {
-                select.set_selected_value(&"es", window, cx)
+                select.set_selected_value(&"es".to_string(), window, cx)
             });
             assert_eq!(select.read(cx).selected_value(), None);
         })
@@ -1918,7 +2150,7 @@ mod tests {
             window.render_frame(cx);
             assert_eq!(
                 view.read(cx).language_select.read(cx).selected_value(),
-                Some(&"en")
+                Some(&"en".to_string())
             );
         })
         .unwrap();
@@ -1939,11 +2171,11 @@ mod tests {
             assert_eq!(view.read(cx).language_backend, backend);
             assert_eq!(codes(backend).len(), 23);
             let select = view.read(cx).language_select.clone();
-            assert_eq!(select.read(cx).selected_value(), Some(&"en"));
+            assert_eq!(select.read(cx).selected_value(), Some(&"en".to_string()));
             select.update(cx, |select, cx| {
-                select.set_selected_value(&"es", window, cx)
+                select.set_selected_value(&"es".to_string(), window, cx)
             });
-            assert_eq!(select.read(cx).selected_value(), Some(&"es"));
+            assert_eq!(select.read(cx).selected_value(), Some(&"es".to_string()));
         })
         .unwrap();
     }
@@ -1969,7 +2201,7 @@ mod tests {
             );
             assert_eq!(
                 view.read(cx).language_select.read(cx).selected_value(),
-                Some(&"es")
+                Some(&"es".to_string())
             );
 
             view.update(cx, |view, cx| {
@@ -1978,7 +2210,7 @@ mod tests {
             window.render_frame(cx);
             assert_eq!(
                 view.read(cx).language_select.read(cx).selected_value(),
-                Some(&"en")
+                Some(&"en".to_string())
             );
         })
         .unwrap();
@@ -1995,8 +2227,8 @@ mod tests {
             window.render_frame(cx);
             let select = view.read(cx).language_select.clone();
             select.update(cx, |_, cx| {
-                cx.emit(SelectEvent::Confirm(Some("en")));
-                cx.emit(SelectEvent::Confirm(Some("es")));
+                cx.emit(SelectEvent::Confirm(Some("en".to_string())));
+                cx.emit(SelectEvent::Confirm(Some("es".to_string())));
             });
         })
         .unwrap();
@@ -2059,7 +2291,9 @@ mod tests {
 
             // Picking a real one is a change, and is sent.
             let select = view.read(cx).language_select.clone();
-            select.update(cx, |_, cx| cx.emit(SelectEvent::Confirm(Some("tr"))));
+            select.update(cx, |_, cx| {
+                cx.emit(SelectEvent::Confirm(Some("tr".to_string())))
+            });
         })
         .unwrap();
         cx.run_until_parked();
@@ -2083,7 +2317,7 @@ mod tests {
             window.render_frame(cx);
             let select = view.read(cx).language_select.clone();
             select.update(cx, |select, cx| {
-                select.set_selected_value(&"en", window, cx)
+                select.set_selected_value(&"en".to_string(), window, cx)
             });
             let mut panel = BackendPanel::default();
             panel
@@ -2092,7 +2326,257 @@ mod tests {
             view.update(cx, |view, cx| view.set_backend_panel(panel, cx));
             window.render_frame(cx);
             assert!(window.try_find("backend-speech-language-error").is_some());
-            assert_eq!(select.read(cx).selected_value(), Some(&"tr"));
+            assert_eq!(select.read(cx).selected_value(), Some(&"tr".to_string()));
+        })
+        .unwrap();
+    }
+
+    fn espeak_voice(id: &str, language: &str, name: &str) -> SystemVoice {
+        SystemVoice {
+            id: id.to_string(),
+            language: language.to_string(),
+            name: name.to_string(),
+            priority: 5,
+        }
+    }
+
+    /// The System voice saved, speaking `language` with `voice` stored,
+    /// against a small eSpeak-shaped list.
+    fn system_voice_panel(language: &str, voice: Option<&str>) -> BackendPanel {
+        BackendPanel {
+            selection: BackendSelection::SystemVoice,
+            speech_languages: SpeechLanguages {
+                system_voice: language.to_string(),
+                ..SpeechLanguages::default()
+            },
+            speech_voices: SpeechVoices {
+                system_voice: voice.map(str::to_string),
+            },
+            system_voices: vec![
+                espeak_voice("gmw/en-US", "en-us", "English (America)"),
+                espeak_voice("trk/tr", "tr", "Turkish"),
+                espeak_voice("sit/yue", "yue", "Chinese (Cantonese)"),
+                espeak_voice(
+                    "sit/yue-Latn-jyutping",
+                    "yue",
+                    "Chinese (Cantonese, latin as Jyutping)",
+                ),
+            ],
+            ..BackendPanel::default()
+        }
+    }
+
+    const JYUTPING: &str = "sit/yue-Latn-jyutping";
+
+    /// Story 3.12, Several voices: the language `Select` lists the
+    /// engine's languages, the voice picker lists yue's two voices with
+    /// the top-priority one selected, and Selected carries the Stock voice
+    /// tag instead of CPU mode.
+    #[gpui_kit::test]
+    fn several_voices_show_the_picker_with_the_default_selected(cx: &mut TestAppContext) {
+        let (window, view, recorded) = open_backend_tab(cx, system_voice_panel("yue", None));
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).kind, BackendKind::Local);
+            assert_eq!(
+                view.read(cx).backend_select.read(cx).selected_value(),
+                Some(&BackendSelection::SystemVoice)
+            );
+            assert!(window.try_find("backend-stock-voice").is_some());
+            assert!(window.try_find("backend-cpu-mode").is_none());
+            assert!(window.try_find("backend-speech-language").is_some());
+            assert!(window.try_find("backend-speech-language-note").is_none());
+            assert_eq!(
+                view.read(cx).language_select.read(cx).selected_value(),
+                Some(&"yue".to_string())
+            );
+            assert!(window.try_find("backend-speech-voice").is_some());
+            assert!(window.try_find("backend-speech-voice-select").is_some());
+            assert!(window.try_find("backend-speech-voice-note").is_none());
+            let voice = view.read(cx).voice_select.clone();
+            assert_eq!(
+                voice.read(cx).selected_value(),
+                Some(&"sit/yue".to_string())
+            );
+            // Both of yue's voices are among the items, and nothing else.
+            voice.update(cx, |select, cx| {
+                select.set_selected_value(&JYUTPING.to_string(), window, cx);
+            });
+            assert_eq!(voice.read(cx).selected_value(), Some(&JYUTPING.to_string()));
+            voice.update(cx, |select, cx| {
+                select.set_selected_value(&"trk/tr".to_string(), window, cx);
+            });
+            assert_eq!(voice.read(cx).selected_value(), None);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        assert!(
+            recorded.borrow().is_empty(),
+            "showing the picker saves nothing"
+        );
+    }
+
+    /// A language with one voice has no picker.
+    #[gpui_kit::test]
+    fn a_single_voice_hides_the_picker(cx: &mut TestAppContext) {
+        let (window, view, _recorded) = open_backend_tab(cx, system_voice_panel("tr", None));
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("backend-speech-language").is_some());
+            assert_eq!(
+                view.read(cx).language_select.read(cx).selected_value(),
+                Some(&"tr".to_string())
+            );
+            assert!(window.try_find("backend-speech-voice").is_none());
+            assert!(window.try_find("backend-stock-voice").is_some());
+        })
+        .unwrap();
+    }
+
+    /// The Pick a voice row: another voice is sent once; re-confirming the
+    /// one in effect (the unset default) sends nothing.
+    #[gpui_kit::test]
+    fn picking_a_voice_asks_the_root_once(cx: &mut TestAppContext) {
+        let (window, view, recorded) = open_backend_tab(cx, system_voice_panel("yue", None));
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let voice = view.read(cx).voice_select.clone();
+            voice.update(cx, |_, cx| {
+                cx.emit(SelectEvent::Confirm(Some("sit/yue".to_string())));
+                cx.emit(SelectEvent::Confirm(Some(JYUTPING.to_string())));
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            *recorded.borrow(),
+            vec![BackendAction::SetSpeechVoice(
+                LanguageBackend::SystemVoice,
+                Some(JYUTPING.to_string())
+            )]
+        );
+
+        // The root saved it: the picker follows, and re-picking it sends
+        // nothing more.
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_backend_panel(system_voice_panel("yue", Some(JYUTPING)), cx)
+            });
+            window.render_frame(cx);
+            let voice = view.read(cx).voice_select.clone();
+            assert_eq!(voice.read(cx).selected_value(), Some(&JYUTPING.to_string()));
+            voice.update(cx, |_, cx| {
+                cx.emit(SelectEvent::Confirm(Some(JYUTPING.to_string())))
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(recorded.borrow().len(), 1);
+    }
+
+    /// The Change language row: picking a language sends only the language
+    /// action — the root clears the voice — and once saved, a one-voice
+    /// language hides the picker.
+    #[gpui_kit::test]
+    fn a_language_change_sends_only_the_language_action(cx: &mut TestAppContext) {
+        let (window, view, recorded) =
+            open_backend_tab(cx, system_voice_panel("yue", Some(JYUTPING)));
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let language = view.read(cx).language_select.clone();
+            language.update(cx, |_, cx| {
+                cx.emit(SelectEvent::Confirm(Some("tr".to_string())))
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            *recorded.borrow(),
+            vec![BackendAction::SetSpeechLanguage(
+                LanguageBackend::SystemVoice,
+                "tr".to_string()
+            )]
+        );
+
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_backend_panel(system_voice_panel("tr", None), cx)
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("backend-speech-voice").is_none());
+            assert_eq!(
+                view.read(cx).language_select.read(cx).selected_value(),
+                Some(&"tr".to_string())
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(recorded.borrow().len(), 1, "the resync sends nothing");
+    }
+
+    /// The Out of set row in the tab: a stored voice that is not the
+    /// language's leaves the picker on its placeholder with a note, even
+    /// for a one-voice language; an unlisted language gets the language
+    /// note; and a failed voice save is shown inline.
+    #[gpui_kit::test]
+    fn an_unlisted_voice_or_language_shows_the_placeholder_and_a_note(cx: &mut TestAppContext) {
+        let (window, view, _recorded) =
+            open_backend_tab(cx, system_voice_panel("tr", Some("sit/yue")));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("backend-speech-voice").is_some());
+            assert!(window.try_find("backend-speech-voice-note").is_some());
+            assert_eq!(view.read(cx).voice_select.read(cx).selected_value(), None);
+
+            let mut panel = system_voice_panel("yue", None);
+            panel
+                .errors
+                .insert(BackendArea::SpeechVoice, "Could not save.".to_string());
+            view.update(cx, |view, cx| view.set_backend_panel(panel, cx));
+            window.render_frame(cx);
+            assert!(window.try_find("backend-speech-voice-error").is_some());
+            assert!(window.try_find("backend-speech-voice-note").is_none());
+        })
+        .unwrap();
+
+        let (window, view, _recorded) = open_backend_tab(cx, system_voice_panel("xx", None));
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                view.read(cx).language_select.read(cx).selected_value(),
+                None
+            );
+            assert!(window.try_find("backend-speech-language-note").is_some());
+            assert!(window.try_find("backend-speech-voice").is_none());
+        })
+        .unwrap();
+
+        // Nothing listed yet (the check has not run): the language note,
+        // no picker, and the list arriving later fills the `Select`.
+        let empty = BackendPanel {
+            system_voices: Vec::new(),
+            ..system_voice_panel("tr", None)
+        };
+        let (window, view, _recorded) = open_backend_tab(cx, empty);
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("backend-speech-language-note").is_some());
+            view.update(cx, |view, cx| {
+                view.set_backend_panel(system_voice_panel("tr", None), cx)
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("backend-speech-language-note").is_none());
+            assert_eq!(
+                view.read(cx).language_select.read(cx).selected_value(),
+                Some(&"tr".to_string())
+            );
         })
         .unwrap();
     }

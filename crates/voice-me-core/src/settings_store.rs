@@ -17,7 +17,7 @@ use crate::ports::SettingsStore;
 use crate::state::{
     ActiveBackend, ApiKeys, AppState, BackendSelection, DEFAULT_SPEECH_LANGUAGE, DependencyOutcome,
     LanguageBackend, LocalRuntime, RemoteProvider, RemoteSample, SpeechBackend,
-    SpeechExecutionTarget, SpeechLanguages,
+    SpeechExecutionTarget, SpeechLanguages, SpeechVoices,
 };
 
 const SETTINGS_FILE_NAME: &str = "settings.toml";
@@ -45,6 +45,10 @@ struct SettingsFile {
     /// an unreadable one falls back to its default, not the whole file.
     #[serde(default, deserialize_with = "lenient_languages")]
     speech_languages: SpeechLanguagesFile,
+    /// Story 3.12: the voice of each backend with a voice choice. Lenient
+    /// like the languages; an absent entry is the top-priority voice.
+    #[serde(default, deserialize_with = "lenient_voices")]
+    speech_voices: SpeechVoicesFile,
     #[serde(default)]
     selected_mic_device: Option<String>,
     /// Story 3.5. Absent in files written before it — which load as the
@@ -110,6 +114,13 @@ struct SpeechLanguagesFile {
         skip_serializing_if = "Option::is_none"
     )]
     deepinfra: Option<String>,
+    /// Story 3.12. Never seeded by the legacy key.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    system_voice: Option<String>,
 }
 
 impl SpeechLanguagesFile {
@@ -118,6 +129,7 @@ impl SpeechLanguagesFile {
             LanguageBackend::Local => Some(&mut self.local),
             LanguageBackend::Remote(RemoteProvider::DeepInfra) => Some(&mut self.deepinfra),
             LanguageBackend::Remote(RemoteProvider::FalAi) => None,
+            LanguageBackend::SystemVoice => Some(&mut self.system_voice),
         }
     }
 
@@ -127,6 +139,40 @@ impl SpeechLanguagesFile {
         SpeechLanguages {
             local: or_default(&self.local),
             deepinfra: or_default(&self.deepinfra),
+            system_voice: or_default(&self.system_voice),
+        }
+    }
+}
+
+/// How [`SpeechVoices`] is written to TOML (Story 3.12):
+///
+/// ```toml
+/// [speech_voices]
+/// system_voice = "sit/yue-Latn-jyutping"
+/// ```
+///
+/// An absent key is the language's top-priority voice.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SpeechVoicesFile {
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    system_voice: Option<String>,
+}
+
+impl SpeechVoicesFile {
+    fn entry(&mut self, backend: LanguageBackend) -> Option<&mut Option<String>> {
+        match backend {
+            LanguageBackend::SystemVoice => Some(&mut self.system_voice),
+            _ => None,
+        }
+    }
+
+    fn to_state(&self) -> SpeechVoices {
+        SpeechVoices {
+            system_voice: self.system_voice.clone(),
         }
     }
 }
@@ -153,6 +199,8 @@ enum SelectionFile {
     Remote {
         provider: RemoteProvider,
     },
+    /// Story 3.12.
+    SystemVoice,
 }
 
 impl From<&BackendSelection> for SelectionFile {
@@ -165,6 +213,7 @@ impl From<&BackendSelection> for SelectionFile {
             BackendSelection::Remote(provider) => SelectionFile::Remote {
                 provider: *provider,
             },
+            BackendSelection::SystemVoice => SelectionFile::SystemVoice,
         }
     }
 }
@@ -174,6 +223,7 @@ impl From<SelectionFile> for BackendSelection {
         match file {
             SelectionFile::Local { runtime, target } => BackendSelection::Local { runtime, target },
             SelectionFile::Remote { provider } => BackendSelection::Remote(provider),
+            SelectionFile::SystemVoice => BackendSelection::SystemVoice,
         }
     }
 }
@@ -209,6 +259,14 @@ where
     Ok(lenient(deserializer)?.unwrap_or_default())
 }
 
+/// The same leniency for the voice table.
+fn lenient_voices<'de, D>(deserializer: D) -> Result<SpeechVoicesFile, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(lenient(deserializer)?.unwrap_or_default())
+}
+
 /// The same leniency per entry: one unreadable runtime drops out of the
 /// list without taking the others with it.
 fn lenient_list<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
@@ -237,7 +295,9 @@ impl Default for SettingsFile {
             speech_languages: SpeechLanguagesFile {
                 local: Some(DEFAULT_SPEECH_LANGUAGE.to_string()),
                 deepinfra: Some(DEFAULT_SPEECH_LANGUAGE.to_string()),
+                system_voice: Some(DEFAULT_SPEECH_LANGUAGE.to_string()),
             },
+            speech_voices: SpeechVoicesFile::default(),
             selected_mic_device: None,
             backend_selection: None,
             local_runtimes: Vec::new(),
@@ -312,6 +372,12 @@ impl FileSettingsStore {
                 );
             }
         }
+        // Story 3.12: the System voice starts at the default, whatever the
+        // legacy key said.
+        settings
+            .speech_languages
+            .system_voice
+            .get_or_insert_with(|| DEFAULT_SPEECH_LANGUAGE.to_string());
         Ok(settings)
     }
 
@@ -338,6 +404,7 @@ impl FileSettingsStore {
             reference_voice_sample: existing_path(&sample_path),
             ui_language: settings.ui_language,
             speech_languages: settings.speech_languages.to_state(),
+            speech_voices: settings.speech_voices.to_state(),
             selected_mic_device: settings.selected_mic_device,
             // Not persisted: the composition root overwrites it with the
             // backend the selection below resolves to (AD-9).
@@ -358,6 +425,8 @@ impl FileSettingsStore {
             // that may have changed since. The composition root merges in
             // whatever the latest live check found.
             dependencies: DependencyOutcome::default(),
+            // Read from the engine by the composition root, never a file.
+            system_voices: Vec::new(),
         }
     }
 }
@@ -438,7 +507,30 @@ impl SettingsStore for FileSettingsStore {
                 backend.label()
             )));
         };
+        let changed = entry.as_deref() != Some(code);
         *entry = Some(code.to_string());
+        // Story 3.12: a voice belongs to one language, so a new System
+        // voice language clears the stored voice.
+        if changed && let Some(voice) = settings.speech_voices.entry(backend) {
+            *voice = None;
+        }
+        self.write_settings_file(&settings)?;
+        Ok(self.build_state(settings))
+    }
+
+    fn save_speech_voice(
+        &self,
+        backend: LanguageBackend,
+        voice: Option<&str>,
+    ) -> Result<AppState, VoiceMeError> {
+        let mut settings = self.read_settings_file()?;
+        let Some(entry) = settings.speech_voices.entry(backend) else {
+            return Err(VoiceMeError::Other(format!(
+                "{} has no voice to save",
+                backend.label()
+            )));
+        };
+        *entry = voice.map(str::to_string);
         self.write_settings_file(&settings)?;
         Ok(self.build_state(settings))
     }
@@ -746,6 +838,80 @@ mod tests {
         let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
         assert_eq!(state.speech_languages, SpeechLanguages::default());
         assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
+    }
+
+    #[test]
+    fn the_system_voice_language_and_voice_round_trip_and_a_new_language_clears_the_voice() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = store_in(config_dir.path(), data_dir.path());
+        let state = store.load().unwrap();
+        assert_eq!(state.speech_languages.system_voice, "tr");
+        assert_eq!(state.speech_voices.system_voice, None);
+
+        store
+            .save_backend_selection(&BackendSelection::SystemVoice)
+            .unwrap();
+        store
+            .save_speech_language(LanguageBackend::SystemVoice, "yue")
+            .unwrap();
+        store
+            .save_speech_voice(LanguageBackend::SystemVoice, Some("sit/yue-Latn-jyutping"))
+            .unwrap();
+
+        let reloaded = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+        assert_eq!(reloaded.backend_selection, BackendSelection::SystemVoice);
+        assert_eq!(reloaded.speech_languages.system_voice, "yue");
+        assert_eq!(
+            reloaded.speech_voices.system_voice.as_deref(),
+            Some("sit/yue-Latn-jyutping")
+        );
+        assert_eq!(reloaded.speech_languages.local, "tr", "Local is untouched");
+        let written = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
+        assert!(written.contains("[speech_voices]"), "{written}");
+        assert!(written.contains("system_voice"), "{written}");
+
+        // Re-saving the same language keeps the voice; a new one clears it.
+        let same = store
+            .save_speech_language(LanguageBackend::SystemVoice, "yue")
+            .unwrap();
+        assert!(same.speech_voices.system_voice.is_some());
+        let state = store
+            .save_speech_language(LanguageBackend::SystemVoice, "tr")
+            .unwrap();
+        assert_eq!(state.speech_languages.system_voice, "tr");
+        assert_eq!(state.speech_voices.system_voice, None);
+        assert_eq!(
+            store_in(config_dir.path(), data_dir.path())
+                .load()
+                .unwrap()
+                .speech_voices
+                .system_voice,
+            None
+        );
+
+        // Only the System voice has a voice to save.
+        assert!(
+            store
+                .save_speech_voice(LanguageBackend::Local, Some("x"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_legacy_key_does_not_seed_the_system_voice() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_dir.path().join(SETTINGS_FILE_NAME),
+            "speech_language = \"en\"\n",
+        )
+        .unwrap();
+
+        let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+
+        assert_eq!(state.speech_languages.local, "en");
+        assert_eq!(state.speech_languages.system_voice, "tr");
     }
 
     #[test]

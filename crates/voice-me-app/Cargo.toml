@@ -31,6 +31,9 @@ voice-me-hotkey-linux = { path = "../voice-me-hotkey-linux" }
 voice-me-notify-linux = { path = "../voice-me-notify-linux" }
 # Story 2.9: the generated buffer is played through the Virtual Microphone.
 voice-me-audio-linux = { path = "../voice-me-audio-linux" }
+# Story 3.12: the System voice — eSpeak NG as a bounded child process.
+# Offline; Linux only (Windows is Story 3.13).
+voice-me-tts-system-linux = { path = "../voice-me-tts-system-linux" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 voice-me-tray-windows = { path = "../voice-me-tray-windows" }

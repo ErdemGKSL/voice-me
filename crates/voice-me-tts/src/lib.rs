@@ -237,8 +237,9 @@ impl TtsPort for TtsAdapter {
     fn generate(
         &self,
         text: &str,
-        reference_clip: &Path,
+        reference_clip: Option<&Path>,
         language: &str,
+        _voice: Option<&str>,
     ) -> Result<AudioBuffer, VoiceMeError> {
         // Both of these happen deliberately outside the lock. Rejecting
         // empty text before anything expensive is the I/O matrix's own rule,
@@ -247,6 +248,8 @@ impl TtsPort for TtsAdapter {
         if text.trim().is_empty() {
             return Err(VoiceMeError::EmptyText);
         }
+        // A cloning engine: with no sample there is no voice to clone.
+        let reference_clip = reference_clip.ok_or(VoiceMeError::NoReferenceVoiceSample)?;
         let reference = reference::load_reference_clip(reference_clip)?;
 
         self.sessions
@@ -532,12 +535,24 @@ mod tests {
         );
     }
 
+    /// Story 3.12: the port's sample became optional; this cloning engine
+    /// still needs one, and says so before any session work.
+    #[test]
+    fn no_reference_clip_is_refused_before_any_session_work() {
+        let (_dir, adapter) = adapter_over_an_empty_cache();
+
+        let error = adapter.generate("Merhaba", None, "tr", None).unwrap_err();
+
+        assert!(matches!(error, VoiceMeError::NoReferenceVoiceSample));
+        assert!(!adapter.is_ready());
+    }
+
     #[test]
     fn empty_text_is_rejected_before_any_session_work() {
         let (_dir, adapter) = adapter_over_an_empty_cache();
 
         let error = adapter
-            .generate("   ", Path::new("/data/reference.wav"), "tr")
+            .generate("   ", Some(Path::new("/data/reference.wav")), "tr", None)
             .unwrap_err();
 
         assert!(matches!(error, VoiceMeError::EmptyText));

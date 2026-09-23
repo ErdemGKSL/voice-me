@@ -137,6 +137,10 @@ impl DepsAdapter {
                 });
                 (self.virtual_mic_installer)()
             }
+            // A system package: its row has manual steps, never Install.
+            DependencyKind::SystemVoiceEngine => Err(VoiceMeError::Other(
+                "voice-me cannot install eSpeak NG; follow the steps on the row.".to_string(),
+            )),
             // Nothing to fetch: a backend that cannot run here is fixed by
             // choosing another one, which the row's own action does.
             DependencyKind::BackendCapability => Err(VoiceMeError::Other(
@@ -215,6 +219,9 @@ impl DependencyProvisioningPort for DepsAdapter {
                 request.selection.added_runtime(),
                 &self.sources,
             ),
+            // Story 3.12: the System voice's one engine row. It is not an
+            // ONNX target, so it has no runtime or model rows.
+            None if request.selection.is_stock_voice() => system_voice_rows(),
             None => Vec::new(),
         };
 
@@ -561,6 +568,30 @@ fn virtual_microphone_row() -> Option<Dependency> {
 #[cfg(not(target_os = "linux"))]
 fn virtual_microphone_row() -> Option<Dependency> {
     None
+}
+
+/// The System voice's engine row (Story 3.12): whether `espeak-ng` is on
+/// PATH, asked of the crate that runs it, with the distribution's install
+/// command when it is not.
+#[cfg(target_os = "linux")]
+fn system_voice_rows() -> Vec<Dependency> {
+    let found = voice_me_tts_system_linux::find_program();
+    let install = if found.is_some() {
+        String::new()
+    } else {
+        voice_me_tts_system_linux::install_step()
+    };
+    vec![capability::system_voice_engine_row(
+        found.as_deref(),
+        &install,
+    )]
+}
+
+/// Off Linux the capability row says the System voice cannot run yet; there
+/// is no engine to report on.
+#[cfg(not(target_os = "linux"))]
+fn system_voice_rows() -> Vec<Dependency> {
+    Vec::new()
 }
 
 /// Install reuses the audio crate's own idempotent `install()`: it ends
@@ -1050,6 +1081,45 @@ mod tests {
             )),
             "{:?}",
             report.dependencies
+        );
+    }
+
+    /// Story 3.12: the System voice reports its engine row and no ONNX
+    /// rows — on Linux, whatever this machine has; elsewhere, the
+    /// capability row instead.
+    #[test]
+    fn a_system_voice_selection_reports_its_engine_and_no_onnx_rows() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let report = check_with(
+            CheckRequest {
+                backend: SpeechBackend::CPU,
+                selection: voice_me_core::BackendSelection::SystemVoice,
+                has_api_key: false,
+            },
+            dir.path(),
+        );
+
+        assert!(
+            !report.dependencies.iter().any(|row| matches!(
+                row.kind,
+                DependencyKind::OnnxRuntime | DependencyKind::ModelWeights
+            )),
+            "{:?}",
+            report.dependencies
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let engine = row(&report.dependencies, DependencyKind::SystemVoiceEngine);
+            assert_eq!(
+                engine.status.is_missing(),
+                voice_me_tts_system_linux::find_program().is_none()
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            report.dependencies[0].kind,
+            DependencyKind::BackendCapability
         );
     }
 

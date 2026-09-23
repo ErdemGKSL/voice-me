@@ -93,7 +93,7 @@ impl Fixture {
 
     fn speak(&self, adapter: &RemoteTtsAdapter<DeepInfra>) -> Result<Vec<f32>, VoiceMeError> {
         adapter
-            .generate("Merhaba dünya", &self.clip, "tr")
+            .generate("Merhaba dünya", Some(&self.clip), "tr", None)
             .map(|audio| audio.into_samples())
     }
 }
@@ -174,6 +174,22 @@ fn the_first_line_uploads_stores_the_id_then_generates() {
             "response_format": "wav",
         })
     );
+}
+
+/// Story 3.12: the port's sample became optional; a cloning provider
+/// refuses a line with none, and sends nothing.
+#[test]
+fn no_reference_clip_is_refused_and_nothing_is_sent() {
+    let fixture = Fixture::new();
+    let server = MockServer::start(happy);
+
+    let error = fixture
+        .adapter(&server)
+        .generate("Merhaba", None, "tr", None)
+        .unwrap_err();
+
+    assert!(matches!(error, VoiceMeError::NoReferenceVoiceSample));
+    assert!(server.calls().is_empty());
 }
 
 #[test]
@@ -342,7 +358,7 @@ fn a_line_through_the_tokio_bridge_uploads_and_generates() {
 
     let audio = futures::executor::block_on(voice_me_core::tokio_bridge::spawn_blocking_on(
         runtime.handle(),
-        move || adapter.generate("Merhaba", &clip, "tr"),
+        move || adapter.generate("Merhaba", Some(&clip), "tr", None),
     ))
     .unwrap();
 

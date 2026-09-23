@@ -17,6 +17,7 @@
 //! Neither probe loads an ONNX Runtime library: that only ever happens in
 //! the `--probe-runtime` helper process (Decision 1).
 
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -329,6 +330,42 @@ pub fn capability_row(request: &CheckRequest, probe: &dyn GpuProbe) -> Option<De
                 )),
             }
         }
+        // Story 3.12: on Linux the System voice's readiness is the eSpeak
+        // NG row ([`system_voice_engine_row`]), not a capability row.
+        // Elsewhere it has no engine yet (Windows is Story 3.13).
+        BackendSelection::SystemVoice => {
+            if cfg!(target_os = "linux") {
+                None
+            } else {
+                Some(cannot_run(
+                    selection,
+                    "The System voice on this system arrives in a later voice-me release.",
+                ))
+            }
+        }
+    }
+}
+
+/// The eSpeak NG row's name.
+pub const SYSTEM_VOICE_ENGINE_LABEL: &str = "eSpeak NG";
+
+/// The System voice's engine row (Story 3.12): ready, naming where
+/// `espeak-ng` was found, or missing and speech-blocking with manual steps
+/// only — it is a system package, which voice-me never installs.
+/// `install_step` is the distribution's command, in words.
+pub fn system_voice_engine_row(found: Option<&Path>, install_step: &str) -> Dependency {
+    match found {
+        Some(path) => Dependency::ready(
+            DependencyKind::SystemVoiceEngine,
+            SYSTEM_VOICE_ENGINE_LABEL,
+            format!("Found at {}.", path.display()),
+        ),
+        None => Dependency::missing(
+            DependencyKind::SystemVoiceEngine,
+            SYSTEM_VOICE_ENGINE_LABEL,
+            "The espeak-ng program is not on PATH. The System voice speaks through it.".to_string(),
+        )
+        .manual([install_step.to_string(), "Press Check again.".to_string()]),
     }
 }
 
@@ -639,6 +676,57 @@ mod tests {
         let row = capability_row(&local(SpeechExecutionTarget::WebGpu), &good_gpu()).unwrap();
 
         assert_eq!(row.status, DependencyStatus::Ready);
+    }
+
+    /// Story 3.12: a missing `espeak-ng` blocks speech, with the install
+    /// command as a manual step and no Install.
+    #[test]
+    fn a_missing_espeak_ng_blocks_with_manual_steps_only() {
+        let row = system_voice_engine_row(
+            None,
+            "Install it from a terminal: sudo apt install espeak-ng",
+        );
+
+        assert_eq!(row.kind, DependencyKind::SystemVoiceEngine);
+        assert_eq!(row.status, DependencyStatus::Missing);
+        assert!(row.kind.blocks_speech());
+        assert!(!row.automatable, "a system package: steps, never Install");
+        assert!(row.manual_steps[0].contains("sudo apt install espeak-ng"));
+        assert_eq!(row.label, "eSpeak NG");
+    }
+
+    #[test]
+    fn a_found_espeak_ng_is_ready_and_names_its_path() {
+        let row = system_voice_engine_row(Some(Path::new("/usr/bin/espeak-ng")), "unused");
+
+        assert_eq!(row.status, DependencyStatus::Ready);
+        assert!(row.detail.contains("/usr/bin/espeak-ng"), "{}", row.detail);
+    }
+
+    fn system_voice() -> CheckRequest {
+        CheckRequest {
+            backend: SpeechBackend::CPU,
+            selection: BackendSelection::SystemVoice,
+            has_api_key: false,
+        }
+    }
+
+    /// On Linux the System voice's readiness is its engine row, so there
+    /// is no capability row, and no hardware is asked.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_system_voice_on_linux_has_no_capability_row() {
+        let probe = good_gpu();
+        assert_eq!(capability_row(&system_voice(), &probe), None);
+        assert_eq!(probe.asked.load(Ordering::SeqCst), 0);
+    }
+
+    /// Elsewhere it cannot run yet, and says so.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn the_system_voice_off_linux_cannot_run_yet() {
+        let row = capability_row(&system_voice(), &good_gpu()).unwrap();
+        assert_blocks(&row, "arrives in a later voice-me release");
     }
 
     #[test]

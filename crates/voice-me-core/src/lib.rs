@@ -26,9 +26,10 @@ pub use speak::{
 pub use state::{
     ActiveBackend, ApiKeys, AppState, BackendSelection, DEFAULT_SPEECH_LANGUAGE,
     DEFAULT_UI_LANGUAGE, Dependency, DependencyKind, DependencyOutcome, DependencyReport,
-    DependencyStatus, LanguageBackend, LocalRuntime, RemoteProvider, RemoteSample, SpeechBackend,
-    SpeechExecutionTarget, SpeechLanguage, SpeechLanguages, SpeechWeights, backend_choices,
-    format_bytes,
+    DependencyStatus, LanguageBackend, LanguageOption, LocalRuntime, RemoteProvider, RemoteSample,
+    SpeechBackend, SpeechExecutionTarget, SpeechLanguage, SpeechLanguages, SpeechVoices,
+    SpeechWeights, SystemVoice, SystemVoiceRefusal, backend_choices, format_bytes,
+    resolve_system_voice, system_voice_languages, system_voices_of,
 };
 
 /// Sender half of the shared `AppEvent` channel (AD-3). Adapters hold only

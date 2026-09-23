@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use crate::audio::AudioBuffer;
 use crate::error::VoiceMeError;
 use crate::ports::{NotificationPort, TtsPort, VirtualMicPort};
-use crate::state::{AppState, BackendSelection};
+use crate::state::{AppState, BackendSelection, LanguageBackend, resolve_system_voice};
 
 /// Held across [`VirtualMicPort::play`], so one utterance finishes draining
 /// before the next one starts.
@@ -124,6 +124,22 @@ fn speak_inner(
             backend.label()
         )));
     };
+
+    // Story 3.12: a stock voice. The language and the stored voice are
+    // checked against the voices the engine listed — refused by name,
+    // never substituted — and there is no sample to check and nothing to
+    // disclose: the engine runs on this machine.
+    if backend == LanguageBackend::SystemVoice {
+        let voice = resolve_system_voice(
+            &state.system_voices,
+            stored,
+            state.speech_voices.get(backend),
+        )
+        .map_err(|refusal| VoiceMeError::Other(refusal.to_string()))?;
+        let audio = tts.generate(text, None, &voice.language, Some(&voice.id))?;
+        return play(virtual_mic, audio);
+    }
+
     let Some(language) = backend.speech_language(stored) else {
         return Err(VoiceMeError::Other(format!(
             "{} can't speak the speech language {stored:?} — choose one in Settings → Backend",
@@ -156,8 +172,11 @@ fn speak_inner(
         eprintln!("could not show the still-working notification: {delivery}");
     }
 
-    let audio = tts.generate(text, reference_clip, language.code)?;
+    let audio = tts.generate(text, Some(reference_clip), language.code, None)?;
+    play(virtual_mic, audio)
+}
 
+fn play(virtual_mic: &dyn VirtualMicPort, audio: AudioBuffer) -> Result<AudioBuffer, VoiceMeError> {
     // The AD-11 buffer crosses straight from one port to the other,
     // unconverted: 24 kHz mono f32 is what the decoder emits and what the
     // adapter declares to the audio server. `play` blocks until the server
@@ -277,6 +296,8 @@ mod tests {
     struct FakeTts {
         ready: AtomicBool,
         calls: Mutex<Vec<(String, PathBuf, String)>>,
+        /// The voice each call was given, in step with `calls`.
+        voices: Mutex<Vec<(Option<PathBuf>, Option<String>)>>,
         fail_with: Mutex<Option<VoiceMeError>>,
     }
 
@@ -285,6 +306,7 @@ mod tests {
             Self {
                 ready: AtomicBool::new(true),
                 calls: Mutex::new(Vec::new()),
+                voices: Mutex::new(Vec::new()),
                 fail_with: Mutex::new(None),
             }
         }
@@ -317,13 +339,18 @@ mod tests {
         fn generate(
             &self,
             text: &str,
-            reference_clip: &Path,
+            reference_clip: Option<&Path>,
             language: &str,
+            voice: Option<&str>,
         ) -> Result<AudioBuffer, VoiceMeError> {
             self.calls.lock().unwrap().push((
                 text.to_string(),
-                reference_clip.to_path_buf(),
+                reference_clip.map(Path::to_path_buf).unwrap_or_default(),
                 language.to_string(),
+            ));
+            self.voices.lock().unwrap().push((
+                reference_clip.map(Path::to_path_buf),
+                voice.map(str::to_string),
             ));
             if let Some(error) = self.fail_with.lock().unwrap().take() {
                 return Err(error);
@@ -448,6 +475,7 @@ mod tests {
             speech_languages: SpeechLanguages {
                 local: local.to_string(),
                 deepinfra: deepinfra.to_string(),
+                ..SpeechLanguages::default()
             },
             ..state
         }
@@ -618,8 +646,9 @@ mod tests {
             fn generate(
                 &self,
                 _text: &str,
-                _reference_clip: &Path,
+                _reference_clip: Option<&Path>,
                 _language: &str,
+                _voice: Option<&str>,
             ) -> Result<AudioBuffer, VoiceMeError> {
                 let _held = self
                     .gate
@@ -791,5 +820,193 @@ mod tests {
             "play is never called without audio"
         );
         assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
+    }
+
+    fn system_voice(id: &str, language: &str, name: &str) -> crate::state::SystemVoice {
+        crate::state::SystemVoice {
+            id: id.to_string(),
+            language: language.to_string(),
+            name: name.to_string(),
+            priority: 5,
+        }
+    }
+
+    /// The System voice selected, speaking `language` with `voice` stored,
+    /// against a small eSpeak-shaped list — and no Reference Voice Sample.
+    fn system_voice_state(language: &str, voice: Option<&str>) -> AppState {
+        AppState {
+            backend_selection: BackendSelection::SystemVoice,
+            speech_languages: SpeechLanguages {
+                system_voice: language.to_string(),
+                ..SpeechLanguages::default()
+            },
+            speech_voices: crate::state::SpeechVoices {
+                system_voice: voice.map(str::to_string),
+            },
+            system_voices: vec![
+                system_voice("gmw/en-US", "en-us", "English (America)"),
+                system_voice("trk/tr", "tr", "Turkish"),
+                system_voice("sit/yue", "yue", "Chinese (Cantonese)"),
+                system_voice(
+                    "sit/yue-Latn-jyutping",
+                    "yue",
+                    "Chinese (Cantonese, latin as Jyutping)",
+                ),
+            ],
+            ..AppState::default()
+        }
+    }
+
+    /// The matrix's Speak row: no sample, no disclosure, the voice id and
+    /// no clip reach the engine, and the buffer is played.
+    #[test]
+    fn the_system_voice_speaks_with_no_sample_in_the_listed_voice() {
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+
+        speak(
+            "Merhaba",
+            &system_voice_state("tr", None),
+            &tts,
+            &mic,
+            &notifier,
+        )
+        .unwrap();
+
+        assert_eq!(tts.calls.lock().unwrap()[0].2, "tr");
+        assert_eq!(
+            tts.voices.lock().unwrap()[0],
+            (None, Some("trk/tr".to_string()))
+        );
+        assert_eq!(mic.played().len(), 1);
+        assert!(notifier.summaries().is_empty());
+    }
+
+    /// The Several voices and Pick a voice rows: unset is the top-priority
+    /// voice; a stored one of the language's is used as stored.
+    #[test]
+    fn the_system_voice_uses_the_stored_voice_or_the_languages_top_one() {
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+
+        speak(
+            "One",
+            &system_voice_state("yue", None),
+            &tts,
+            &mic,
+            &notifier,
+        )
+        .unwrap();
+        speak(
+            "Two",
+            &system_voice_state("yue", Some("sit/yue-Latn-jyutping")),
+            &tts,
+            &mic,
+            &notifier,
+        )
+        .unwrap();
+
+        let voices: Vec<_> = tts
+            .voices
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, voice)| voice.clone().unwrap())
+            .collect();
+        assert_eq!(voices, vec!["sit/yue", "sit/yue-Latn-jyutping"]);
+    }
+
+    /// The Change language row, at this level: the language saved with its
+    /// voice cleared speaks in the new language's only voice.
+    #[test]
+    fn a_new_system_voice_language_with_no_voice_uses_its_own() {
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+
+        speak(
+            "Bir",
+            &system_voice_state("tr", None),
+            &tts,
+            &mic,
+            &notifier,
+        )
+        .unwrap();
+
+        assert_eq!(tts.voices.lock().unwrap()[0].1.as_deref(), Some("trk/tr"));
+    }
+
+    /// The Out of set row: an unlisted language, or a stored voice of
+    /// another language, is refused by name before the engine, once.
+    #[test]
+    fn an_unlisted_system_voice_language_or_voice_is_refused_by_name() {
+        for (state, named) in [
+            (system_voice_state("xx", None), "\"xx\""),
+            (system_voice_state("tr", Some("sit/yue")), "\"sit/yue\""),
+            (
+                AppState {
+                    system_voices: Vec::new(),
+                    ..system_voice_state("tr", None)
+                },
+                "eSpeak NG",
+            ),
+        ] {
+            let tts = FakeTts::default();
+            let notifier = FakeNotifier::default();
+            let mic = FakeMic::default();
+
+            let error = speak("Merhaba", &state, &tts, &mic, &notifier).unwrap_err();
+
+            assert!(tts.calls.lock().unwrap().is_empty());
+            let message = error.to_string();
+            assert!(
+                message.contains(named) && message.contains("System voice"),
+                "{message}"
+            );
+            assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
+        }
+    }
+
+    /// The cloning backends still require the sample.
+    #[test]
+    fn the_cloning_backends_still_require_the_sample() {
+        for selection in [
+            BackendSelection::BUNDLED_CPU,
+            BackendSelection::Remote(RemoteProvider::DeepInfra),
+        ] {
+            let tts = FakeTts::default();
+            let notifier = FakeNotifier::default();
+            let mic = FakeMic::default();
+            let state = AppState {
+                backend_selection: selection,
+                confirmed_disclosures: vec![RemoteProvider::DeepInfra],
+                ..AppState::default()
+            };
+
+            let error = speak("Merhaba", &state, &tts, &mic, &notifier).unwrap_err();
+
+            assert!(matches!(error, VoiceMeError::NoReferenceVoiceSample));
+            assert!(tts.calls.lock().unwrap().is_empty());
+        }
+
+        // With one, the clip reaches the engine and no voice does.
+        let tts = FakeTts::default();
+        speak(
+            "Merhaba",
+            &state_with_a_sample(),
+            &tts,
+            &FakeMic::default(),
+            &FakeNotifier::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            tts.voices.lock().unwrap()[0],
+            (
+                Some(PathBuf::from("/data/reference_voice_sample.wav")),
+                None
+            )
+        );
     }
 }

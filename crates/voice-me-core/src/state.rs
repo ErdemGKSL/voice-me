@@ -159,6 +159,10 @@ impl RemoteProvider {
 pub enum LanguageBackend {
     Local,
     Remote(RemoteProvider),
+    /// The OS's own speech engine (Story 3.12: eSpeak NG on Linux). Its
+    /// set is whatever the engine lists on this machine, so it has no
+    /// static table: see [`LanguageBackend::language_options`].
+    SystemVoice,
 }
 
 impl LanguageBackend {
@@ -168,23 +172,70 @@ impl LanguageBackend {
         match self {
             LanguageBackend::Local => "local Chatterbox",
             LanguageBackend::Remote(provider) => provider.label(),
+            LanguageBackend::SystemVoice => "System voice",
         }
     }
 
     /// The speech languages this backend generates in, in the order the UI
     /// lists them. Empty for a backend whose set is not decided yet
-    /// (fal.ai, Story 3.7).
+    /// (fal.ai, Story 3.7), and for the System voice, whose set is not
+    /// static — [`Self::language_options`] takes its voice list.
     pub fn speech_languages(self) -> &'static [SpeechLanguage] {
         match self {
             LanguageBackend::Local => LOCAL_SPEECH_LANGUAGES,
             LanguageBackend::Remote(RemoteProvider::DeepInfra) => DEEPINFRA_SPEECH_LANGUAGES,
-            LanguageBackend::Remote(RemoteProvider::FalAi) => &[],
+            LanguageBackend::Remote(RemoteProvider::FalAi) | LanguageBackend::SystemVoice => &[],
         }
     }
 
-    /// Whether this backend has a speech language at all.
+    /// Whether this backend has a speech language at all. The System voice
+    /// always does, even while its voice list is empty or not loaded yet.
     pub fn has_speech_language(self) -> bool {
-        !self.speech_languages().is_empty()
+        self == LanguageBackend::SystemVoice || !self.speech_languages().is_empty()
+    }
+
+    /// Whether this backend speaks in a stock voice chosen from a list
+    /// rather than the user's cloned one (Story 3.12).
+    pub fn has_voice_choice(self) -> bool {
+        self == LanguageBackend::SystemVoice
+    }
+
+    /// The sibling of [`Self::speech_languages`] that also covers the
+    /// System voice: its languages come from `system_voices`, the engine's
+    /// own list (see [`system_voice_languages`]). Every other backend
+    /// ignores `system_voices` and lists its static set.
+    pub fn language_options(self, system_voices: &[SystemVoice]) -> Vec<LanguageOption> {
+        match self {
+            LanguageBackend::SystemVoice => system_voice_languages(system_voices),
+            _ => self
+                .speech_languages()
+                .iter()
+                .map(|language| LanguageOption {
+                    code: language.code.to_string(),
+                    label: language.label.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The canonical code of the language `saved` names, if this backend
+    /// speaks it — [`Self::speech_language`] for a static set, and for the
+    /// System voice the listed `Language` value it matches (trimmed,
+    /// compared without regard to ASCII case). `None` outside the set,
+    /// never a default.
+    pub fn resolve_language(self, saved: &str, system_voices: &[SystemVoice]) -> Option<String> {
+        match self {
+            LanguageBackend::SystemVoice => {
+                let saved = saved.trim();
+                system_voices
+                    .iter()
+                    .find(|voice| voice.language.eq_ignore_ascii_case(saved))
+                    .map(|voice| voice.language.clone())
+            }
+            _ => self
+                .speech_language(saved)
+                .map(|language| language.code.to_string()),
+        }
     }
 
     /// The entry a saved value names, if this backend speaks it. The value
@@ -196,6 +247,120 @@ impl LanguageBackend {
         self.speech_languages()
             .iter()
             .find(|language| language.code == code)
+    }
+}
+
+/// One entry of a backend's language list, owned, so a list read from the
+/// System voice's engine and a static table look the same to the UI.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LanguageOption {
+    pub code: String,
+    pub label: String,
+}
+
+/// One voice the System voice's engine lists (Story 3.12), as parsed from
+/// `espeak-ng --voices`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SystemVoice {
+    /// What the engine is told to use (`trk/tr`). Unique in a list.
+    pub id: String,
+    /// The language code the voice speaks (`tr`, `en-gb`, `yue`). Each
+    /// distinct code is its own speech language.
+    pub language: String,
+    /// The name the user reads ("Chinese (Cantonese)").
+    pub name: String,
+    /// The engine's priority: lower is preferred.
+    pub priority: u32,
+}
+
+/// The distinct languages `voices` speak, each labelled with its
+/// top-priority voice's name, sorted by label.
+pub fn system_voice_languages(voices: &[SystemVoice]) -> Vec<LanguageOption> {
+    let mut languages: Vec<LanguageOption> = Vec::new();
+    for voice in voices {
+        if languages
+            .iter()
+            .any(|language| language.code == voice.language)
+        {
+            continue;
+        }
+        let top = system_voices_of(voices, &voice.language)[0];
+        languages.push(LanguageOption {
+            code: voice.language.clone(),
+            label: top.name.clone(),
+        });
+    }
+    languages.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.code.cmp(&b.code)));
+    languages
+}
+
+/// The voices that speak exactly `language`, top priority first: lowest
+/// priority number, then list order.
+pub fn system_voices_of<'a>(voices: &'a [SystemVoice], language: &str) -> Vec<&'a SystemVoice> {
+    let mut of: Vec<&SystemVoice> = voices
+        .iter()
+        .filter(|voice| voice.language == language)
+        .collect();
+    // A stable sort keeps list order among equal priorities.
+    of.sort_by_key(|voice| voice.priority);
+    of
+}
+
+/// Why a stored System voice language or voice cannot be used (Story 3.12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SystemVoiceRefusal {
+    /// No voice list has been read from the engine yet.
+    NoVoices,
+    /// No listed voice speaks the stored language.
+    Language(String),
+    /// The stored voice is not one of the language's voices.
+    Voice { language: String, voice: String },
+}
+
+impl std::fmt::Display for SystemVoiceRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SystemVoiceRefusal::NoVoices => f.write_str(
+                "System voice has no voices listed yet — check Settings → Dependencies for eSpeak NG",
+            ),
+            SystemVoiceRefusal::Language(language) => write!(
+                f,
+                "System voice can't speak the speech language {language:?} — choose one in \
+                 Settings → Backend"
+            ),
+            SystemVoiceRefusal::Voice { language, voice } => write!(
+                f,
+                "System voice has no voice {voice:?} for {language:?} — choose one in Settings → \
+                 Backend"
+            ),
+        }
+    }
+}
+
+/// The voice a System voice Speak Action uses: the stored `voice` if it is
+/// one of `language`'s, or with none stored, the language's top-priority
+/// voice. Refused by name otherwise — never a substitute.
+pub fn resolve_system_voice<'a>(
+    voices: &'a [SystemVoice],
+    language: &str,
+    voice: Option<&str>,
+) -> Result<&'a SystemVoice, SystemVoiceRefusal> {
+    if voices.is_empty() {
+        return Err(SystemVoiceRefusal::NoVoices);
+    }
+    let Some(code) = LanguageBackend::SystemVoice.resolve_language(language, voices) else {
+        return Err(SystemVoiceRefusal::Language(language.trim().to_string()));
+    };
+    let of = system_voices_of(voices, &code);
+    match voice {
+        None => Ok(of[0]),
+        Some(id) => of
+            .into_iter()
+            .find(|candidate| candidate.id == id)
+            .ok_or_else(|| SystemVoiceRefusal::Voice {
+                language: code,
+                voice: id.to_string(),
+            }),
     }
 }
 
@@ -251,6 +416,8 @@ const DEEPINFRA_SPEECH_LANGUAGES: &[SpeechLanguage] = &[
 pub struct SpeechLanguages {
     pub local: String,
     pub deepinfra: String,
+    /// Story 3.12. Defaults to `tr`; the legacy key never seeds it.
+    pub system_voice: String,
 }
 
 impl Default for SpeechLanguages {
@@ -258,6 +425,24 @@ impl Default for SpeechLanguages {
         Self {
             local: DEFAULT_SPEECH_LANGUAGE.to_string(),
             deepinfra: DEFAULT_SPEECH_LANGUAGE.to_string(),
+            system_voice: DEFAULT_SPEECH_LANGUAGE.to_string(),
+        }
+    }
+}
+
+/// The saved voice of each backend that has a voice choice (Story 3.12).
+/// Persisted. `None` is the language's top-priority voice.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpeechVoices {
+    pub system_voice: Option<String>,
+}
+
+impl SpeechVoices {
+    /// `backend`'s saved voice, if it has a voice choice and one is saved.
+    pub fn get(&self, backend: LanguageBackend) -> Option<&str> {
+        match backend {
+            LanguageBackend::SystemVoice => self.system_voice.as_deref(),
+            _ => None,
         }
     }
 }
@@ -269,6 +454,7 @@ impl SpeechLanguages {
             LanguageBackend::Local => Some(&self.local),
             LanguageBackend::Remote(RemoteProvider::DeepInfra) => Some(&self.deepinfra),
             LanguageBackend::Remote(RemoteProvider::FalAi) => None,
+            LanguageBackend::SystemVoice => Some(&self.system_voice),
         }
     }
 }
@@ -291,6 +477,9 @@ pub enum BackendSelection {
     },
     /// A remote provider, with the user's own key.
     Remote(RemoteProvider),
+    /// The OS's own speech engine in a stock voice (Story 3.12): eSpeak NG
+    /// on Linux. Local, but never an ONNX target.
+    SystemVoice,
 }
 
 impl Default for BackendSelection {
@@ -307,12 +496,19 @@ impl BackendSelection {
         target: SpeechExecutionTarget::Cpu,
     };
 
-    /// The local execution target, or `None` for a remote provider.
+    /// The local ONNX execution target, or `None` for a remote provider
+    /// and for the System voice, which runs no ONNX session.
     pub fn local_target(&self) -> Option<SpeechExecutionTarget> {
         match self {
             BackendSelection::Local { target, .. } => Some(*target),
-            BackendSelection::Remote(_) => None,
+            BackendSelection::Remote(_) | BackendSelection::SystemVoice => None,
         }
+    }
+
+    /// Whether this backend speaks in a stock voice rather than the user's
+    /// cloned one — and so needs no Reference Voice Sample (Story 3.12).
+    pub fn is_stock_voice(&self) -> bool {
+        matches!(self, BackendSelection::SystemVoice)
     }
 
     /// The added runtime library this selection loads, if it is one the
@@ -333,6 +529,7 @@ impl BackendSelection {
         match self {
             BackendSelection::Local { .. } => LanguageBackend::Local,
             BackendSelection::Remote(provider) => LanguageBackend::Remote(*provider),
+            BackendSelection::SystemVoice => LanguageBackend::SystemVoice,
         }
     }
 
@@ -355,6 +552,7 @@ impl BackendSelection {
                 target,
             } => format!("{} ({})", target.label(), file_name(path)),
             BackendSelection::Remote(provider) => format!("{} (remote)", provider.label()),
+            BackendSelection::SystemVoice => "System voice — instant (stock voice)".to_string(),
         }
     }
 }
@@ -410,10 +608,12 @@ impl LocalRuntime {
 }
 
 /// Every entry the backend `Select` lists, in order: the bundled CPU
-/// runtime, each added runtime's entries, then the remote providers.
+/// runtime, each added runtime's entries, the System voice, then the
+/// remote providers.
 pub fn backend_choices(runtimes: &[LocalRuntime]) -> Vec<BackendSelection> {
     std::iter::once(BackendSelection::BUNDLED_CPU)
         .chain(runtimes.iter().flat_map(LocalRuntime::entries))
+        .chain(std::iter::once(BackendSelection::SystemVoice))
         .chain(
             RemoteProvider::ALL
                 .into_iter()
@@ -577,6 +777,10 @@ pub enum DependencyKind {
     /// (Story 3.3): a driver, a capable GPU, an API key. Blocking — a
     /// selection that cannot run is never quietly run on CPU instead.
     BackendCapability,
+    /// The OS speech engine the System voice runs (Story 3.12: the
+    /// `espeak-ng` program). Blocking, with manual steps: it is a system
+    /// package voice-me cannot install.
+    SystemVoiceEngine,
 }
 
 impl DependencyKind {
@@ -588,6 +792,7 @@ impl DependencyKind {
             DependencyKind::OnnxRuntime
                 | DependencyKind::ModelWeights
                 | DependencyKind::BackendCapability
+                | DependencyKind::SystemVoiceEngine
         )
     }
 }
@@ -757,6 +962,9 @@ pub struct AppState {
     /// (Story 3.11). Persisted, and set from Settings → Backend. Read on
     /// every Speak Action through [`Self::speech_language`].
     pub speech_languages: SpeechLanguages,
+    /// The saved voice of each backend with a voice choice (Story 3.12).
+    /// Persisted.
+    pub speech_voices: SpeechVoices,
     pub selected_mic_device: Option<String>,
     /// The AD-9 resolved speech backend. Not persisted: the composition
     /// root derives it from [`Self::backend_selection`] on every read.
@@ -785,6 +993,11 @@ pub struct AppState {
     /// exactly the kind of thing that must never be believed from a file
     /// written on a previous run.
     pub dependencies: DependencyOutcome,
+    /// The voices the System voice's engine listed at the last Dependency
+    /// Check that had it selected (Story 3.12). Not persisted: like
+    /// [`Self::dependencies`], it describes this machine as it was a moment
+    /// ago, and the composition root merges it in.
+    pub system_voices: Vec<SystemVoice>,
 }
 
 /// Hand-written rather than derived so the two language fields default to
@@ -797,6 +1010,7 @@ impl Default for AppState {
             reference_voice_sample: None,
             ui_language: DEFAULT_UI_LANGUAGE.to_string(),
             speech_languages: SpeechLanguages::default(),
+            speech_voices: SpeechVoices::default(),
             selected_mic_device: None,
             speech_backend: SpeechBackend::default(),
             backend_selection: BackendSelection::default(),
@@ -806,6 +1020,7 @@ impl Default for AppState {
             remote_samples: Vec::new(),
             active_backend: ActiveBackend::default(),
             dependencies: DependencyOutcome::default(),
+            system_voices: Vec::new(),
         }
     }
 }
@@ -927,7 +1142,9 @@ mod tests {
             choices.last(),
             Some(&BackendSelection::Remote(RemoteProvider::FalAi))
         );
-        assert_eq!(choices.len(), 4);
+        assert_eq!(choices.len(), 5);
+        // The System voice comes after the local runtimes, before remote.
+        assert_eq!(choices[2], BackendSelection::SystemVoice);
     }
 
     #[test]
@@ -1000,6 +1217,7 @@ mod tests {
             let expected = match &selection {
                 BackendSelection::Local { .. } => LanguageBackend::Local,
                 BackendSelection::Remote(provider) => LanguageBackend::Remote(*provider),
+                BackendSelection::SystemVoice => LanguageBackend::SystemVoice,
             };
             assert_eq!(selection.language_backend(), expected);
         }
@@ -1008,6 +1226,7 @@ mod tests {
             speech_languages: SpeechLanguages {
                 local: "en".to_string(),
                 deepinfra: "es".to_string(),
+                ..SpeechLanguages::default()
             },
             backend_selection: BackendSelection::Local {
                 runtime: Some(PathBuf::from("/opt/ort/libonnxruntime.so")),
@@ -1021,5 +1240,99 @@ mod tests {
     #[test]
     fn a_capability_miss_blocks_speech() {
         assert!(DependencyKind::BackendCapability.blocks_speech());
+    }
+
+    fn voice(id: &str, language: &str, name: &str, priority: u32) -> SystemVoice {
+        SystemVoice {
+            id: id.to_string(),
+            language: language.to_string(),
+            name: name.to_string(),
+            priority,
+        }
+    }
+
+    fn some_voices() -> Vec<SystemVoice> {
+        vec![
+            voice("gmw/en", "en-gb", "English (Great Britain)", 2),
+            voice("gmw/en-US", "en-us", "English (America)", 5),
+            voice("trk/tr", "tr", "Turkish", 5),
+            voice("sit/yue", "yue", "Chinese (Cantonese)", 5),
+            voice(
+                "sit/yue-Latn-jyutping",
+                "yue",
+                "Chinese (Cantonese, latin as Jyutping)",
+                5,
+            ),
+        ]
+    }
+
+    #[test]
+    fn each_system_voice_language_code_is_its_own_language_sorted_by_label() {
+        let languages = system_voice_languages(&some_voices());
+        let codes: Vec<_> = languages.iter().map(|l| l.code.as_str()).collect();
+        assert_eq!(codes, vec!["yue", "en-us", "en-gb", "tr"]);
+        assert_eq!(languages[0].label, "Chinese (Cantonese)");
+        assert_eq!(
+            LanguageBackend::SystemVoice.language_options(&some_voices()),
+            languages
+        );
+        assert!(LanguageBackend::SystemVoice.has_speech_language());
+        assert!(
+            LanguageBackend::SystemVoice
+                .language_options(&[])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_language_is_labelled_by_its_top_priority_voice() {
+        let voices = vec![
+            voice("a/low", "xx", "Second choice", 5),
+            voice("a/high", "xx", "First choice", 2),
+        ];
+        assert_eq!(system_voice_languages(&voices)[0].label, "First choice");
+        assert_eq!(system_voices_of(&voices, "xx")[0].id, "a/high");
+    }
+
+    #[test]
+    fn the_system_voice_resolves_the_stored_voice_or_the_top_priority_one() {
+        let voices = some_voices();
+        assert_eq!(
+            resolve_system_voice(&voices, "yue", None).unwrap().id,
+            "sit/yue"
+        );
+        assert_eq!(
+            resolve_system_voice(&voices, " YUE ", Some("sit/yue-Latn-jyutping"))
+                .unwrap()
+                .id,
+            "sit/yue-Latn-jyutping"
+        );
+        assert_eq!(
+            resolve_system_voice(&voices, "xx", None),
+            Err(SystemVoiceRefusal::Language("xx".to_string()))
+        );
+        assert_eq!(
+            resolve_system_voice(&voices, "tr", Some("sit/yue")),
+            Err(SystemVoiceRefusal::Voice {
+                language: "tr".to_string(),
+                voice: "sit/yue".to_string()
+            })
+        );
+        assert_eq!(
+            resolve_system_voice(&[], "tr", None),
+            Err(SystemVoiceRefusal::NoVoices)
+        );
+    }
+
+    #[test]
+    fn the_system_voice_is_a_stock_voice_and_never_an_onnx_target() {
+        let selection = BackendSelection::SystemVoice;
+        assert_eq!(selection.local_target(), None);
+        assert!(!selection.is_cpu());
+        assert!(selection.is_stock_voice());
+        assert!(!BackendSelection::BUNDLED_CPU.is_stock_voice());
+        assert!(selection.label().contains("stock voice"));
+        assert_eq!(selection.language_backend(), LanguageBackend::SystemVoice);
+        assert!(DependencyKind::SystemVoiceEngine.blocks_speech());
     }
 }
