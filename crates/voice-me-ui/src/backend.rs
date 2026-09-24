@@ -850,19 +850,8 @@ impl BackendView {
         backend: LanguageBackend,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let saved = self.panel.speech_languages.get(backend).unwrap_or_default();
         let unknown = saved_language_code(&self.panel, backend).is_none();
-        let note = if backend == LanguageBackend::SystemVoice && self.panel.system_voices.is_empty()
-        {
-            // Nothing listed is not the same as a wrong value.
-            "eSpeak NG has not listed its voices yet. See Settings → Dependencies.".to_string()
-        } else {
-            format!(
-                "The saved speech language {saved:?} is not one {} speaks. Choose one to speak \
-                 again.",
-                backend.label()
-            )
-        };
+        let note = speech_language_note(&self.panel, backend);
 
         v_flex()
             .id("backend-speech-language")
@@ -1323,6 +1312,20 @@ impl BackendView {
             )
             .into_any_element()
     }
+}
+
+/// The note beside a speech language the saved backend cannot speak.
+fn speech_language_note(panel: &BackendPanel, backend: LanguageBackend) -> String {
+    if backend == LanguageBackend::SystemVoice && panel.system_voices.is_empty() {
+        // Nothing listed is not the same as a wrong value.
+        return "The System voice has not listed its voices yet. See Settings → Backend."
+            .to_string();
+    }
+    let saved = panel.speech_languages.get(backend).unwrap_or_default();
+    format!(
+        "The saved speech language {saved:?} is not one {} speaks. Choose one to speak again.",
+        backend.label()
+    )
 }
 
 impl Render for BackendView {
@@ -2555,6 +2558,8 @@ mod tests {
             );
             assert!(window.try_find("backend-speech-language-note").is_some());
             assert!(window.try_find("backend-speech-voice").is_none());
+            let note = speech_language_note(&view.read(cx).panel, LanguageBackend::SystemVoice);
+            assert!(note.contains("\"xx\""), "{note}");
         })
         .unwrap();
 
@@ -2568,6 +2573,9 @@ mod tests {
         cx.update_window(window.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(window.try_find("backend-speech-language-note").is_some());
+            let note = speech_language_note(&view.read(cx).panel, LanguageBackend::SystemVoice);
+            assert!(note.contains("Settings → Backend"), "{note}");
+            assert!(!note.contains("eSpeak"), "{note}");
             view.update(cx, |view, cx| {
                 view.set_backend_panel(system_voice_panel("tr", None), cx)
             });

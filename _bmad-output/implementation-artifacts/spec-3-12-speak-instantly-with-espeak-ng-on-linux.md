@@ -2,7 +2,7 @@
 title: 'Speak instantly with eSpeak NG on Linux (Story 3.12)'
 type: 'feature'
 created: '2026-09-23'
-status: 'in-review'
+status: 'done'
 route: 'dispatch'
 review_loop_iteration: 0
 baseline_commit: '558a13a10c30fafa870586714092ded74d30506b'
@@ -106,11 +106,33 @@ context: ['{project-root}/_bmad-output/implementation-artifacts/epic-3-context.m
 - Crate: `voice-me-tts-system-linux` (voices parser, hand-rolled RIFF parser that reads `data` to EOF, os-release command, bounded runner). Failures are `VoiceMeError::SpeechEngine("eSpeak NG …")`. `--voices` runs with a null stdin. `voice-me-deps` depends on it (Linux only) for `find_program` / `install_step`, following the `voice-me-audio-linux` precedent.
 - UI: Stock voice tag `backend-stock-voice`; voice picker also shown for a one-voice language when the stored voice is not that language's, so it can be fixed. An empty list shows a "not listed yet" language note.
 - App: `refresh_system_voices` runs from `run_check` and the startup check when the System voice is saved; a list that fails to read becomes empty.
+- Review patches (2026-09-24): a failed voice listing shows beside the speech language, the empty-list copy points at Settings → Backend, and the startup auto-open skips System voice users. CI installs `espeak-ng`, so `tests/espeak.rs` runs the real engine.
 - Verified: the listed `cargo test` crates (plus `voice-me-tts`) pass; `cargo check --workspace --all-targets` clean; clippy has no new warnings (the pre-existing `type_complexity` on `apply_selection` and `assert!(true)` in `voice-me-tests` remain); `cargo fmt --check` clean. Manual app checks not run.
 
 ## Spec Change Log
 
 ## Review Triage Log
+
+Pass 1 (blind-hunter, edge-case-hunter, verification-gap). Triaged on 2026-09-23; the patches were applied on 2026-09-24.
+
+| Verdict | Finding | Evidence |
+|---|---|---|
+| high | The new crate and `tests/espeak.rs` are not Linux-gated, so the Windows CI job fails on `std::os::unix` | Confirmed. Both are now `#![cfg(target_os = "linux")]`, as in `voice-me-audio-linux`. That landed with the Windows tray and hotkey commit (`3d5dd35`) → patch |
+| medium | CI never runs the real engine: `tests/espeak.rs` skips itself because `build-ubuntu` does not install `espeak-ng` | Confirmed. `espeak-ng` is added to the apt-get list in `.github/workflows/ci.yml` → patch |
+| medium | A failed `--voices` listing is only `eprintln!`ed. The engine row stays Ready, and the user is sent to Dependencies, which shows nothing wrong | Confirmed. `refresh_system_voices` now sets `BackendArea::SpeechLanguage` to "Couldn't list the System voice's voices: …" on `Err` and clears it on `Ok`, then pushes the panel. The wrong comment is fixed → patch |
+| low | The empty-list refusal (`state.rs`) and the tab note (`backend.rs`) name eSpeak NG and point at Settings → Dependencies, but the System voice is platform-neutral (3.13 is Windows) | Confirmed. Both now point at Settings → Backend and name no engine. The `speak.rs` test expectation is updated → patch |
+| medium | With the System voice selected and no Reference Voice Sample, Settings auto-opens on every launch | Confirmed. The startup `if !has_active_sample` treated a sample-free backend as a first run. The startup auto-open is now skipped when the loaded selection `is_stock_voice()`. The Settings window's own `has_active_sample` and the warm-up gate are unchanged → patch |
+| low | `an_unlisted_voice_or_language_shows_the_placeholder_and_a_note` checks only that the note exists, and both branches share its id | Confirmed. The note text is now built by `speech_language_note`, and the test asserts it: the empty-list case names Settings → Backend and no engine, and the `"xx"` case names `xx` → patch |
+| medium | A late SystemVoice or Remote Dependency Check report after a switch to CPU passes `for_current_selection` (both map to the CPU placeholder in `resolve_backend`), so the ONNX warm-up can start with the runtime unverified | Real, but it was already true for Remote selections before 3.12 → defer |
+| medium | Nothing tests the root's refresh-and-speak assembly (`refresh_system_voices` → `current_state` → `speak`) | Pre-verified. It is inline in `main()`, and belongs with 3.11's `backend_actions` deferral → defer |
+| low | Speaking before the async voice list lands is refused | The window is about 50 ms after the check, and a user cannot reach it by typing → rejected |
+| low | Out-of-order refreshes can overwrite a newer list, and a stale list can remain after deselecting | Rare, and the lists are identical → rejected |
+| low | Grandchild processes can hold the pipes past a kill | `espeak-ng` spawns none, and the fix needs process groups → rejected |
+| low | The WAV chunk offset can overflow on 32-bit targets | Only 64-bit targets are built → rejected |
+| false | The 10 s deadline is fixed | The spec sets it, and eSpeak runs far faster than real time → rejected |
+| false | `resample` is copied from `voice-me-tts-remote` | The spec's Code Map directed the copy → rejected |
+| low | The language grouping is quadratic | With about 140 voices, it costs nothing → rejected |
+| low | `save_speech_voice` accepts any value | The only caller is the UI, which sends listed ids → rejected |
 
 ## Verification
 

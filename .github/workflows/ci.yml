@@ -27,7 +27,8 @@ jobs:
             libxcursor-dev \
             libxi-dev \
             libxrandr-dev \
-            libssl-dev
+            libssl-dev \
+            espeak-ng
       - run: cargo build --workspace
       # The tests are written to pass with no audio server; the ones that
       # need one are `#[ignore]`d. Without this step nothing automated ever
