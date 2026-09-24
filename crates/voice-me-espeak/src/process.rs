@@ -63,6 +63,30 @@ pub fn run(
     run_command(command, input, deadline)
 }
 
+/// Start `command`, retrying briefly on `ETXTBSY` ("text file busy"). On
+/// Linux a program file that was just written can still be open for
+/// writing in a child another thread forked in the meantime (until that
+/// child execs), and exec refuses it for that moment. It clears within
+/// milliseconds, so a handful of short retries is enough; any other error
+/// is returned at once.
+fn spawn(command: &mut Command) -> std::io::Result<std::process::Child> {
+    const TEXT_FILE_BUSY: i32 = 26;
+    let mut attempts = 0;
+    loop {
+        match command.spawn() {
+            Err(error)
+                if cfg!(target_os = "linux")
+                    && error.raw_os_error() == Some(TEXT_FILE_BUSY)
+                    && attempts < 10 =>
+            {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+}
+
 /// One bounded run of `command`, whose program and arguments are set.
 fn run_command(
     mut command: Command,
@@ -87,7 +111,7 @@ fn run_command(
         use std::os::windows::process::CommandExt as _;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    let mut child = command.spawn().map_err(|error| match error.kind() {
+    let mut child = spawn(&mut command).map_err(|error| match error.kind() {
         std::io::ErrorKind::NotFound => RunError::NotFound(error.to_string()),
         _ => RunError::Spawn(error.to_string()),
     })?;
