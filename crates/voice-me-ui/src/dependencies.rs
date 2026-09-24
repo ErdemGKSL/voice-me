@@ -1306,11 +1306,14 @@ mod tests {
             window.click("dependency-install-piper-voice", cx);
         })
         .unwrap();
+        // The job runs on Tokio's blocking pool. Wait without driving
+        // GPUI's scheduler: its completion wakes the view from a Tokio
+        // thread, which the test scheduler rejects while it is running.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while port.provisions.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
-            cx.run_until_parked();
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        cx.run_until_parked();
 
         let forwarded = port.last_provision.lock().unwrap().clone().unwrap();
         assert_eq!(forwarded.piper_voice.as_deref(), Some("tr_TR-dfki-medium"));
