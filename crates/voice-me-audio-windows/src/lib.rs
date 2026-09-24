@@ -27,7 +27,7 @@
 //! job tests them; only the device and the process launch need Windows.
 
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -83,7 +83,15 @@ impl VirtualMicPort for WindowsVirtualMicAdapter {
         if audio.is_empty() {
             return Ok(());
         }
+        let samples = audio.samples().to_vec();
+        let duration = audio.duration();
+        on_audio_thread(move || play_samples(&samples, duration))?
+    }
+}
 
+/// `play`'s work, on the audio thread.
+fn play_samples(samples: &[f32], duration: Duration) -> Result<(), VoiceMeError> {
+    {
         let device = cable_input_device()?;
         let supported = device.default_output_config().map_err(|error| {
             unavailable(format!(
@@ -100,8 +108,8 @@ impl VirtualMicPort for WindowsVirtualMicAdapter {
             )));
         }
         let config: cpal::StreamConfig = supported.into();
-        let mono = resample(audio.samples(), SAMPLE_RATE, rate)?;
-        let timeout = audio.duration() + DRAIN_GRACE;
+        let mono = resample(samples, SAMPLE_RATE, rate)?;
+        let timeout = duration + DRAIN_GRACE;
 
         match format {
             SampleFormat::F32 => play_on::<f32>(&device, config, mono, channels, timeout),
@@ -124,7 +132,55 @@ impl VirtualMicPort for WindowsVirtualMicAdapter {
 /// Check's question. Duplicates count as present (the row is about whether
 /// the driver is installed); `play` is what refuses them.
 pub fn virtual_microphone_available() -> Result<bool, VoiceMeError> {
-    Ok(!matching_indices(&output_device_names()?.1).is_empty())
+    on_audio_thread(|| Ok(!matching_indices(&output_device_names()?.1).is_empty()))?
+}
+
+/// Run `job` on voice-me's one audio thread, which never exits, and wait
+/// for its result.
+///
+/// cpal's WASAPI host initialises COM per thread and uninitialises it when
+/// the thread ends, while its device enumerator is one process-wide object
+/// created in whichever thread asked first. Used from short-lived threads —
+/// Tokio's blocking pool retires idle threads, and every test runs on its
+/// own — the enumerator outlives the apartment it was made in, and the next
+/// call through it is an access violation. Every cpal call in this crate
+/// runs here instead, so that apartment lives as long as the process.
+fn on_audio_thread<T: Send + 'static>(
+    job: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, VoiceMeError> {
+    type Job = Box<dyn FnOnce() + Send>;
+    static AUDIO_THREAD: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
+
+    let sender = AUDIO_THREAD.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<Job>();
+        let spawned = std::thread::Builder::new()
+            .name("voice-me-audio".to_string())
+            .spawn(move || {
+                for job in rx {
+                    // A job that panics must not take the thread (and the
+                    // apartment) down with it; its caller sees the dropped
+                    // reply instead.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                }
+            });
+        if let Err(error) = spawned {
+            eprintln!("could not start the audio thread: {error}");
+        }
+        Mutex::new(tx)
+    });
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let job: Job = Box::new(move || {
+        let _ = reply_tx.send(job());
+    });
+    sender
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .send(job)
+        .map_err(|_| unavailable("voice-me's audio thread is not running".to_string()))?;
+    reply_rx.recv().map_err(|_| {
+        unavailable("the audio thread failed while talking to Windows audio".to_string())
+    })
 }
 
 fn unavailable(reason: String) -> VoiceMeError {
@@ -436,6 +492,30 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    /// Every audio job runs on the same long-lived thread, whichever
+    /// short-lived thread asked — and one that panics does not take it down.
+    #[test]
+    fn audio_jobs_from_short_lived_threads_share_one_audio_thread() {
+        let names: Vec<String> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    on_audio_thread(|| std::thread::current().name().map(str::to_string))
+                        .unwrap()
+                        .unwrap()
+                })
+                .join()
+                .unwrap()
+            })
+            .collect();
+        assert!(
+            names.iter().all(|name| name == "voice-me-audio"),
+            "{names:?}"
+        );
+
+        assert!(on_audio_thread(|| panic!("a job that fails")).is_err());
+        assert_eq!(on_audio_thread(|| 7).unwrap(), 7, "the thread survived");
     }
 
     #[test]
