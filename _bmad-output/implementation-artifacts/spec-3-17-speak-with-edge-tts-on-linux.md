@@ -2,9 +2,10 @@
 title: 'Speak with Edge TTS on Linux (Story 3.17)'
 type: 'feature'
 created: '2026-09-24'
-status: 'ready-for-dev'
+status: 'in-progress'
 route: 'dispatch'
 review_loop_iteration: 0
+baseline_commit: 'a12c688e87f1eb7b0ef625382cfa15420bbc74d2'
 context: ['{project-root}/_bmad-output/implementation-artifacts/epic-3-context.md', '{project-root}/_bmad-output/planning-artifacts/sprint-change-proposal-2026-09-24-edge-tts.md']
 ---
 
