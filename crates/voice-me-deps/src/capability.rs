@@ -366,6 +366,19 @@ pub fn capability_row(request: &CheckRequest, probe: &dyn GpuProbe) -> Option<De
                 ))
             }
         }
+        // Story 3.15: on Linux Piper's readiness is its runtime, voice and
+        // eSpeak NG rows. Elsewhere it has no engine yet (Windows is Story
+        // 3.16).
+        BackendSelection::Piper => {
+            if cfg!(target_os = "linux") {
+                None
+            } else {
+                Some(cannot_run(
+                    selection,
+                    "Piper on this system arrives in a later voice-me release.",
+                ))
+            }
+        }
     }
 }
 
@@ -375,8 +388,13 @@ pub const SYSTEM_VOICE_ENGINE_LABEL: &str = "eSpeak NG";
 /// The System voice's engine row (Story 3.12): ready, naming where
 /// `espeak-ng` was found, or missing and speech-blocking with manual steps
 /// only — it is a system package, which voice-me never installs.
-/// `install_step` is the distribution's command, in words.
-pub fn system_voice_engine_row(found: Option<&Path>, install_step: &str) -> Dependency {
+/// `install_step` is the distribution's command, in words; `used_by` ends
+/// the missing sentence with who needs it (Story 3.15: Piper, too).
+pub fn system_voice_engine_row(
+    found: Option<&Path>,
+    install_step: &str,
+    used_by: &str,
+) -> Dependency {
     match found {
         Some(path) => Dependency::ready(
             DependencyKind::SystemVoiceEngine,
@@ -386,7 +404,7 @@ pub fn system_voice_engine_row(found: Option<&Path>, install_step: &str) -> Depe
         None => Dependency::missing(
             DependencyKind::SystemVoiceEngine,
             SYSTEM_VOICE_ENGINE_LABEL,
-            "The espeak-ng program is not on PATH. The System voice speaks through it.".to_string(),
+            format!("The espeak-ng program is not on PATH. {used_by}"),
         )
         .manual([install_step.to_string(), "Press Check again.".to_string()]),
     }
@@ -580,6 +598,7 @@ mod tests {
             has_api_key: false,
             has_region: false,
             has_voice: false,
+            piper_voice: None,
         }
     }
 
@@ -590,6 +609,7 @@ mod tests {
             has_api_key,
             has_region: false,
             has_voice: false,
+            piper_voice: None,
         }
     }
 
@@ -742,7 +762,9 @@ mod tests {
         let row = system_voice_engine_row(
             None,
             "Install it from a terminal: sudo apt install espeak-ng",
+            "Piper reads text through it.",
         );
+        assert!(row.detail.contains("Piper"), "{}", row.detail);
 
         assert_eq!(row.kind, DependencyKind::SystemVoiceEngine);
         assert_eq!(row.status, DependencyStatus::Missing);
@@ -754,7 +776,8 @@ mod tests {
 
     #[test]
     fn a_found_espeak_ng_is_ready_and_names_its_path() {
-        let row = system_voice_engine_row(Some(Path::new("/usr/bin/espeak-ng")), "unused");
+        let row =
+            system_voice_engine_row(Some(Path::new("/usr/bin/espeak-ng")), "unused", "unused");
 
         assert_eq!(row.status, DependencyStatus::Ready);
         assert!(row.detail.contains("/usr/bin/espeak-ng"), "{}", row.detail);
@@ -767,6 +790,7 @@ mod tests {
             has_api_key: false,
             has_region: false,
             has_voice: false,
+            piper_voice: None,
         }
     }
 
@@ -824,6 +848,7 @@ mod tests {
             has_api_key,
             has_region,
             has_voice,
+            piper_voice: None,
         }
     }
 

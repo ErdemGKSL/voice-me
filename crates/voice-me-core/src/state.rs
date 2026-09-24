@@ -221,6 +221,9 @@ pub enum LanguageBackend {
     /// set is whatever the engine lists on this machine, so it has no
     /// static table: see [`LanguageBackend::language_options`].
     SystemVoice,
+    /// Piper (Story 3.15): its languages are the locales of the voices
+    /// installed in the cache, so it has no static table either.
+    Piper,
 }
 
 impl LanguageBackend {
@@ -231,6 +234,7 @@ impl LanguageBackend {
             LanguageBackend::Local => "local Chatterbox",
             LanguageBackend::Remote(provider) => provider.label(),
             LanguageBackend::SystemVoice => "System voice",
+            LanguageBackend::Piper => "Piper",
         }
     }
 
@@ -245,19 +249,21 @@ impl LanguageBackend {
             LanguageBackend::Remote(
                 RemoteProvider::FalAi | RemoteProvider::Azure | RemoteProvider::EdgeTts,
             )
-            | LanguageBackend::SystemVoice => &[],
+            | LanguageBackend::SystemVoice
+            | LanguageBackend::Piper => &[],
         }
     }
 
     /// Whether this backend's languages and voices come from a list read
     /// at run time rather than a static table: the System voice's engine
-    /// (Story 3.12), Azure's voice list (Story 3.14) and `edge-tts
-    /// --list-voices` (Story 3.17).
+    /// (Story 3.12), Azure's voice list (Story 3.14), the installed Piper
+    /// voices (Story 3.15) and `edge-tts --list-voices` (Story 3.17).
     pub fn has_voice_list(self) -> bool {
         matches!(
             self,
             LanguageBackend::SystemVoice
                 | LanguageBackend::Remote(RemoteProvider::Azure | RemoteProvider::EdgeTts)
+                | LanguageBackend::Piper
         )
     }
 
@@ -529,6 +535,10 @@ const DEEPINFRA_SPEECH_LANGUAGES: &[SpeechLanguage] = &[
     language("tr", "Turkish"),
 ];
 
+/// Piper's speech language when nothing has been saved yet (Story 3.15):
+/// the default voice's locale.
+pub const DEFAULT_PIPER_LOCALE: &str = crate::assets::PIPER_DEFAULT_VOICE.locale;
+
 /// The saved speech language of each backend that has one (Story 3.11).
 /// Persisted. Values are stored as written — a hand-edited value outside the
 /// backend's set is kept, and refused by name at the next Speak Action.
@@ -544,6 +554,9 @@ pub struct SpeechLanguages {
     /// Story 3.17: an Edge TTS locale. Defaults to `tr-TR`; the legacy key
     /// never seeds it.
     pub edge_tts: String,
+    /// Story 3.15: a Piper locale (`tr_TR`). Defaults to the default
+    /// voice's; the legacy key never seeds it.
+    pub piper: String,
 }
 
 impl Default for SpeechLanguages {
@@ -554,14 +567,15 @@ impl Default for SpeechLanguages {
             system_voice: DEFAULT_SPEECH_LANGUAGE.to_string(),
             azure: DEFAULT_AZURE_LOCALE.to_string(),
             edge_tts: DEFAULT_EDGE_TTS_LOCALE.to_string(),
+            piper: DEFAULT_PIPER_LOCALE.to_string(),
         }
     }
 }
 
 /// The saved voice of each backend that has a voice choice (Stories 3.12,
-/// 3.14). Persisted. For the System voice `None` is the language's
-/// top-priority voice; for Azure it is no voice at all (D4).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// 3.14, 3.15). Persisted. For the System voice and Piper `None` is the
+/// language's top-priority voice; for Azure it is no voice at all (D4).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpeechVoices {
     pub system_voice: Option<String>,
     /// Azure's `ShortName` (`tr-TR-EmelNeural`).
@@ -569,6 +583,19 @@ pub struct SpeechVoices {
     /// Story 3.17: an Edge TTS voice id (`tr-TR-EmelNeural`). `None` is the
     /// language's first listed voice.
     pub edge_tts: Option<String>,
+    /// Story 3.15: a Piper voice key. Starts at the default voice.
+    pub piper: Option<String>,
+}
+
+impl Default for SpeechVoices {
+    fn default() -> Self {
+        Self {
+            system_voice: None,
+            azure: None,
+            edge_tts: None,
+            piper: Some(crate::assets::PIPER_DEFAULT_VOICE.key.to_string()),
+        }
+    }
 }
 
 impl SpeechVoices {
@@ -578,6 +605,7 @@ impl SpeechVoices {
             LanguageBackend::SystemVoice => self.system_voice.as_deref(),
             LanguageBackend::Remote(RemoteProvider::Azure) => self.azure.as_deref(),
             LanguageBackend::Remote(RemoteProvider::EdgeTts) => self.edge_tts.as_deref(),
+            LanguageBackend::Piper => self.piper.as_deref(),
             _ => None,
         }
     }
@@ -593,6 +621,7 @@ impl SpeechLanguages {
             LanguageBackend::Remote(RemoteProvider::Azure) => Some(&self.azure),
             LanguageBackend::Remote(RemoteProvider::EdgeTts) => Some(&self.edge_tts),
             LanguageBackend::SystemVoice => Some(&self.system_voice),
+            LanguageBackend::Piper => Some(&self.piper),
         }
     }
 }
@@ -618,11 +647,22 @@ pub enum BackendSelection {
     /// The OS's own speech engine in a stock voice (Story 3.12): eSpeak NG
     /// on Linux. Local, but never an ONNX target.
     SystemVoice,
+    /// A Piper neural stock voice (Story 3.15), run on the bundled CPU
+    /// runtime. Local, but not a Chatterbox ONNX target.
+    Piper,
 }
 
+/// What an unsaved selection is (Story 3.15): Piper where this OS's build
+/// has it (Linux), the bundled CPU runtime everywhere else. Only ever the
+/// answer for a profile with *no* saved selection — an explicit one is
+/// never rewritten.
 impl Default for BackendSelection {
     fn default() -> Self {
-        Self::BUNDLED_CPU
+        if cfg!(target_os = "linux") {
+            Self::Piper
+        } else {
+            Self::BUNDLED_CPU
+        }
     }
 }
 
@@ -634,12 +674,15 @@ impl BackendSelection {
         target: SpeechExecutionTarget::Cpu,
     };
 
-    /// The local ONNX execution target, or `None` for a remote provider
-    /// and for the System voice, which runs no ONNX session.
+    /// The local Chatterbox execution target, or `None` for a remote
+    /// provider, for the System voice, which runs no ONNX session, and for
+    /// Piper, whose one CPU session is not a Chatterbox target.
     pub fn local_target(&self) -> Option<SpeechExecutionTarget> {
         match self {
             BackendSelection::Local { target, .. } => Some(*target),
-            BackendSelection::Remote(_) | BackendSelection::SystemVoice => None,
+            BackendSelection::Remote(_)
+            | BackendSelection::SystemVoice
+            | BackendSelection::Piper => None,
         }
     }
 
@@ -648,7 +691,7 @@ impl BackendSelection {
     /// 3.14): the System voice and Azure.
     pub fn is_stock_voice(&self) -> bool {
         match self {
-            BackendSelection::SystemVoice => true,
+            BackendSelection::SystemVoice | BackendSelection::Piper => true,
             BackendSelection::Remote(provider) => provider.is_stock_voice(),
             BackendSelection::Local { .. } => false,
         }
@@ -659,6 +702,11 @@ impl BackendSelection {
     /// but not this.
     pub fn is_system_voice(&self) -> bool {
         matches!(self, BackendSelection::SystemVoice)
+    }
+
+    /// Whether this is Piper (Story 3.15).
+    pub fn is_piper(&self) -> bool {
+        matches!(self, BackendSelection::Piper)
     }
 
     /// The added runtime library this selection loads, if it is one the
@@ -680,6 +728,7 @@ impl BackendSelection {
             BackendSelection::Local { .. } => LanguageBackend::Local,
             BackendSelection::Remote(provider) => LanguageBackend::Remote(*provider),
             BackendSelection::SystemVoice => LanguageBackend::SystemVoice,
+            BackendSelection::Piper => LanguageBackend::Piper,
         }
     }
 
@@ -707,6 +756,7 @@ impl BackendSelection {
             }
             BackendSelection::Remote(provider) => format!("{} (remote)", provider.label()),
             BackendSelection::SystemVoice => "System voice — instant (stock voice)".to_string(),
+            BackendSelection::Piper => "Piper — natural, instant (stock voice)".to_string(),
         }
     }
 }
@@ -761,11 +811,12 @@ impl LocalRuntime {
     }
 }
 
-/// Every entry the backend `Select` lists, in order: the bundled CPU
-/// runtime, each added runtime's entries, the System voice, then the
-/// remote providers.
+/// Every entry the backend `Select` lists, in order: Piper (Story 3.15,
+/// first under Local), the bundled CPU runtime, each added runtime's
+/// entries, the System voice, then the remote providers.
 pub fn backend_choices(runtimes: &[LocalRuntime]) -> Vec<BackendSelection> {
-    std::iter::once(BackendSelection::BUNDLED_CPU)
+    std::iter::once(BackendSelection::Piper)
+        .chain(std::iter::once(BackendSelection::BUNDLED_CPU))
         .chain(runtimes.iter().flat_map(LocalRuntime::entries))
         .chain(std::iter::once(BackendSelection::SystemVoice))
         .chain(
@@ -943,11 +994,14 @@ pub enum DependencyKind {
     BackendCapability,
     /// The OS speech engine the System voice runs (Story 3.12: the
     /// `espeak-ng` program). Blocking, with manual steps: it is a system
-    /// package voice-me cannot install.
+    /// package voice-me cannot install. Piper phonemizes through it too.
     SystemVoiceEngine,
     /// The `edge-tts` program Edge TTS runs (Story 3.17). Blocking, with
     /// manual steps only: voice-me never runs pip for the user.
     EdgeTtsProgram,
+    /// The Piper voice the selection speaks in (Story 3.15). Blocking; its
+    /// Install downloads the voice named in the request.
+    PiperVoice,
 }
 
 impl DependencyKind {
@@ -961,6 +1015,7 @@ impl DependencyKind {
                 | DependencyKind::BackendCapability
                 | DependencyKind::SystemVoiceEngine
                 | DependencyKind::EdgeTtsProgram
+                | DependencyKind::PiperVoice
         )
     }
 }
@@ -1177,6 +1232,9 @@ pub struct AppState {
     /// Check with Edge TTS selected and the program found (Story 3.17).
     /// Merged in by the composition root; never persisted.
     pub edge_tts_voices: Vec<StockVoice>,
+    /// The Piper voices installed in the cache (Story 3.15), read from disk
+    /// by the composition root. Not persisted.
+    pub piper_voices: Vec<StockVoice>,
 }
 
 /// Hand-written rather than derived so the two language fields default to
@@ -1203,6 +1261,7 @@ impl Default for AppState {
             azure_region: None,
             azure_voices: Vec::new(),
             edge_tts_voices: Vec::new(),
+            piper_voices: Vec::new(),
         }
     }
 }
@@ -1223,6 +1282,7 @@ impl AppState {
             LanguageBackend::SystemVoice => &self.system_voices,
             LanguageBackend::Remote(RemoteProvider::Azure) => &self.azure_voices,
             LanguageBackend::Remote(RemoteProvider::EdgeTts) => &self.edge_tts_voices,
+            LanguageBackend::Piper => &self.piper_voices,
             _ => &[],
         }
     }
@@ -1368,15 +1428,17 @@ mod tests {
         assert_eq!(cpu_only.entries()[0].label(), "CPU (libonnxruntime.so)");
 
         let choices = backend_choices(&[cuda]);
-        assert_eq!(choices.first(), Some(&BackendSelection::BUNDLED_CPU));
-        assert_eq!(choices[0].label(), "CPU (bundled runtime)");
+        // Story 3.15: Piper first under Local, then the bundled CPU.
+        assert_eq!(choices.first(), Some(&BackendSelection::Piper));
+        assert_eq!(choices[1], BackendSelection::BUNDLED_CPU);
+        assert_eq!(choices[1].label(), "CPU (bundled runtime)");
         assert_eq!(
             choices.last(),
             Some(&BackendSelection::Remote(RemoteProvider::EdgeTts))
         );
-        assert_eq!(choices.len(), 7);
+        assert_eq!(choices.len(), 8);
         // The System voice comes after the local runtimes, before remote.
-        assert_eq!(choices[2], BackendSelection::SystemVoice);
+        assert_eq!(choices[3], BackendSelection::SystemVoice);
     }
 
     #[test]
@@ -1450,6 +1512,7 @@ mod tests {
                 BackendSelection::Local { .. } => LanguageBackend::Local,
                 BackendSelection::Remote(provider) => LanguageBackend::Remote(*provider),
                 BackendSelection::SystemVoice => LanguageBackend::SystemVoice,
+                BackendSelection::Piper => LanguageBackend::Piper,
             };
             assert_eq!(selection.language_backend(), expected);
         }
@@ -1672,5 +1735,71 @@ mod tests {
         for bad in ["west europe!", "evil.com/", "a-b", "westeurope.attacker"] {
             assert!(parse_azure_region(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn piper_is_a_local_stock_voice_listed_first_with_a_voice_list() {
+        let piper = BackendSelection::Piper;
+        assert_eq!(piper.local_target(), None);
+        assert!(!piper.is_cpu());
+        assert!(piper.is_stock_voice());
+        assert!(!piper.is_system_voice());
+        assert!(piper.is_piper());
+        assert_eq!(piper.label(), "Piper — natural, instant (stock voice)");
+        assert_eq!(backend_choices(&[])[0], piper);
+        let backend = piper.language_backend();
+        assert_eq!(backend, LanguageBackend::Piper);
+        assert!(backend.has_voice_list() && backend.has_voice_choice());
+        assert!(!backend.requires_voice());
+        assert!(backend.has_speech_language(), "even with nothing installed");
+        assert_eq!(SpeechLanguages::default().get(backend), Some("tr_TR"));
+        assert_eq!(
+            SpeechVoices::default().get(backend),
+            Some("tr_TR-fahrettin-medium")
+        );
+        assert!(DependencyKind::PiperVoice.blocks_speech());
+    }
+
+    /// The First run row at core level: with nothing saved, Linux speaks
+    /// with Piper and fahrettin; every other OS keeps the bundled CPU.
+    #[test]
+    fn an_unsaved_selection_is_piper_on_linux_and_the_bundled_cpu_elsewhere() {
+        let state = AppState::default();
+        if cfg!(target_os = "linux") {
+            assert_eq!(state.backend_selection, BackendSelection::Piper);
+            assert_eq!(state.speech_language(), Some("tr_TR"));
+            assert_eq!(
+                state.speech_voices.get(LanguageBackend::Piper),
+                Some("tr_TR-fahrettin-medium")
+            );
+        } else {
+            assert_eq!(state.backend_selection, BackendSelection::BUNDLED_CPU);
+        }
+    }
+
+    #[test]
+    fn piper_languages_are_the_installed_voices_locales() {
+        let voices = vec![
+            voice("tr_TR-fahrettin-medium", "tr_TR", "Turkish", 0),
+            voice("tr_TR-dfki-medium", "tr_TR", "Turkish", 0),
+            voice("en_US-lessac-medium", "en_US", "English", 0),
+        ];
+        let state = AppState {
+            piper_voices: voices.clone(),
+            ..AppState::default()
+        };
+        assert_eq!(state.stock_voices(LanguageBackend::Piper), &voices[..]);
+        let codes: Vec<_> = LanguageBackend::Piper
+            .language_options(&voices)
+            .into_iter()
+            .map(|language| language.code)
+            .collect();
+        assert_eq!(codes, vec!["en_US", "tr_TR"]);
+        assert_eq!(
+            resolve_stock_voice(LanguageBackend::Piper, &voices, "tr_TR", None)
+                .unwrap()
+                .id,
+            "tr_TR-fahrettin-medium"
+        );
     }
 }

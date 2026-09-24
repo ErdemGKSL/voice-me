@@ -17,6 +17,8 @@ members = [
   "crates/voice-me-tts-remote",
   "crates/voice-me-tts-system-linux",
   "crates/voice-me-tts-edge",
+  "crates/voice-me-espeak",
+  "crates/voice-me-tts-piper",
   "crates/voice-me-deps",
   "crates/voice-me-tests",
 ]

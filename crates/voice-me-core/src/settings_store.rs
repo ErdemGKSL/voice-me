@@ -16,9 +16,9 @@ use crate::error::VoiceMeError;
 use crate::ports::SettingsStore;
 use crate::state::{
     ActiveBackend, ApiKeys, AppState, BackendSelection, DEFAULT_AZURE_LOCALE,
-    DEFAULT_EDGE_TTS_LOCALE, DEFAULT_SPEECH_LANGUAGE, DependencyOutcome, LanguageBackend,
-    LocalRuntime, RemoteProvider, RemoteSample, SpeechBackend, SpeechExecutionTarget,
-    SpeechLanguages, SpeechVoices, parse_azure_region,
+    DEFAULT_EDGE_TTS_LOCALE, DEFAULT_PIPER_LOCALE, DEFAULT_SPEECH_LANGUAGE, DependencyOutcome,
+    LanguageBackend, LocalRuntime, RemoteProvider, RemoteSample, SpeechBackend,
+    SpeechExecutionTarget, SpeechLanguages, SpeechVoices, parse_azure_region,
 };
 
 const SETTINGS_FILE_NAME: &str = "settings.toml";
@@ -145,6 +145,13 @@ struct SpeechLanguagesFile {
         skip_serializing_if = "Option::is_none"
     )]
     edge_tts: Option<String>,
+    /// Story 3.15: a Piper locale. Never seeded by the legacy key.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    piper: Option<String>,
 }
 
 impl SpeechLanguagesFile {
@@ -156,6 +163,7 @@ impl SpeechLanguagesFile {
             LanguageBackend::Remote(RemoteProvider::Azure) => Some(&mut self.azure),
             LanguageBackend::Remote(RemoteProvider::EdgeTts) => Some(&mut self.edge_tts),
             LanguageBackend::SystemVoice => Some(&mut self.system_voice),
+            LanguageBackend::Piper => Some(&mut self.piper),
         }
     }
 
@@ -174,6 +182,10 @@ impl SpeechLanguagesFile {
                 .edge_tts
                 .clone()
                 .unwrap_or_else(|| DEFAULT_EDGE_TTS_LOCALE.to_string()),
+            piper: self
+                .piper
+                .clone()
+                .unwrap_or_else(|| DEFAULT_PIPER_LOCALE.to_string()),
         }
     }
 }
@@ -211,6 +223,15 @@ struct SpeechVoicesFile {
         skip_serializing_if = "Option::is_none"
     )]
     edge_tts: Option<String>,
+    /// Story 3.15: a Piper voice key. Absent is the language's
+    /// top-priority installed voice; a profile that never saved a Piper
+    /// language starts at the default voice (see `read_settings_file`).
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    piper: Option<String>,
 }
 
 impl SpeechVoicesFile {
@@ -219,6 +240,7 @@ impl SpeechVoicesFile {
             LanguageBackend::SystemVoice => Some(&mut self.system_voice),
             LanguageBackend::Remote(RemoteProvider::Azure) => Some(&mut self.azure),
             LanguageBackend::Remote(RemoteProvider::EdgeTts) => Some(&mut self.edge_tts),
+            LanguageBackend::Piper => Some(&mut self.piper),
             _ => None,
         }
     }
@@ -228,6 +250,7 @@ impl SpeechVoicesFile {
             system_voice: self.system_voice.clone(),
             azure: self.azure.clone(),
             edge_tts: self.edge_tts.clone(),
+            piper: self.piper.clone(),
         }
     }
 }
@@ -256,6 +279,8 @@ enum SelectionFile {
     },
     /// Story 3.12.
     SystemVoice,
+    /// Story 3.15.
+    Piper,
 }
 
 impl From<&BackendSelection> for SelectionFile {
@@ -269,6 +294,7 @@ impl From<&BackendSelection> for SelectionFile {
                 provider: *provider,
             },
             BackendSelection::SystemVoice => SelectionFile::SystemVoice,
+            BackendSelection::Piper => SelectionFile::Piper,
         }
     }
 }
@@ -279,6 +305,7 @@ impl From<SelectionFile> for BackendSelection {
             SelectionFile::Local { runtime, target } => BackendSelection::Local { runtime, target },
             SelectionFile::Remote { provider } => BackendSelection::Remote(provider),
             SelectionFile::SystemVoice => BackendSelection::SystemVoice,
+            SelectionFile::Piper => BackendSelection::Piper,
         }
     }
 }
@@ -353,8 +380,12 @@ impl Default for SettingsFile {
                 system_voice: Some(DEFAULT_SPEECH_LANGUAGE.to_string()),
                 azure: Some(DEFAULT_AZURE_LOCALE.to_string()),
                 edge_tts: Some(DEFAULT_EDGE_TTS_LOCALE.to_string()),
+                piper: Some(DEFAULT_PIPER_LOCALE.to_string()),
             },
-            speech_voices: SpeechVoicesFile::default(),
+            speech_voices: SpeechVoicesFile {
+                piper: Some(crate::assets::PIPER_DEFAULT_VOICE.key.to_string()),
+                ..SpeechVoicesFile::default()
+            },
             selected_mic_device: None,
             backend_selection: None,
             local_runtimes: Vec::new(),
@@ -447,6 +478,17 @@ impl FileSettingsStore {
             .speech_languages
             .edge_tts
             .get_or_insert_with(|| DEFAULT_EDGE_TTS_LOCALE.to_string());
+        // Story 3.15: a profile that never saved a Piper language starts at
+        // the default voice and its locale. Once a language is saved, an
+        // absent voice is that language's top-priority one — so a new
+        // language (which clears the voice) is never pulled back here.
+        if settings.speech_languages.piper.is_none() {
+            settings.speech_languages.piper = Some(DEFAULT_PIPER_LOCALE.to_string());
+            settings
+                .speech_voices
+                .piper
+                .get_or_insert_with(|| crate::assets::PIPER_DEFAULT_VOICE.key.to_string());
+        }
         // A hand-edited region that is not `[a-z0-9]+` is no region: it
         // must never reach the host name.
         settings.azure_region = settings
@@ -508,6 +550,8 @@ impl FileSettingsStore {
             azure_voices: Vec::new(),
             // Listed by the `edge-tts` program at a check, never a file.
             edge_tts_voices: Vec::new(),
+            // Read from the cache by the composition root, never a file.
+            piper_voices: Vec::new(),
         }
     }
 }
@@ -819,7 +863,12 @@ mod tests {
         // No settings file at all yet (first run).
         let state = store.load().unwrap();
         assert_eq!(state.speech_languages, SpeechLanguages::default());
-        assert_eq!(state.speech_language(), Some("tr"));
+        assert_eq!(state.speech_languages.local, "tr");
+        // Story 3.15: the unsaved selection (Piper on Linux) reads its own.
+        assert_eq!(
+            state.speech_language(),
+            SpeechLanguages::default().get(BackendSelection::default().language_backend())
+        );
 
         // Any save writes the whole file, so the defaults become explicit.
         store.save_hotkey(Some("Ctrl+Alt+KeyV")).unwrap();
@@ -1031,8 +1080,10 @@ mod tests {
         FileSettingsStore::with_dirs(config_dir.to_path_buf(), data_dir.to_path_buf())
     }
 
+    /// Story 3.15: a file with no saved selection loads as the default —
+    /// Piper on Linux, the bundled CPU runtime elsewhere.
     #[test]
-    fn a_file_from_before_story_3_5_loads_as_the_bundled_cpu_backend() {
+    fn a_file_from_before_story_3_5_loads_as_the_default_backend() {
         let config_dir = tempfile::tempdir().unwrap();
         let data_dir = tempfile::tempdir().unwrap();
         fs::write(
@@ -1043,7 +1094,12 @@ mod tests {
 
         let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
 
-        assert_eq!(state.backend_selection, BackendSelection::BUNDLED_CPU);
+        assert_eq!(state.backend_selection, BackendSelection::default());
+        if cfg!(target_os = "linux") {
+            assert_eq!(state.backend_selection, BackendSelection::Piper);
+        } else {
+            assert_eq!(state.backend_selection, BackendSelection::BUNDLED_CPU);
+        }
         assert!(state.local_runtimes.is_empty());
         assert_eq!(state.api_keys, ApiKeys::default());
         assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
@@ -1143,7 +1199,8 @@ mod tests {
 
         let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
 
-        assert_eq!(state.backend_selection, BackendSelection::BUNDLED_CPU);
+        // The default — Piper on Linux since Story 3.15.
+        assert_eq!(state.backend_selection, BackendSelection::default());
         assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
     }
 
@@ -1405,5 +1462,60 @@ mod tests {
             state.speech_languages.azure, "tr-TR",
             "the legacy key never seeds Azure"
         );
+    }
+
+    /// Story 3.15: Piper's selection, language and voice round-trip; an
+    /// explicit selection is never rewritten; a new language clears the
+    /// voice and it stays cleared.
+    #[test]
+    fn piper_selection_language_and_voice_round_trip() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = store_in(config_dir.path(), data_dir.path());
+
+        let fresh = store.load().unwrap();
+        assert_eq!(fresh.speech_languages.piper, "tr_TR");
+        assert_eq!(
+            fresh.speech_voices.piper.as_deref(),
+            Some("tr_TR-fahrettin-medium")
+        );
+
+        store
+            .save_backend_selection(&BackendSelection::Piper)
+            .unwrap();
+        store
+            .save_speech_voice(LanguageBackend::Piper, Some("tr_TR-dfki-medium"))
+            .unwrap();
+        let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+        assert_eq!(state.backend_selection, BackendSelection::Piper);
+        assert_eq!(
+            state.speech_voices.piper.as_deref(),
+            Some("tr_TR-dfki-medium")
+        );
+
+        store
+            .save_speech_language(LanguageBackend::Piper, "en_US")
+            .unwrap();
+        let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+        assert_eq!(state.speech_languages.piper, "en_US");
+        assert_eq!(
+            state.speech_voices.piper, None,
+            "a new language clears the voice"
+        );
+        assert_eq!(
+            state.speech_languages.system_voice, "tr",
+            "every other backend's language is untouched"
+        );
+
+        // An explicit selection is never rewritten by the default.
+        store
+            .save_backend_selection(&BackendSelection::BUNDLED_CPU)
+            .unwrap();
+        assert_eq!(
+            store.load().unwrap().backend_selection,
+            BackendSelection::BUNDLED_CPU
+        );
+        let text = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
+        assert!(text.contains("kind = \"local\""), "{text}");
     }
 }

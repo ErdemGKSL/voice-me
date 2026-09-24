@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use voice_me_core::{AudioBuffer, StockVoice, TtsPort, VoiceMeError};
-use voice_me_tts_system_linux::process::{self, RunError};
+use voice_me_espeak::{self as process, RunError};
 
 pub use install::{
     CHECK_AGAIN_STEP, PIP_FALLBACK_STEP, install_steps, install_steps_for, pipx_command_for,

@@ -1,0 +1,94 @@
+{
+ "tr_TR-dfki-medium": {
+  "key": "tr_TR-dfki-medium",
+  "name": "dfki",
+  "language": {
+   "code": "tr_TR",
+   "family": "tr",
+   "region": "TR",
+   "name_native": "Türkçe",
+   "name_english": "Turkish",
+   "country_english": "Turkey"
+  },
+  "quality": "medium",
+  "num_speakers": 1,
+  "speaker_id_map": {},
+  "files": {
+   "tr/tr_TR/dfki/medium/tr_TR-dfki-medium.onnx": {
+    "size_bytes": 63201294,
+    "md5_digest": "f51287b350a042dd8d67b2b215145e5a"
+   },
+   "tr/tr_TR/dfki/medium/tr_TR-dfki-medium.onnx.json": {
+    "size_bytes": 4960,
+    "md5_digest": "683c97d5bf7588abb4d7b9ff556c9466"
+   },
+   "tr/tr_TR/dfki/medium/MODEL_CARD": {
+    "size_bytes": 319,
+    "md5_digest": "870d6bc19719328699449cb7b4dd56cf"
+   }
+  },
+  "aliases": []
+ },
+ "en_US-lessac-medium": {
+  "key": "en_US-lessac-medium",
+  "name": "lessac",
+  "language": {
+   "code": "en_US",
+   "family": "en",
+   "region": "US",
+   "name_native": "English",
+   "name_english": "English",
+   "country_english": "United States"
+  },
+  "quality": "medium",
+  "num_speakers": 1,
+  "speaker_id_map": {},
+  "files": {
+   "en/en_US/lessac/medium/en_US-lessac-medium.onnx": {
+    "size_bytes": 63201294,
+    "md5_digest": "2fc642b535197b6305c7c8f92dc8b24f"
+   },
+   "en/en_US/lessac/medium/en_US-lessac-medium.onnx.json": {
+    "size_bytes": 4885,
+    "md5_digest": "c1f2b7bddefe113f3255ff9ef234cfd3"
+   },
+   "en/en_US/lessac/medium/MODEL_CARD": {
+    "size_bytes": 351,
+    "md5_digest": "42f2dd4a98149e12fc70b301d9579dfd"
+   }
+  },
+  "aliases": [
+   "en-us-lessac-medium"
+  ]
+ },
+ "de_DE-thorsten-medium": {
+  "key": "de_DE-thorsten-medium",
+  "name": "thorsten",
+  "language": {
+   "code": "de_DE",
+   "family": "de",
+   "region": "DE",
+   "name_native": "Deutsch",
+   "name_english": "German",
+   "country_english": "Germany"
+  },
+  "quality": "medium",
+  "num_speakers": 1,
+  "speaker_id_map": {},
+  "files": {
+   "de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx": {
+    "size_bytes": 63201294,
+    "md5_digest": "a129b00fb3078df43c96bab6c94535c0"
+   },
+   "de/de_DE/thorsten/medium/de_DE-thorsten-medium.onnx.json": {
+    "size_bytes": 4819,
+    "md5_digest": "843a7bd7272724f750534dd5a26d1aad"
+   },
+   "de/de_DE/thorsten/medium/MODEL_CARD": {
+    "size_bytes": 285,
+    "md5_digest": "e84cf8b09957fccceb068a3c1664d0f3"
+   }
+  },
+  "aliases": []
+ }
+}

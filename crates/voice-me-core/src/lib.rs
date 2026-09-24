@@ -15,8 +15,9 @@ pub use audio::{AudioBuffer, SAMPLE_RATE};
 pub use error::VoiceMeError;
 pub use event::AppEvent;
 pub use ports::{
-    CheckRequest, DependencyProvisioningPort, HotkeyPort, NotificationPort, SettingsStore,
-    TrayPort, TtsPort, VirtualMicPort,
+    CatalogResult, CheckRequest, DependencyProvisioningPort, HotkeyPort, NotificationPort,
+    PiperCatalogEntry, PiperCatalogPort, PiperSource, SettingsStore, TrayPort, TtsPort,
+    VirtualMicPort,
 };
 pub use settings_store::FileSettingsStore;
 pub use speak::{
@@ -25,9 +26,9 @@ pub use speak::{
 };
 pub use state::{
     AZURE_REGION_INVALID, ActiveBackend, ApiKeys, AppState, BackendSelection, DEFAULT_AZURE_LOCALE,
-    DEFAULT_EDGE_TTS_LOCALE, DEFAULT_SPEECH_LANGUAGE, DEFAULT_UI_LANGUAGE, Dependency,
-    DependencyKind, DependencyOutcome, DependencyReport, DependencyStatus, LanguageBackend,
-    LanguageOption, LocalRuntime, RemoteProvider, RemoteSample, SpeechBackend,
+    DEFAULT_EDGE_TTS_LOCALE, DEFAULT_PIPER_LOCALE, DEFAULT_SPEECH_LANGUAGE, DEFAULT_UI_LANGUAGE,
+    Dependency, DependencyKind, DependencyOutcome, DependencyReport, DependencyStatus,
+    LanguageBackend, LanguageOption, LocalRuntime, RemoteProvider, RemoteSample, SpeechBackend,
     SpeechExecutionTarget, SpeechLanguage, SpeechLanguages, SpeechVoices, SpeechWeights,
     StockVoice, StockVoiceRefusal, backend_choices, format_bytes, parse_azure_region,
     resolve_stock_voice, stock_voice_languages, stock_voices_of,

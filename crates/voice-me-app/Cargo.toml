@@ -21,6 +21,8 @@ voice-me-deps = { path = "../voice-me-deps" }
 # The other network-capable crate (AD-8) — `voice-me-tests` fails on a
 # third.
 voice-me-tts-remote = { path = "../voice-me-tts-remote" }
+# Story 3.15: Piper voices, in-process on the shared CPU runtime. Offline.
+voice-me-tts-piper = { path = "../voice-me-tts-piper" }
 # For the `AppEvent` channel (AD-3) — already resolved to 0.3.34 in
 # Cargo.lock via gpui's own dependency graph.
 futures = "0.3"
@@ -37,6 +39,8 @@ voice-me-tts-system-linux = { path = "../voice-me-tts-system-linux" }
 # Story 3.17: Edge TTS — the user-installed `edge-tts` program as a bounded
 # child process. Linux only; no reqwest.
 voice-me-tts-edge = { path = "../voice-me-tts-edge" }
+# Story 3.15: Piper phonemizes through `espeak-ng`, run by this crate only.
+voice-me-espeak = { path = "../voice-me-espeak" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 voice-me-tray-windows = { path = "../voice-me-tray-windows" }

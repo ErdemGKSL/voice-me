@@ -95,6 +95,7 @@ Decisions (P1–P3 by Erdem on 2026-09-24, P4–P7 recommended with this proposa
 - **P5 — Voices are fetched from the Hugging Face origin at a pinned revision and not mirrored.** Their licences vary (Turkish: CC BY-NC-SA 4.0). The licence and attribution are shown in the voice picker. This follows AD-7's "any stable, versioned, resumable URL".
 - **P6 — CPU only.** Piper gets no GPU backend or device picker. At RTF ~0.04 there is nothing to gain.
 - **P7 — Voice catalogue is a pinned, curated table in `voice-me-deps`, not a live fetch of `voices.json`.** That keeps SHA-256 pins in code, as the epic context requires, and it keeps the voice list offline.
+  **Reversed by the addendum below (2026-09-24).**
 
 ---
 
@@ -272,3 +273,14 @@ After `3-14-generate-through-azure-neural-tts`, add:
 - No voice-me crate links libespeak-ng, `piper1-gpl` or `piper-phonemize`. Only `voice-me-espeak` spawns a process.
 - The phonemes `voice-me-tts-piper` produces for the §1 Turkish lines match Piper's reference sequence, which is pinned as a test fixture.
 - The Windows crates build and pass their tests on CI's Windows job (3.16).
+
+---
+
+## Addendum (2026-09-24): the Piper voices tab, three catalogs, fahrettin default
+
+Agreed while specifying Story 3.15; supersedes P7 and the `tr_TR-dfki-medium` default.
+
+- **P7 reversed — voices come from three live catalogs, browsed in a new Settings → Piper voices tab.** In precedence order (the first source wins a duplicate voice key): voice-me's own `piper-voices/catalog.json` in this repository (URL, size and SHA-256 per file; adding a voice is an edit of that file, no release needed), `rhasspy/piper-voices`' `voices.json` at pinned revision `c10ece1aade47bb51c153c893d14e5bf8e5b7117` (size and MD5), and the `speaches-ai` Hugging Face repositories (`models?author=speaches-ai&search=piper-`; at download, `?blobs=true` gives the revision, the LFS SHA-256 of `model.onnx` and the Git blob SHA-1 of `config.json`). Each file is checked with the digest its source publishes. Catalogs are fetched only when the tab is opened or refreshed, never at startup.
+- **Default voice: `tr_TR-fahrettin-medium` (CC0, NabuCasa dataset)** from `speaches-ai/piper-tr_TR-fahrettin-medium` at `aab8f92429ede58091e17de506484a2c84384792`, SHA-256 of both files pinned in code, so a first run needs no catalog. `tr_TR-dfki-medium` (CC BY-NC-SA 4.0) becomes an optional download.
+- **Storage:** `<cache>/piper/<key>/{model.onnx, config.json, voice.toml}`; the installed list is read from disk and supplies Piper's languages and voices.
+- **Tab:** search and language filter; rows with name, language, quality, size, source, licence ("see model card" when none is declared) and status; Download (progress), Delete, Use. The Backend tab's Piper pickers list installed voices only, with a "Manage voices" link.

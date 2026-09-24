@@ -176,3 +176,9 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-3-14-generate-through-azure-neural-tts.md`
   summary: Unverified: Azure's disclosure (an extra note and a long voice item) may not fit `OVERLAY_DISCLOSURE_HEIGHT` (medium if true).
   evidence: No test renders `confirm_disclosure` with Azure's text. The manual check in the spec (confirm the disclosure with a real key) settles it. If it clips, raise the height in `crates/voice-me-app/src/main.rs`.
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-15-speak-naturally-and-instantly-with-piper-on-linux.md`
+  summary: The real Piper engine path (`PiperTts::ensure_voice` rebuilding on a voice change, `run_graph`'s input names, shapes and `scales` order) only runs in `tests/real_engine.rs`, which skips itself in CI.
+  evidence: CI sets neither `ORT_DYLIB_PATH` nor `VOICE_ME_PIPER_TEST_VOICE`. Fix it either with a session-builder seam so a unit test can check the rebuild, or by having CI fetch the pinned runtime and fahrettin (about 72 MB) and set both variables.
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-15-speak-naturally-and-instantly-with-piper-on-linux.md`
+  summary: No test checks that Install on "No Piper voice installed" downloads the built-in default voice (fahrettin).
+  evidence: `piper::default_voice()` has its URLs fixed in code, so an adapter-level test cannot point it at a `TestServer`. Make the default voice's source injectable (e.g. through `PiperSources`) first.

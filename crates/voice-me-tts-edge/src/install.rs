@@ -1,6 +1,6 @@
 //! The manual steps for a missing `edge-tts`, from `/etc/os-release`.
 
-use voice_me_tts_system_linux::{distro_ids, is_opensuse, read_os_release};
+use voice_me_espeak::{distro_ids, is_opensuse, read_os_release};
 
 /// The command that installs `pipx` on the system `os_release` (the
 /// contents of `/etc/os-release`) describes, going by `ID` and then

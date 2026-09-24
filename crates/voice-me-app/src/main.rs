@@ -76,8 +76,9 @@ use voice_me_core::VoiceMeError;
 use voice_me_core::{
     ActiveBackend, AppEvent, AppState, BackendSelection, CheckRequest, DependencyKind,
     DependencyOutcome, DependencyProvisioningPort, DependencyReport, FileSettingsStore, HotkeyPort,
-    LocalRuntime, NotificationPort, RemoteProvider, SettingsStore, SpeechBackend,
-    SpeechExecutionTarget, StockVoice, TtsPort, VirtualMicPort, tokio_bridge,
+    LanguageBackend, LocalRuntime, NotificationPort, PiperCatalogPort, RemoteProvider,
+    SettingsStore, SpeechBackend, SpeechExecutionTarget, StockVoice, TtsPort, VirtualMicPort,
+    assets, stock_voices_of, tokio_bridge,
 };
 use voice_me_deps::DepsAdapter;
 use voice_me_tts::TtsAdapter;
@@ -86,7 +87,9 @@ use voice_me_tts_remote::{
 };
 use voice_me_ui::{
     BackendAction, BackendActions, BackendArea, BackendPanel, ConfirmDisclosure, DependenciesTab,
-    DisclosureText, PromptOverlayView, RowProvisioning, SettingsView, blocker_notice,
+    DisclosureText, PiperCatalogState, PiperVoicesAction, PiperVoicesActions, PiperVoicesPanel,
+    PiperVoicesTab, PromptOverlayView, RowProvisioning, SettingsView, VoiceDownload,
+    blocker_notice,
 };
 
 #[cfg(target_os = "linux")]
@@ -335,6 +338,47 @@ fn resolve_backend(selection: &BackendSelection) -> SpeechBackend {
     }
 }
 
+/// The Piper voice `state` speaks in (Story 3.15): the saved one, or the
+/// saved language's top installed voice — or, for the default language
+/// with nothing installed, the default voice. `None` for any other
+/// selection, or when no voice can be named.
+/// Use on the Piper voices tab: the voice's language is saved first,
+/// because saving a language clears the voice, then the voice itself.
+fn use_piper_voice(
+    store: &dyn SettingsStore,
+    key: &str,
+    locale: &str,
+) -> Result<AppState, VoiceMeError> {
+    store.save_speech_language(LanguageBackend::Piper, locale)?;
+    store.save_speech_voice(LanguageBackend::Piper, Some(key))
+}
+
+fn piper_voice_for(state: &AppState) -> Option<String> {
+    if !state.backend_selection.is_piper() {
+        return None;
+    }
+    if let Some(voice) = state.speech_voices.get(LanguageBackend::Piper) {
+        return Some(voice.to_string());
+    }
+    let language = state.speech_languages.piper.trim();
+    stock_voices_of(&state.piper_voices, language)
+        .first()
+        .map(|voice| voice.id.clone())
+        .or_else(|| {
+            language
+                .eq_ignore_ascii_case(assets::PIPER_DEFAULT_VOICE.locale)
+                .then(|| assets::PIPER_DEFAULT_VOICE.key.to_string())
+        })
+}
+
+/// The Piper voices installed in the cache, as stock voices. Read from disk
+/// on every call: installing or deleting one changes it.
+fn installed_piper_voices() -> Vec<StockVoice> {
+    assets::model_cache_root()
+        .map(|root| assets::installed_piper_stock_voices(&root))
+        .unwrap_or_default()
+}
+
 /// What the Dependency Check is asked about for `state`.
 fn check_request(state: &AppState) -> CheckRequest {
     CheckRequest {
@@ -345,7 +389,9 @@ fn check_request(state: &AppState) -> CheckRequest {
             BackendSelection::Remote(provider) => {
                 !provider.needs_api_key() || state.api_keys.has(*provider)
             }
-            BackendSelection::Local { .. } | BackendSelection::SystemVoice => false,
+            BackendSelection::Local { .. }
+            | BackendSelection::SystemVoice
+            | BackendSelection::Piper => false,
         },
         // Story 3.14: only Azure has a region; only its voice is required.
         has_region: state.azure_region.is_some(),
@@ -353,14 +399,19 @@ fn check_request(state: &AppState) -> CheckRequest {
             .speech_voices
             .get(state.backend_selection.language_backend())
             .is_some(),
+        piper_voice: piper_voice_for(state),
     }
 }
 
 /// The runtime library a selection loads: the added one it names, or the
-/// bundled one by the usual rule. `None` for a remote selection, or when
-/// there is no cache root to resolve the bundled one against.
+/// bundled one by the usual rule — which is also Piper's (Story 3.15: it
+/// shares the bundled CPU runtime). `None` for a remote selection and the
+/// System voice, or when there is no cache root to resolve the bundled one
+/// against.
 fn selection_library(selection: &BackendSelection) -> Option<PathBuf> {
-    selection.local_target()?;
+    if !selection.is_piper() {
+        selection.local_target()?;
+    }
     let root = voice_me_core::assets::model_cache_root().ok()?;
     Some(voice_me_core::assets::resolve_runtime_dylib(&root, selection.added_runtime()).path)
 }
@@ -495,6 +546,18 @@ fn build_engine(
                 .to_string(),
         );
     }
+    // Story 3.15: Piper on the bundled CPU runtime, committed through
+    // `voice-me-tts`'s once-per-process guard; phonemes from `espeak-ng`.
+    if state.backend_selection.is_piper() {
+        return match build_piper(state) {
+            Ok(port) => Engine {
+                port: Some(port),
+                unavailable: None,
+                generation,
+            },
+            Err(reason) => unavailable(reason),
+        };
+    }
     if let BackendSelection::Remote(provider) = &state.backend_selection {
         return unavailable(format!(
             "{} is selected, and remote generation through it arrives in a later voice-me \
@@ -513,6 +576,32 @@ fn build_engine(
             unavailable(error.to_string())
         }
     }
+}
+
+/// Piper's engine (Story 3.15), or why there is none.
+#[cfg(target_os = "linux")]
+fn build_piper(state: &AppState) -> Result<Arc<dyn TtsPort>, String> {
+    let root = assets::model_cache_root().map_err(|error| error.to_string())?;
+    let runtime_root = root.clone();
+    Ok(Arc::new(voice_me_tts_piper::PiperTts::new(
+        root,
+        piper_voice_for(state),
+        Arc::new(voice_me_tts_piper::EspeakPhonemizer::new()),
+        Arc::new(move || {
+            voice_me_tts::sessions::init_runtime(
+                &assets::resolve_runtime_dylib(&runtime_root, None).path,
+            )
+        }),
+    )))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn build_piper(_state: &AppState) -> Result<Arc<dyn TtsPort>, String> {
+    Err(
+        "Piper on this system arrives in a later voice-me release. Choose another backend under \
+         Settings → Backend."
+            .to_string(),
+    )
 }
 
 /// The remote provider whose disclosure the hotkey press has to ask about
@@ -543,18 +632,20 @@ fn is_current_engine_report(current_generation: u64, reported_generation: u64) -
     current_generation == reported_generation
 }
 
-/// Whether to warm the engine up now: a Reference Voice Sample exists, this
-/// engine has not been warmed yet, and the check that just landed was run
-/// for the *current* selection and found it runnable — so a selection that
-/// cannot run here never commits its runtime library just by trying, not
-/// even on the strength of a late report about the previous selection.
+/// Whether to warm the engine up now: a Reference Voice Sample exists (or
+/// the engine needs none — Piper, Story 3.15), this engine has not been
+/// warmed yet, and the check that just landed was run for the *current*
+/// selection and found it runnable — so a selection that cannot run here
+/// never commits its runtime library just by trying, not even on the
+/// strength of a late report about the previous selection.
 fn should_warm_up(
     runnable: bool,
     for_current_selection: bool,
     has_active_sample: bool,
+    needs_no_sample: bool,
     already_warmed: bool,
 ) -> bool {
-    runnable && for_current_selection && has_active_sample && !already_warmed
+    runnable && for_current_selection && (has_active_sample || needs_no_sample) && !already_warmed
 }
 
 /// What a hotkey press should open, given what the last Dependency Check
@@ -682,6 +773,8 @@ fn current_state(
     state.azure_voices = azure_voices.to_vec();
     // Story 3.17: Edge TTS's list, as the program last listed it.
     state.edge_tts_voices = edge_tts_voices.to_vec();
+    // Story 3.15: the installed Piper voices, read from the cache.
+    state.piper_voices = installed_piper_voices();
     state
 }
 
@@ -1193,6 +1286,107 @@ mod tests {
         assert!(state.azure_voices.is_empty());
     }
 
+    /// A fresh directory under the system temp dir, removed on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "voice-me-app-{name}-{}-{:?}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Held by every test that sets or relies on `CACHE_ROOT_ENV` staying
+    /// put, so none of them sees the cache root change mid-test.
+    static CACHE_ROOT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn cache_root_lock() -> std::sync::MutexGuard<'static, ()> {
+        CACHE_ROOT_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Story 3.15: the installed Piper voices are read from the cache on
+    /// every read.
+    #[test]
+    fn the_installed_piper_voices_are_merged_into_every_read() {
+        let _lock = cache_root_lock();
+        let cache = TempDir::new("piper-cache");
+        let key = "tr_TR-dfki-medium";
+        let files = assets::piper_voice_files(&cache.0, key).unwrap();
+        std::fs::create_dir_all(&files.dir).unwrap();
+        std::fs::write(&files.model, b"m").unwrap();
+        std::fs::write(&files.config, b"c").unwrap();
+        std::fs::write(
+            &files.manifest,
+            "name = \"dfki\"\nlocale = \"tr_TR\"\nlabel = \"Turkish (Turkey)\"\n\
+             quality = \"medium\"\nsource = \"rhasspy/piper-voices\"\n",
+        )
+        .unwrap();
+        let previous = std::env::var_os(assets::CACHE_ROOT_ENV);
+        // SAFETY: only this test sets the cache root, under
+        // `cache_root_lock`, which every test comparing cache-root reads
+        // holds too.
+        unsafe { std::env::set_var(assets::CACHE_ROOT_ENV, &cache.0) };
+        let store: Arc<dyn SettingsStore> = Arc::new(SampleAppearsLater {
+            loads: AtomicUsize::new(0),
+        });
+
+        let state = current_state(&store, &DependencyOutcome::Pending, &[], &[], &[]);
+
+        // SAFETY: as above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(assets::CACHE_ROOT_ENV, value),
+                None => std::env::remove_var(assets::CACHE_ROOT_ENV),
+            }
+        }
+        let ids: Vec<_> = state
+            .piper_voices
+            .iter()
+            .map(|voice| voice.id.as_str())
+            .collect();
+        assert_eq!(ids, vec![key]);
+        assert_eq!(state.piper_voices[0].language, "tr_TR");
+    }
+
+    /// Use on the Piper voices tab saves the language before the voice,
+    /// since saving a language clears the voice: a voice of another
+    /// locale ends up saved.
+    #[test]
+    fn using_a_piper_voice_of_another_language_saves_that_voice() {
+        let dir = TempDir::new("use-piper-voice");
+        let store = FileSettingsStore::with_dirs(dir.0.join("config"), dir.0.join("data"));
+
+        let state = use_piper_voice(&store, "en_US-lessac-medium", "en_US").unwrap();
+
+        assert_eq!(state.speech_languages.piper, "en_US");
+        assert_eq!(
+            state.speech_voices.piper.as_deref(),
+            Some("en_US-lessac-medium")
+        );
+        let reloaded = store.load().unwrap();
+        assert_eq!(reloaded.speech_languages.piper, "en_US");
+        assert_eq!(
+            reloaded.speech_voices.piper.as_deref(),
+            Some("en_US-lessac-medium")
+        );
+    }
+
     #[test]
     fn the_resolved_backend_rides_along_with_every_read() {
         let store: Arc<dyn SettingsStore> = Arc::new(SampleAppearsLater {
@@ -1556,20 +1750,27 @@ mod tests {
 
         #[test]
         fn warm_up_waits_for_a_runnable_check_and_happens_once_per_engine() {
-            assert!(should_warm_up(true, true, true, false));
+            assert!(should_warm_up(true, true, true, false, false));
             assert!(
-                !should_warm_up(false, true, true, false),
+                !should_warm_up(false, true, true, false, false),
                 "a check that found a blocker never triggers a warm-up"
             );
             assert!(
-                !should_warm_up(true, false, true, false),
+                !should_warm_up(true, false, true, false, false),
                 "a late report about the previous selection never triggers one"
             );
             assert!(
-                !should_warm_up(true, true, false, false),
+                !should_warm_up(true, true, false, false, false),
                 "no sample, no warm-up"
             );
-            assert!(!should_warm_up(true, true, true, true), "already warmed");
+            assert!(
+                should_warm_up(true, true, false, true, false),
+                "Story 3.15: Piper needs no sample to warm up"
+            );
+            assert!(
+                !should_warm_up(true, true, true, false, true),
+                "already warmed"
+            );
         }
 
         /// A store `build_engine` can hold; it is never touched by
@@ -1614,6 +1815,87 @@ mod tests {
             assert!(engine.unavailable.is_none());
             let port = engine.port.expect("an engine in the slot");
             assert!(port.is_ready(), "a remote engine has no sessions to build");
+        }
+
+        fn piper_voice(id: &str, locale: &str) -> StockVoice {
+            StockVoice {
+                id: id.to_string(),
+                language: locale.to_string(),
+                language_label: "Turkish".to_string(),
+                name: id.to_string(),
+                priority: 0,
+            }
+        }
+
+        /// Story 3.15: the check asks about the voice Piper speaks in — the
+        /// saved one, the language's top installed one, or on the default
+        /// language the default voice — and never needs a key.
+        #[test]
+        fn the_check_request_names_pipers_voice() {
+            let state = AppState {
+                backend_selection: BackendSelection::Piper,
+                ..AppState::default()
+            };
+            let request = check_request(&state);
+            assert_eq!(request.selection, BackendSelection::Piper);
+            assert_eq!(request.backend, SpeechBackend::CPU);
+            assert!(!request.has_api_key);
+            assert_eq!(
+                request.piper_voice.as_deref(),
+                Some("tr_TR-fahrettin-medium")
+            );
+
+            let mut english = state.clone();
+            english.speech_voices.piper = None;
+            english.speech_languages.piper = "en_US".to_string();
+            assert_eq!(check_request(&english).piper_voice, None);
+            english.piper_voices = vec![piper_voice("en_US-lessac-medium", "en_US")];
+            assert_eq!(
+                check_request(&english).piper_voice.as_deref(),
+                Some("en_US-lessac-medium")
+            );
+
+            let cpu = AppState {
+                backend_selection: BackendSelection::BUNDLED_CPU,
+                ..state
+            };
+            assert_eq!(check_request(&cpu).piper_voice, None);
+        }
+
+        /// Story 3.15: Piper loads the bundled CPU runtime — the same
+        /// library, so switching to or from the bundled CPU needs no restart.
+        #[test]
+        fn piper_loads_the_bundled_runtime() {
+            let _lock = super::cache_root_lock();
+            let _ = voice_me_core::assets::model_cache_root();
+            assert_eq!(
+                selection_library(&BackendSelection::Piper),
+                selection_library(&BackendSelection::BUNDLED_CPU)
+            );
+            if voice_me_core::assets::model_cache_root().is_ok() {
+                assert!(selection_library(&BackendSelection::Piper).is_some());
+            }
+            assert_eq!(selection_library(&BackendSelection::SystemVoice), None);
+        }
+
+        /// Story 3.15: Piper gets its own engine — nothing built until a
+        /// warm-up or a line, and never the "later release" sentence.
+        #[test]
+        fn piper_gets_its_engine() {
+            let (tx, _rx) = mpsc::unbounded();
+            let state = AppState {
+                backend_selection: BackendSelection::Piper,
+                ..AppState::default()
+            };
+
+            let engine = build_engine(&state, None, &tx, &unused_store());
+
+            assert!(engine.unavailable.is_none(), "{:?}", engine.unavailable);
+            let port = engine.port.expect("an engine in the slot");
+            assert!(
+                !port.is_ready(),
+                "no session is built by building the engine"
+            );
         }
 
         /// Story 3.14: an Azure selection, keyed and with a voice list.
@@ -2185,7 +2467,11 @@ fn main() {
         // adapter for the whole process — it remembers which rows are
         // installing, so a second Install on the same row is refused
         // rather than racing the first on one `.part` file.
-        let deps_port: Arc<dyn DependencyProvisioningPort> = Arc::new(DepsAdapter::new());
+        let deps_adapter = Arc::new(DepsAdapter::new());
+        let deps_port: Arc<dyn DependencyProvisioningPort> = deps_adapter.clone();
+        // Story 3.15: the same adapter serves the Piper voices tab, so a
+        // voice its catalog listed is one the voice row can install too.
+        let piper_catalog: Arc<dyn PiperCatalogPort> = deps_adapter;
 
         #[cfg(target_os = "linux")]
         let notification_port: Arc<dyn NotificationPort> = Arc::new(LinuxNotificationAdapter);
@@ -2322,6 +2608,40 @@ fn main() {
         // listing that finishes late — overtaken, or for a backend no
         // longer selected — is discarded.
         let edge_tts_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        // Story 3.15: the Piper voices tab's state — the catalogs as last
+        // fetched (only when the tab asked), each voice's download, and
+        // the last failed delete or "Use". The installed list is read from
+        // disk on every panel.
+        let piper_catalog_state: Rc<RefCell<PiperCatalogState>> =
+            Rc::new(RefCell::new(PiperCatalogState::NotLoaded));
+        let piper_downloads: Rc<RefCell<HashMap<String, VoiceDownload>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        let piper_error: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
+        let make_piper_panel: Rc<dyn Fn() -> PiperVoicesPanel> = Rc::new({
+            let settings_store = settings_store.clone();
+            let piper_catalog_state = piper_catalog_state.clone();
+            let piper_downloads = piper_downloads.clone();
+            let piper_error = piper_error.clone();
+            move || {
+                let installed = assets::model_cache_root()
+                    .map(|root| assets::installed_piper_voices(&root))
+                    .unwrap_or_default();
+                // "In use" only while Piper really is the selection.
+                let mut state = settings_store.load().unwrap_or_default();
+                state.piper_voices = installed
+                    .iter()
+                    .map(|voice| voice.to_stock_voice())
+                    .collect();
+                PiperVoicesPanel {
+                    in_use: piper_voice_for(&state),
+                    installed,
+                    catalog: piper_catalog_state.borrow().clone(),
+                    downloads: piper_downloads.borrow().clone(),
+                    error: piper_error.borrow().clone(),
+                }
+            }
+        });
 
         // What the backend section shows, from the settings file and the
         // state above.
@@ -2336,7 +2656,8 @@ fn main() {
             let azure_voices = azure_voices.clone();
             let edge_tts_voices = edge_tts_voices.clone();
             move || {
-                let state = settings_store.load().unwrap_or_default();
+                let mut state = settings_store.load().unwrap_or_default();
+                state.piper_voices = installed_piper_voices();
                 BackendPanel {
                     check_request: check_request(&state),
                     selection: state.backend_selection,
@@ -2354,22 +2675,31 @@ fn main() {
                     azure_region: state.azure_region,
                     azure_voices: azure_voices.borrow().clone(),
                     edge_tts_voices: edge_tts_voices.borrow().clone(),
+                    piper_voices: state.piper_voices,
                 }
             }
         });
 
         // Push that into an open Settings window. Deferred, because the
         // action that caused it usually arrives from inside that very view.
+        // Story 3.15: the Piper voices tab is pushed alongside, since a
+        // voice installed, deleted or used changes both.
         let push_panel: Rc<dyn Fn(&mut App)> = Rc::new({
             let make_panel = make_panel.clone();
+            let make_piper_panel = make_piper_panel.clone();
             let settings_view_slot = settings_view_slot.clone();
             move |cx: &mut App| {
                 let make_panel = make_panel.clone();
+                let make_piper_panel = make_piper_panel.clone();
                 let settings_view_slot = settings_view_slot.clone();
                 cx.defer(move |cx| {
                     if let Some(view) = settings_view_slot.borrow().clone() {
                         let panel = make_panel();
-                        view.update(cx, |view, cx| view.set_backend_panel(panel, cx));
+                        let piper = make_piper_panel();
+                        view.update(cx, |view, cx| {
+                            view.set_backend_panel(panel, cx);
+                            view.set_piper_voices_panel(piper, cx);
+                        });
                     }
                 });
             }
@@ -2918,6 +3248,117 @@ fn main() {
             }
         });
 
+        // Story 3.15: everything the Piper voices tab asks for. Catalogs and
+        // deletes run on GPUI's background executor; a download runs on the
+        // Tokio blocking pool and reports by event.
+        let piper_actions: PiperVoicesActions = Rc::new({
+            let settings_store = settings_store.clone();
+            let piper_catalog = piper_catalog.clone();
+            let piper_catalog_state = piper_catalog_state.clone();
+            let piper_downloads = piper_downloads.clone();
+            let piper_error = piper_error.clone();
+            let run_check = run_check.clone();
+            let push_panel = push_panel.clone();
+            let event_tx = event_tx.clone();
+            move |action: PiperVoicesAction, cx: &mut App| match action {
+                PiperVoicesAction::Refresh => {
+                    if *piper_catalog_state.borrow() == PiperCatalogState::Loading {
+                        return;
+                    }
+                    *piper_catalog_state.borrow_mut() = PiperCatalogState::Loading;
+                    (*push_panel)(cx);
+                    let fetch = {
+                        let piper_catalog = piper_catalog.clone();
+                        cx.background_spawn(async move { piper_catalog.fetch_catalog() })
+                    };
+                    let piper_catalog_state = piper_catalog_state.clone();
+                    let push_panel = push_panel.clone();
+                    cx.spawn(async move |cx| {
+                        let results = fetch.await;
+                        *piper_catalog_state.borrow_mut() = PiperCatalogState::Loaded(results);
+                        cx.update(|cx| (*push_panel)(cx));
+                    })
+                    .detach();
+                }
+                PiperVoicesAction::Download(entry) => {
+                    let key = entry.key.clone();
+                    if matches!(
+                        piper_downloads.borrow().get(&key),
+                        Some(VoiceDownload::Downloading { .. })
+                    ) {
+                        return;
+                    }
+                    let Some(handle) = cx
+                        .try_global::<tokio_bridge::TokioRuntime>()
+                        .map(|runtime| runtime.handle().clone())
+                    else {
+                        piper_downloads.borrow_mut().insert(
+                            key,
+                            VoiceDownload::Failed(
+                                "voice-me's background runtime did not start this session; \
+                                 restart it to download voices."
+                                    .to_string(),
+                            ),
+                        );
+                        (*push_panel)(cx);
+                        return;
+                    };
+                    piper_downloads.borrow_mut().insert(
+                        key.clone(),
+                        VoiceDownload::Downloading { done: 0, total: 0 },
+                    );
+                    (*push_panel)(cx);
+                    let piper_catalog = piper_catalog.clone();
+                    let events = event_tx.clone();
+                    let work = tokio_bridge::spawn_blocking_on(&handle, move || {
+                        piper_catalog.install(&entry, events)
+                    });
+                    let events = event_tx.clone();
+                    cx.spawn(async move |_| {
+                        // A job that panicked never reported; this does. An
+                        // adapter that did report sends the same sentence
+                        // again, which is handled idempotently.
+                        if let Err(error) = work.await {
+                            let _ = events.unbounded_send(AppEvent::PiperVoiceFinished {
+                                key,
+                                result: Err(error.to_string()),
+                            });
+                        }
+                    })
+                    .detach();
+                }
+                PiperVoicesAction::Delete(key) => {
+                    let delete = {
+                        let piper_catalog = piper_catalog.clone();
+                        let key = key.clone();
+                        cx.background_spawn(async move { piper_catalog.delete(&key) })
+                    };
+                    let piper_error = piper_error.clone();
+                    let run_check = run_check.clone();
+                    let push_panel = push_panel.clone();
+                    cx.spawn(async move |cx| {
+                        *piper_error.borrow_mut() = delete
+                            .await
+                            .err()
+                            .map(|error| format!("Couldn't delete {key}: {error}"));
+                        cx.update(|cx| {
+                            (*run_check)(cx);
+                            (*push_panel)(cx);
+                        });
+                    })
+                    .detach();
+                }
+                PiperVoicesAction::Use { key, locale } => {
+                    let result = use_piper_voice(settings_store.as_ref(), &key, &locale);
+                    *piper_error.borrow_mut() = result
+                        .err()
+                        .map(|error| format!("Couldn't use {key}: {error}"));
+                    (*run_check)(cx);
+                    (*push_panel)(cx);
+                }
+            }
+        });
+
         // The same one-at-a-time guarantee for the Prompt Overlay: a press
         // while one is already open activates it instead of stacking a
         // second window on top.
@@ -2939,6 +3380,8 @@ fn main() {
             let provisioning = provisioning.clone();
             let make_panel = make_panel.clone();
             let backend_actions = backend_actions.clone();
+            let make_piper_panel = make_piper_panel.clone();
+            let piper_actions = piper_actions.clone();
             move |cx: &mut App| {
                 if let Some(handle) = window_slot.borrow().as_ref() {
                     let _ = handle.update(cx, |_, window, _| window.activate_window());
@@ -2967,6 +3410,10 @@ fn main() {
                     actions: backend_actions.clone(),
                     outcome: dependency_outcome.borrow().clone(),
                     provisioning: provisioning.borrow().clone(),
+                    piper: PiperVoicesTab {
+                        panel: make_piper_panel(),
+                        actions: piper_actions.clone(),
+                    },
                 };
                 let view_slot = settings_view_slot.clone();
                 let handle = match cx.open_window(WindowOptions::default(), move |window, cx| {
@@ -3326,10 +3773,16 @@ fn main() {
                             // a selection that cannot run here never commits
                             // its runtime library just by trying — which
                             // would turn "Use CPU backend" into a restart.
+                            // Story 3.15: Piper needs no sample; its
+                            // session builds in about a second.
+                            let needs_no_sample = settings_store
+                                .load()
+                                .is_ok_and(|state| state.backend_selection.is_piper());
                             if should_warm_up(
                                 runnable,
                                 for_current_selection,
                                 has_active_sample,
+                                needs_no_sample,
                                 warmed_up.get(),
                             ) {
                                 let current_engine = engine.borrow().port.clone();
@@ -3393,6 +3846,40 @@ fn main() {
                         // path as the startup one. It reports by event;
                         // only a check that could not run lands here.
                         cx.update(|cx| (*run_check)(cx));
+                    }
+                    // Story 3.15: a Piper voice downloading from its tab.
+                    AppEvent::PiperVoiceProgress {
+                        key,
+                        done_bytes,
+                        total_bytes,
+                    } => {
+                        piper_downloads.borrow_mut().insert(
+                            key,
+                            VoiceDownload::Downloading {
+                                done: done_bytes,
+                                total: total_bytes,
+                            },
+                        );
+                        cx.update(|cx| (*push_panel)(cx));
+                    }
+                    AppEvent::PiperVoiceFinished { key, result } => {
+                        match result {
+                            Ok(()) => {
+                                piper_downloads.borrow_mut().remove(&key);
+                            }
+                            Err(reason) => {
+                                eprintln!("downloading the Piper voice {key} failed: {reason}");
+                                piper_downloads
+                                    .borrow_mut()
+                                    .insert(key, VoiceDownload::Failed(reason));
+                            }
+                        }
+                        // The voice is in the pickers now, and may be the
+                        // one a blocking row was waiting for.
+                        cx.update(|cx| {
+                            (*run_check)(cx);
+                            (*push_panel)(cx);
+                        });
                     }
                     AppEvent::SpeechSessionBuilt { generation, result } => {
                         // A replaced engine's late report is not about the

@@ -31,6 +31,11 @@ pub struct CheckRequest {
     /// Whether the selected backend has a voice saved (Story 3.14: Azure,
     /// which has no default voice). Meaningless for any other selection.
     pub has_voice: bool,
+    /// The Piper voice the selection speaks in (Story 3.15): the saved one,
+    /// or the language's top installed one. What the Piper voice row checks
+    /// for, and what its Install downloads. `None` for any other selection,
+    /// or when no voice can be named.
+    pub piper_voice: Option<String>,
 }
 
 impl CheckRequest {
@@ -42,6 +47,7 @@ impl CheckRequest {
             has_api_key: false,
             has_region: false,
             has_voice: false,
+            piper_voice: None,
         }
     }
 }
@@ -247,16 +253,101 @@ pub trait DependencyProvisioningPort: Send + Sync {
     /// never ran" (a panicked job sends nothing). It does not re-run the
     /// check; the composition root does that on `ProvisioningFinished`.
     ///
-    /// Relative to `backend` exactly as [`Self::check`] is: it fetches the
-    /// selected backend's assets and nothing else. A second call for a
-    /// `kind` already being provisioned returns at once, sending nothing,
-    /// so the run already in flight stays the only one reporting.
+    /// Relative to `request` exactly as [`Self::check`] is: it fetches the
+    /// selected backend's assets and nothing else — for the Piper voice row
+    /// (Story 3.15), the voice `request.piper_voice` names. A second call
+    /// for a `kind` already being provisioned returns at once, sending
+    /// nothing, so the run already in flight stays the only one reporting.
     fn provision(
         &self,
         kind: DependencyKind,
-        backend: SpeechBackend,
+        request: CheckRequest,
         events: AppEventSender,
     ) -> Result<(), VoiceMeError>;
+}
+
+/// Where a Piper voice in a catalog comes from (Story 3.15), in the order
+/// a duplicate is resolved: the first source wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PiperSource {
+    /// voice-me's own `piper-voices/catalog.json`, fetched live.
+    VoiceMe,
+    /// `rhasspy/piper-voices`' `voices.json`, at a pinned revision.
+    Official,
+    /// The `speaches-ai` repositories on Hugging Face.
+    Speaches,
+}
+
+impl PiperSource {
+    /// Every source, in precedence order.
+    pub const ALL: [PiperSource; 3] = [
+        PiperSource::VoiceMe,
+        PiperSource::Official,
+        PiperSource::Speaches,
+    ];
+
+    /// How the source is named to the user, and in `voice.toml`.
+    pub fn label(self) -> &'static str {
+        match self {
+            PiperSource::VoiceMe => "voice-me",
+            PiperSource::Official => "rhasspy/piper-voices",
+            PiperSource::Speaches => "speaches-ai",
+        }
+    }
+}
+
+/// One downloadable Piper voice, as the Piper voices tab shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PiperCatalogEntry {
+    /// `tr_TR-dfki-medium`: the voice's id, and its directory name.
+    pub key: String,
+    /// The voice's own name (`dfki`).
+    pub name: String,
+    /// `tr_TR`: Piper's speech language.
+    pub locale: String,
+    /// How the language is named to the user (`Turkish (Turkey)`).
+    pub language_label: String,
+    pub quality: String,
+    /// `None` when the source declares none ("see model card").
+    pub licence: Option<String>,
+    pub source: PiperSource,
+    /// The graph and config together; `None` when the source's list does
+    /// not say (speaches-ai, until the download resolves it).
+    pub size_bytes: Option<u64>,
+}
+
+/// What one catalog source gave: its voices (without any an earlier source
+/// already listed), or why it could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogResult {
+    pub source: PiperSource,
+    pub result: Result<Vec<PiperCatalogEntry>, String>,
+}
+
+/// Driven adapter port: the Piper voice catalogs, and installing and
+/// deleting voices (Story 3.15). Implemented by `voice-me-deps`, the only
+/// crate that touches the network or writes the cache.
+///
+/// Every call blocks (network, disk); the caller runs it off the main
+/// thread.
+pub trait PiperCatalogPort: Send + Sync {
+    /// Fetch every catalog, in precedence order, deduplicated: a voice an
+    /// earlier source lists is not listed again. A source that fails is
+    /// its own `Err`; the others are still returned.
+    fn fetch_catalog(&self) -> Vec<CatalogResult>;
+
+    /// Download `entry` into the cache: `.part` files, verified with the
+    /// digest its source publishes, moved into place, then its `voice.toml`.
+    /// Reports [`crate::AppEvent::PiperVoiceProgress`] while bytes arrive
+    /// and exactly one [`crate::AppEvent::PiperVoiceFinished`].
+    fn install(
+        &self,
+        entry: &PiperCatalogEntry,
+        events: AppEventSender,
+    ) -> Result<(), VoiceMeError>;
+
+    /// Delete the installed voice `key` from the cache.
+    fn delete(&self, key: &str) -> Result<(), VoiceMeError>;
 }
 
 /// Port for reading/writing persisted settings (implemented inside

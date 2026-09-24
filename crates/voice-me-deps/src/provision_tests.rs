@@ -10,8 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest as _, Sha256};
 use voice_me_core::{
-    AppEvent, DependencyKind, DependencyProvisioningPort, DependencyStatus, SpeechBackend,
-    SpeechWeights, assets,
+    AppEvent, DependencyKind, DependencyProvisioningPort, DependencyStatus, SpeechWeights, assets,
 };
 
 use crate::DepsAdapter;
@@ -44,13 +43,13 @@ struct ServerState {
     requests: Vec<(String, Option<String>)>,
 }
 
-struct TestServer {
-    base: String,
+pub(crate) struct TestServer {
+    pub(crate) base: String,
     state: Arc<Mutex<ServerState>>,
 }
 
 impl TestServer {
-    fn start(files: HashMap<String, Vec<u8>>) -> Self {
+    pub(crate) fn start(files: HashMap<String, Vec<u8>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let state = Arc::new(Mutex::new(ServerState {
@@ -254,7 +253,7 @@ impl Fixture {
             relative_path: rel.to_string(),
             url: format!("{}/{rel}", server.base),
             size: bytes.len() as u64,
-            sha256: sha256(bytes),
+            digest: crate::sources::Digest::Sha256(sha256(bytes)),
         };
         let model_files = models
             .iter()
@@ -292,7 +291,7 @@ impl Fixture {
         let (tx, mut rx) = futures::channel::mpsc::unbounded();
         let result = self
             .adapter()
-            .provision(kind, SpeechBackend::CPU, tx)
+            .provision(kind, voice_me_core::CheckRequest::cpu(), tx)
             .map_err(|error| error.to_string());
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -485,7 +484,7 @@ fn a_corrupt_download_never_takes_its_final_name() {
         assets::graph_file(fixture.root(), "speech_encoder.onnx").with_extension("onnx_data");
     for asset in &mut fixture.sources.model_files {
         if asset.relative_path == "onnx/speech_encoder.onnx_data" {
-            asset.sha256 = "0".repeat(64);
+            asset.digest = crate::sources::Digest::Sha256("0".repeat(64));
         }
     }
 
@@ -833,7 +832,11 @@ fn a_second_install_on_a_row_in_flight_is_ignored() {
         .expect("the first claim succeeds");
 
     let (tx, mut rx) = futures::channel::mpsc::unbounded();
-    let result = adapter.provision(DependencyKind::ModelWeights, SpeechBackend::CPU, tx);
+    let result = adapter.provision(
+        DependencyKind::ModelWeights,
+        voice_me_core::CheckRequest::cpu(),
+        tx,
+    );
 
     assert!(result.is_ok());
     assert!(rx.try_recv().is_err(), "the duplicate sends nothing");
@@ -856,7 +859,11 @@ fn installing_the_virtual_microphone_runs_the_installer_and_reports_its_end() {
     });
     let (tx, mut rx) = futures::channel::mpsc::unbounded();
 
-    let result = adapter.provision(DependencyKind::VirtualMicrophone, SpeechBackend::CPU, tx);
+    let result = adapter.provision(
+        DependencyKind::VirtualMicrophone,
+        voice_me_core::CheckRequest::cpu(),
+        tx,
+    );
 
     assert!(result.is_ok());
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -884,7 +891,11 @@ fn installing_the_virtual_microphone_runs_the_installer_and_reports_its_end() {
     let (tx, mut rx) = futures::channel::mpsc::unbounded();
     assert!(
         failing
-            .provision(DependencyKind::VirtualMicrophone, SpeechBackend::CPU, tx)
+            .provision(
+                DependencyKind::VirtualMicrophone,
+                voice_me_core::CheckRequest::cpu(),
+                tx
+            )
             .is_err()
     );
     let _progress = rx.try_recv().unwrap();
@@ -1067,7 +1078,13 @@ fn a_q4_install_through_the_tokio_bridge_lands_every_file() {
 
     let result = futures::executor::block_on(voice_me_core::tokio_bridge::spawn_blocking_on(
         runtime.handle(),
-        move || adapter.provision(DependencyKind::ModelWeights, SpeechBackend::CPU, tx),
+        move || {
+            adapter.provision(
+                DependencyKind::ModelWeights,
+                voice_me_core::CheckRequest::cpu(),
+                tx,
+            )
+        },
     ));
 
     assert!(result.is_ok(), "{result:?}");

@@ -1,0 +1,43 @@
+[package]
+name = "voice-me-tts-piper"
+version = "0.1.0"
+edition.workspace = true
+
+# Story 3.15: Piper VITS voices, in-process on the existing ONNX Runtime,
+# CPU only. No Piper engine code (`piper1-gpl`, `piper-phonemize`) and no
+# libespeak-ng is linked: phonemes come from the `espeak-ng` program through
+# `voice-me-espeak`. Offline — no HTTP client (AD-8). AD-1: no dependency on
+# `voice-me-tts`; the runtime is committed through an injected closure.
+[dependencies]
+voice-me-core = { path = "../voice-me-core" }
+# The version `voice-me-tts` uses. `default-features = false` is
+# load-bearing for the same reason as there: ort's defaults download a
+# runtime at build time (AD-8). `load-dynamic` comes from the default
+# `dynamic-runtime` feature below.
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray"] }
+# The version ort rc.13 itself depends on.
+ndarray = "0.17"
+# Piper voices speak at 22 050 Hz (most) or 16 000 Hz; AD-11's buffer is
+# 24 kHz. The version the other adapters use.
+rubato = "5.0.0"
+# The voice's `config.json`.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Piper decomposes each clause's phonemes to NFD codepoints before looking
+# them up in the voice's phoneme map.
+unicode-normalization = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The one crate that runs `espeak-ng`.
+voice-me-espeak = { path = "../voice-me-espeak" }
+
+[dev-dependencies]
+tempfile = "3.14"
+# The real-engine test commits the runtime itself.
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic"] }
+
+[features]
+default = ["dynamic-runtime"]
+# ONNX Runtime is resolved at run time from the library the app provisioned
+# (AD-8): the binary carries no runtime and the build downloads nothing.
+dynamic-runtime = ["ort/load-dynamic"]

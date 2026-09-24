@@ -14,34 +14,28 @@
 // the workspace being made unbuildable there. Windows is Story 3.13.
 #![cfg(target_os = "linux")]
 
-mod os_release;
-/// The bounded runner, public so `voice-me-tts-edge` (Story 3.17) runs
-/// `edge-tts` through the same one.
-pub mod process;
 mod voices;
 mod wav;
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::time::Duration;
 
 use voice_me_core::{AudioBuffer, StockVoice, TtsPort, VoiceMeError};
-
-pub use os_release::{
-    GENERIC_INSTALL_STEP, distro_ids, install_command_for, install_step, is_opensuse,
-    read_os_release,
+// Story 3.15: the bounded runner, the lookup on PATH and the install step
+// moved to `voice-me-espeak`, the one crate that runs the program. They are
+// re-exported so every caller of this crate keeps compiling unchanged.
+use voice_me_espeak as process;
+pub use voice_me_espeak::{
+    DEADLINE, GENERIC_INSTALL_STEP, PROGRAM, find_program, install_command_for, install_step,
 };
 pub use voices::parse_voices;
 pub use wav::decode_wav;
 
-/// The program, by the fixed name it is looked up by on PATH.
-pub const PROGRAM: &str = "espeak-ng";
-
 /// The engine's name as the user reads it.
 pub const ENGINE_LABEL: &str = "eSpeak NG";
-
-/// How long one run of the program may take.
-pub const DEADLINE: Duration = Duration::from_secs(10);
 
 /// The arguments one utterance runs with: the voice, UTF-8 input (`-b 1`),
 /// and the WAV on stdout. The text is not among them — it goes on stdin,
@@ -51,22 +45,6 @@ pub fn speak_args(voice_id: &str) -> Vec<OsString> {
         .into_iter()
         .map(OsString::from)
         .collect()
-}
-
-/// Where `espeak-ng` is on PATH, if anywhere: the first executable file of
-/// that name. What the Dependency Check reports; the adapter itself lets
-/// the OS resolve the name the same way.
-pub fn find_program() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(PROGRAM))
-        .find(|candidate| is_executable(candidate))
-}
-
-fn is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 /// The voices `espeak-ng --voices` lists, run the same bounded way.
