@@ -1254,20 +1254,31 @@ mod tests {
             panel,
         );
 
+        // Install runs on Tokio's blocking pool: wait for it without
+        // driving GPUI's scheduler, since its completion wakes the view from
+        // a Tokio thread, which the test scheduler rejects while running.
         cx.update_window(window.into(), |_, window, cx| {
             window.render_frame(cx);
-            window.click("dependencies-check-again", cx);
             window.click("dependency-install-model-weights", cx);
         })
         .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while (port.checks.load(Ordering::SeqCst) == 0
-            || port.provisions.load(Ordering::SeqCst) == 0)
-            && std::time::Instant::now() < deadline
-        {
-            cx.run_until_parked();
+        while port.provisions.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        // The count rises inside `provision`; let it return and wake the
+        // view before the scheduler runs.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        cx.run_until_parked();
+
+        // "Check again" runs on GPUI's own background executor, which the
+        // scheduler drives.
+        cx.update_window(window.into(), |_, window, cx| {
+            window.click("dependencies-check-again", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(port.checks.load(Ordering::SeqCst), 1);
 
         assert_eq!(*port.last_request.lock().unwrap(), Some(request.clone()));
         assert_eq!(*port.last_provision.lock().unwrap(), Some(request));
