@@ -470,6 +470,73 @@ fn extract_zip_entry(
     Ok(true)
 }
 
+/// Unpack a whole verified `.zip` into `dir` (Story 2.8: the VB-CABLE
+/// driver pack, whose setup program needs the files beside it).
+///
+/// Every entry is placed only by its enclosed name — no absolute path, no
+/// `..` escaping `dir` — and the names are all checked before anything is
+/// written, so an archive with one unsafe entry writes nothing at all. A
+/// symlink entry is refused the same way. Each file arrives through its own
+/// `.part` and is renamed into place, like every download.
+pub fn extract_zip_into_dir(archive: &Path, dir: &Path) -> Result<(), VoiceMeError> {
+    let archive_name = archive
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let failed = |reason: String| {
+        VoiceMeError::Other(format!("Extraction of {archive_name} failed: {reason}"))
+    };
+
+    let file = File::open(archive).map_err(|error| failed(error.to_string()))?;
+    let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
+        .map_err(|error| failed(error.to_string()))?;
+
+    // First pass: where every entry would go, refusing the archive outright
+    // on the first one that would land outside `dir`.
+    let mut placed = Vec::with_capacity(zip.len());
+    for index in 0..zip.len() {
+        let entry = zip
+            .by_index(index)
+            .map_err(|error| failed(error.to_string()))?;
+        let Some(relative) = entry.enclosed_name() else {
+            return Err(failed(format!(
+                "it holds an entry with an unsafe name ({})",
+                entry.name()
+            )));
+        };
+        if entry.is_symlink() {
+            return Err(failed(format!(
+                "it holds a symbolic link ({})",
+                entry.name()
+            )));
+        }
+        placed.push((relative, entry.is_dir()));
+    }
+
+    std::fs::create_dir_all(dir)
+        .map_err(|error| failed(format!("could not create {}: {error}", dir.display())))?;
+    for (index, (relative, is_dir)) in placed.into_iter().enumerate() {
+        let destination = dir.join(&relative);
+        if is_dir {
+            std::fs::create_dir_all(&destination).map_err(|error| {
+                failed(format!(
+                    "could not create {}: {error}",
+                    destination.display()
+                ))
+            })?;
+            continue;
+        }
+        let parent = destination.parent().unwrap_or(dir).to_path_buf();
+        std::fs::create_dir_all(&parent)
+            .map_err(|error| failed(format!("could not create {}: {error}", parent.display())))?;
+        let mut entry = zip
+            .by_index(index)
+            .map_err(|error| failed(error.to_string()))?;
+        write_entry(&mut entry, &destination, &parent, &failed)?;
+    }
+    Ok(())
+}
+
 /// Write one archive entry to `destination` through its `.part` (made
 /// executable on unix), then give it its final name by rename.
 fn write_entry(

@@ -2,7 +2,7 @@
 title: 'Windows Virtual Microphone via VB-CABLE, installed with one click'
 type: 'feature'
 created: '2026-09-24'
-status: 'in-progress'
+status: 'done'
 route: 'dispatch'
 review_loop_iteration: 0
 baseline_commit: 'aedc7a52c82845ea0ed7853c63bf79d5389ff1ce'
@@ -57,12 +57,12 @@ context: ['{project-root}/_bmad-output/implementation-artifacts/epic-2-context.m
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `crates/voice-me-audio-windows/{Cargo.toml,src/lib.rs}` -- adapter, availability check, elevated installer launch, pure helpers with unit tests -- the Windows `VirtualMicPort`
-- [ ] `crates/voice-me-deps/src/{sources.rs,provision.rs}` -- VB-CABLE pin and directory extraction -- verified download
-- [ ] `crates/voice-me-deps/src/lib.rs`, `Cargo.toml` -- Windows row and Install flow; installer hook takes the extracted dir -- one-click install
-- [ ] `crates/voice-me-deps/src/provision_tests.rs` -- install via fixture (fake pack with setup + decoys, fake installer records the path, zip deleted), extraction rejects `../` entries, hash mismatch keeps no pack -- matrix rows
-- [ ] `crates/voice-me-app/src/main.rs` -- wire the adapter on Windows -- Speak plays through the cable
-- [ ] `README.md`, PRD Open Question 2, `ARCHITECTURE-SPINE.md` Deferred -- record the driver decision -- documentation stays true
+- [x] `crates/voice-me-audio-windows/{Cargo.toml,src/lib.rs}` -- adapter, availability check, elevated installer launch, pure helpers with unit tests -- the Windows `VirtualMicPort`
+- [x] `crates/voice-me-deps/src/{sources.rs,provision.rs}` -- VB-CABLE pin and directory extraction -- verified download
+- [x] `crates/voice-me-deps/src/lib.rs`, `Cargo.toml` -- Windows row and Install flow; installer hook takes the extracted dir -- one-click install
+- [x] `crates/voice-me-deps/src/provision_tests.rs` -- install via fixture (fake pack with setup + decoys, fake installer records the path, zip deleted), extraction rejects `../` entries, hash mismatch keeps no pack -- matrix rows
+- [x] `crates/voice-me-app/src/main.rs` -- wire the adapter on Windows -- Speak plays through the cable
+- [x] `README.md`, PRD Open Question 2, `ARCHITECTURE-SPINE.md` Deferred -- record the driver decision -- documentation stays true
 
 **Acceptance Criteria:**
 - Given Windows without VB-CABLE, when Settings → Dependencies opens, then the Virtual Microphone row is missing with Install and credits VB-CABLE
@@ -71,6 +71,31 @@ context: ['{project-root}/_bmad-output/implementation-artifacts/epic-2-context.m
 - Given `cargo test --workspace` on Linux and Windows CI, then everything passes and `cargo check --target x86_64-pc-windows-msvc`-level code compiles on the Windows runner
 
 ## Spec Change Log
+
+## Review Triage Log
+
+- medium (patch): `run_installer_elevated` ignored VB setup's exit code (`Start-Process -Wait` without `-PassThru`), so a cancelled VB installer counted as success and wrote the restart marker. Found by blind, edge-case and verification layers.
+- low (patch): every PowerShell failure became "Windows did not allow the installer to run" and stderr was discarded.
+- medium (patch): the `setup-ran` marker was never cleared, so the row could say "restart" forever after an uninstall or a failed setup.
+- low (patch): the zip was deleted before the installer ran, so a retry after a declined prompt downloaded the pack again.
+- medium (patch): `play_on` dropped the stream on the first all-silence callback, while the tail could still be queued in the WASAPI endpoint, clipping the last syllable.
+- medium (patch): cpal 0.18.2's WASAPI `description()` calls `.expect("could not open property store")` (`wasapi/device.rs:420`). Verified in the registry source; a bad device would panic the check or a Speak.
+- low (patch): PowerShell treats ‘ ’ ‚ ‛ as single quotes, so `powershell_quote` must double them too.
+- medium (patch): there was no route if VB-Audio moves the pinned pack (it cannot be mirrored). The row now names the manual download.
+- gap (patch): no test tied the marker writer to its reader. Filed pre-verified by the verification layer.
+- gap (patch): the real Windows installer hook was never called by a test. Filed pre-verified.
+- gap (defer): the `play_on` drain/timeout logic is untested; it needs a device or a refactor. Recorded in deferred-work.md.
+- medium (defer): the unpacked setup is run elevated without an Authenticode check. Hardening; recorded in deferred-work.md.
+- low (defer): PRD FR-6, the addendum and the distribution claim still name the old driver. Correct-course material; recorded in deferred-work.md.
+- false: "3.13/3.16 are not in epics.md". They are, at `epics.md` lines 570 and 623.
+- false: "spec in-review vs sprint in-progress". The sprint status syncs at finalization, by design.
+- low (rejected): `epic-2-context.md` reads as stale. It is a cache compiled from the planning docs and is recompiled automatically now that they are newer.
+- low (rejected): ARM64/32-bit Windows would get the x64 setup. voice-me ships x86_64 Windows builds only.
+- maybe-false (rejected, low): `[`/`]` in the setup path. Needs a Windows check of `Start-Process -FilePath` wildcard handling; the cache path under AppData rarely contains them.
+- low (rejected): a user who renames a device to start with "CABLE Input". Contrived.
+- low (rejected): when device enumeration fails, the row still offers Install. Rerunning VB's setup is harmless.
+- low (rejected): the unpacked pack stays in the cache. VB's setup there is also its uninstaller.
+- low (rejected): no tests for the symlink refusal or the skip-fetch branch, and a loose resample-length tolerance. Unlikely to matter in use.
 
 ## Design Notes
 

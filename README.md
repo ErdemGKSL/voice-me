@@ -63,9 +63,17 @@ played — deliberately, since PulseAudio answers an unresolvable device by
 falling back to your speakers — and a desktop notification says which of
 those it was.
 
-On **Windows** the virtual microphone is not implemented yet (Story 2.8): the
-app runs and generates, and a Speak Action notifies that it has nowhere to
-play the result.
+On **Windows** the Virtual Microphone is VB-Audio's **VB-CABLE**
+(donationware, www.vb-cable.com). voice-me plays each line to its
+"CABLE Input" playback device; in your voice-chat app, select
+**CABLE Output** as the microphone. If it is missing, open
+**Settings → Dependencies** and press **Install** on the Virtual Microphone
+row: voice-me downloads VB-Audio's official driver pack (pinned and
+checksum-verified), then runs VB's own setup, which Windows asks you to
+allow. If Windows wants a restart afterwards, restart and press
+**Check again**. voice-me never installs the driver silently or at startup,
+and never plays to your speakers instead: with no cable, or more than one,
+a Speak Action notifies rather than playing.
 
 ## Speech generation (spec-2-5 spike)
 

@@ -204,3 +204,12 @@
 - source_spec: none
   summary: Story 3.16 — Piper on Windows.
   evidence: split from "finish the remaining Windows implementations" (2026-09-24); not in the user's first two priorities.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-8-windows-virtual-microphone-via-vb-cable.md`
+  summary: The Windows playback drain/timeout state machine in `play_on` (`crates/voice-me-audio-windows/src/lib.rs`) has no automated test.
+  evidence: it is built directly on a cpal WASAPI stream, which CI has no device for; covering it means pulling the callback's position/signalled/drained state into a small pure type tested like `fill_frames`. Until then only the manual Windows check (Discord hears the whole line) verifies it.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-8-windows-virtual-microphone-via-vb-cable.md`
+  summary: Check the Authenticode signature (VB-Audio) of the unpacked `VBCABLE_Setup_x64.exe` before asking Windows to run it elevated.
+  evidence: the pack is SHA-256-verified when downloaded, but the unpacked setup in the user-writable cache is run elevated without a signer check; UAC shows the publisher, so the user is the last line of defence today (medium, hardening).
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-8-windows-virtual-microphone-via-vb-cable.md`
+  summary: Update the PRD's FR-6, the PRD addendum's driver notes and the "single executable" distribution claim for VB-CABLE on Windows.
+  evidence: only PRD Open Question 2 and the architecture spine were updated in spec-2-8; the planning documents that name the old driver belong to a correct-course pass.

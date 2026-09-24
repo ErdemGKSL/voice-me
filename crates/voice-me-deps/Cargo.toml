@@ -58,6 +58,12 @@ voice-me-espeak = { path = "../voice-me-espeak" }
 # that runs it.
 voice-me-tts-edge = { path = "../voice-me-tts-edge" }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# Story 2.8: whether VB-CABLE's "CABLE Input" is present, and the elevated
+# launch of VB's own setup, are *asked of* the crate that plays to it —
+# the same rule as the Linux audio crate above.
+voice-me-audio-windows = { path = "../voice-me-audio-windows" }
+
 [dev-dependencies]
 tempfile = "3.14"
 # The `AppEvent` channel the check reports on (AD-3).

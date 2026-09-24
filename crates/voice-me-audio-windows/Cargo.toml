@@ -5,3 +5,12 @@ edition.workspace = true
 
 [dependencies]
 voice-me-core = { path = "../voice-me-core" }
+# Story 2.8: the output stream to VB-CABLE's "CABLE Input" (WASAPI on
+# Windows). Unconditional, like `voice-me-ui`'s, so the adapter and its pure
+# helpers type-check and are unit-tested on the Linux CI job too; nothing
+# here opens a device unless `play` is called.
+cpal = "0.18"
+# The AD-11 buffer is 24 kHz; the cable runs at whatever its default format
+# says (48 kHz, typically). Same resampler and pattern as
+# `voice-me-tts-remote`'s `wav.rs`.
+rubato = "5.0.0"

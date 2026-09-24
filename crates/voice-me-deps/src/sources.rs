@@ -196,6 +196,10 @@ pub struct Sources {
     /// target but Linux x64 and Windows x64 (Decision 1, extended by
     /// spec 3-2 for Windows).
     pub runtime: Option<RuntimeArchive>,
+    /// Story 2.8: VB-Audio's VB-CABLE driver pack, whose setup Install on
+    /// the Virtual Microphone row runs. `Some` on Windows only; elsewhere
+    /// the row installs without downloading anything.
+    pub virtual_mic: Option<Asset>,
 }
 
 impl Default for Sources {
@@ -219,6 +223,7 @@ impl Sources {
         Self {
             model_files,
             runtime: pinned_runtime(),
+            virtual_mic: pinned_virtual_mic(),
         }
     }
 
@@ -312,6 +317,36 @@ fn pinned_runtime() -> Option<RuntimeArchive> {
     None
 }
 
+/// Where the VB-CABLE pack lands under the cache root, and the directory
+/// it is unpacked into.
+pub const VB_CABLE_DIR: &str = "vb-cable";
+
+/// VB-Audio's official VB-CABLE driver pack (donationware,
+/// www.vb-cable.com). Downloaded from VB-Audio itself and never bundled in
+/// voice-me's own package or release assets: VB's licence forbids
+/// embedding it in another installer, so voice-me only fetches it and runs
+/// VB's own setup, which the user confirms.
+pub fn vb_cable_pack() -> Asset {
+    Asset {
+        relative_path: format!("{VB_CABLE_DIR}/VBCABLE_Driver_Pack45.zip"),
+        url: "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip".to_string(),
+        size: 1_318_877,
+        digest: Digest::Sha256(
+            "b950e39f01af1d04ea623c8f6d8eb9b6ea5c477c637295fabf20631c85116bfb".to_string(),
+        ),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn pinned_virtual_mic() -> Option<Asset> {
+    Some(vb_cable_pack())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn pinned_virtual_mic() -> Option<Asset> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,6 +428,27 @@ mod tests {
             runtime.library_entry.ends_with("/lib/onnxruntime.dll"),
             "{}",
             runtime.library_entry
+        );
+    }
+
+    /// Story 2.8: the VB-CABLE pack is pinned like everything else — an
+    /// HTTPS URL on VB-Audio's own server, an exact size and a full
+    /// SHA-256 — and only Windows downloads it.
+    #[test]
+    fn the_vb_cable_pack_is_pinned_and_windows_only() {
+        let pack = vb_cable_pack();
+        assert!(
+            pack.url
+                .starts_with("https://download.vb-audio.com/Download_CABLE/"),
+            "{}",
+            pack.url
+        );
+        assert_eq!(pack.file_name(), "VBCABLE_Driver_Pack45.zip");
+        assert_eq!(pack.size, 1_318_877);
+        assert!(matches!(&pack.digest, Digest::Sha256(hex) if hex.len() == 64));
+        assert_eq!(
+            Sources::pinned().virtual_mic.is_some(),
+            cfg!(target_os = "windows")
         );
     }
 

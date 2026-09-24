@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-20-2026 19:26
-last_updated: 09-24-2026 10:37
+last_updated: 09-24-2026 11:04
 project: voice-me
 project_key: NOKEY
 tracking_system: file-system
@@ -51,7 +51,7 @@ development_status:
   2-5-spike-in-process-chatterbox-inference-on-onnx-runtime: review
   2-6-generate-speech-from-the-prompt-overlay-text: review
   2-7-spike-linux-virtual-microphone-via-pipewire: review
-  2-8-spike-windows-virtual-microphone-control-surface: in-progress  # VB-CABLE, spec-2-8 (2026-09-24)
+  2-8-spike-windows-virtual-microphone-control-surface: review  # VB-CABLE, spec-2-8 (2026-09-24)
   2-9-play-generated-audio-through-the-virtual-microphone: review
   epic-2-retrospective: optional
 

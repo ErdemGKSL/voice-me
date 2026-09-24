@@ -8718,6 +8718,8 @@ dependencies = [
 name = "voice-me-audio-windows"
 version = "0.1.0"
 dependencies = [
+ "cpal 0.18.2",
+ "rubato",
  "voice-me-core",
 ]
 
@@ -8753,6 +8755,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "voice-me-audio-linux",
+ "voice-me-audio-windows",
  "voice-me-core",
  "voice-me-espeak",
  "voice-me-tts-edge",
