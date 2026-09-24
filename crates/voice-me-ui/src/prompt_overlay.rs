@@ -521,11 +521,20 @@ impl PromptOverlayView {
 }
 
 impl PromptOverlayView {
-    /// The overlay window's `Root`. Transparent: `Root` otherwise fills the
-    /// whole window with the theme background, which shows as a square
-    /// behind the pill's rounded ends (and behind the card's corners).
+    /// The overlay window's `Root`.
+    ///
+    /// Not bordered: on Linux, `Root` wraps a client-decorated window in
+    /// `window_border`, which reserves a 20px shadow margin on every side
+    /// and draws its own frame — on a 56px window that leaves a 16px strip
+    /// for the bar, framed by a square. The overlay draws its own edge.
+    ///
+    /// Transparent: `Root` otherwise fills the whole window with the theme
+    /// background, which shows as a square behind the pill's rounded ends
+    /// (and behind the card's corners).
     pub fn root(view: Entity<Self>, window: &mut Window, cx: &mut Context<Root>) -> Root {
-        Root::new(view, window, cx).bg(gpui_kit::transparent_black())
+        Root::new(view, window, cx)
+            .bordered(false)
+            .bg(gpui_kit::transparent_black())
     }
 }
 

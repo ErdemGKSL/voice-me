@@ -29,7 +29,7 @@ context: []
 
 ## Spec Change Log
 
-- User report after release (screenshot): the bar ran off the bottom of a window whose client area came out much shorter than 56px, and a white square showed behind the pill's rounded ends. Amended: the overlay's `Root` is transparent (`PromptOverlayView::root`), since `Root` fills its window with the theme background. The bar now fills the window up to `PROMPT_BAR_HEIGHT` instead of a fixed height, so it never overflows. Why that window's client area is so short is not settled yet. KEEP: the bar is capped at its own height, so a taller confirm-first window never stretches it.
+- User report after release (screenshot): the bar ran off the bottom of a window whose client area came out much shorter than 56px, and a white square showed behind the pill's rounded ends. Amended: the overlay's `Root` is transparent (`PromptOverlayView::root`), since `Root` fills its window with the theme background. The bar now fills the window up to `PROMPT_BAR_HEIGHT` instead of a fixed height, so it never overflows. The short client area turned out to be `Root`'s own window border. On Linux, `Root` is `bordered` by default and wraps a client-decorated window in `window_border`, which reserves a 20px shadow margin on every side (Wayland, 100% scale: 560×56 leaves 520×16, as the screenshot shows) and draws its own frame. The overlay's `Root` is now `bordered(false)`. The test platform always reports server-side decorations, so no unit test can reproduce the margin. KEEP: the bar is capped at its own height, so a taller confirm-first window never stretches it.
 
 ## Review Triage Log
 
