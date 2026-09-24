@@ -72,6 +72,8 @@ context: ['{project-root}/_bmad-output/implementation-artifacts/epic-2-context.m
 
 ## Spec Change Log
 
+- Windows CI after merge: the `voice-me-deps` test binary died with STATUS_ACCESS_VIOLATION. cpal 0.18.2's WASAPI host initialises COM per thread (`host/com.rs`), calls `CoUninitialize` when the thread ends, and keeps one process-wide `ENUMERATOR` created in whichever thread asked first. Once that thread exits (test threads always do, and Tokio retires idle blocking threads), the next call through the enumerator crashes; in the app that would have been a later Speak or check. Amended: every cpal call in `voice-me-audio-windows` runs on one long-lived "voice-me-audio" thread (`on_audio_thread`). KEEP: no cpal call from any other thread.
+
 ## Review Triage Log
 
 - medium (patch): `run_installer_elevated` ignored VB setup's exit code (`Start-Process -Wait` without `-PassThru`), so a cancelled VB installer counted as success and wrote the restart marker. Found by blind, edge-case and verification layers.
