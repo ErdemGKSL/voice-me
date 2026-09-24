@@ -18,7 +18,8 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, Styled as _, Subscription, Window, WindowOptions, div, px, size,
+    ParentElement as _, Render, Styled as _, Subscription, TestSupportExt as _, Window,
+    WindowOptions, div, px, size,
 };
 use voice_me_core::{
     AppEventSender, DependencyKind, DependencyOutcome, DependencyProvisioningPort, HotkeyPort,
@@ -275,28 +276,37 @@ impl Render for SettingsView {
                         bar.on_close_window(move |_, window, cx| on_close(window, cx))
                     })
                     .child(
-                        div().id("settings-tabs-strip").occlude().h_full().child(
-                            // Pills paint no background or bottom border
-                            // of their own, so the title bar's are the only
-                            // ones, and they sit centred in its height.
-                            TabBar::new("settings-tabs")
-                                .pill()
-                                .small()
-                                .selected_index(self.active_tab)
-                                .child(Tab::new().label("Voice"))
-                                .child(Tab::new().label("Hotkey"))
-                                .child(Tab::new().label("Backend"))
-                                .child(Tab::new().label("Dependencies"))
-                                .child(Tab::new().label("Piper voices"))
-                                .on_click(cx.listener(|this, index: &usize, _window, cx| {
-                                    if *index == PIPER_VOICES_TAB {
-                                        this.show_piper_voices(cx);
-                                    } else {
-                                        this.active_tab = *index;
-                                        cx.notify();
-                                    }
-                                })),
-                        ),
+                        div()
+                            .id("settings-tabs-strip")
+                            .test_support()
+                            .occlude()
+                            .h_full()
+                            // Full height so all of the bar's height is
+                            // occluded, with the tabs centred in it.
+                            .flex()
+                            .items_center()
+                            .child(
+                                // Pills paint no background or bottom border
+                                // of their own, so the title bar's are the only
+                                // ones, and they sit centred in its height.
+                                TabBar::new("settings-tabs")
+                                    .pill()
+                                    .small()
+                                    .selected_index(self.active_tab)
+                                    .child(Tab::new().label("Voice"))
+                                    .child(Tab::new().label("Hotkey"))
+                                    .child(Tab::new().label("Backend"))
+                                    .child(Tab::new().label("Dependencies"))
+                                    .child(Tab::new().label("Piper voices"))
+                                    .on_click(cx.listener(|this, index: &usize, _window, cx| {
+                                        if *index == PIPER_VOICES_TAB {
+                                            this.show_piper_voices(cx);
+                                        } else {
+                                            this.active_tab = *index;
+                                            cx.notify();
+                                        }
+                                    })),
+                            ),
                     ),
             )
             .child(
@@ -443,6 +453,28 @@ mod tests {
         fn rebind(&self, _hotkey: &str) -> Result<(), VoiceMeError> {
             Ok(())
         }
+    }
+
+    /// The tabs sit centred in the title bar's height, not at its top.
+    #[gpui_kit::test]
+    fn the_tabs_are_centred_vertically_in_the_title_bar(cx: &mut TestAppContext) {
+        let (handle, _view) =
+            open_settings(cx, BackendPanel::default(), DependencyOutcome::Pending);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let strip = window.find("settings-tabs-strip").bounds();
+            let tab = window.find(VOICE_TAB).bounds();
+            assert!(
+                strip.size.height > tab.size.height,
+                "the strip is the bar's height, taller than a tab: {strip:?} {tab:?}"
+            );
+            let offset = (strip.center().y - tab.center().y).abs();
+            assert!(
+                offset <= px(1.),
+                "the tab is {offset:?} off the strip's centre: {strip:?} {tab:?}"
+            );
+        })
+        .unwrap();
     }
 
     #[gpui_kit::test]
