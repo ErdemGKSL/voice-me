@@ -63,7 +63,7 @@ development_status:
   3-5-choose-which-backend-generates-speech: review  # shipped in spec-3-3; the no-restart switch between runtime libraries waits on 3-8
   3-6-generate-through-a-remote-provider: review
   3-7-add-fal-ai-as-a-second-provider: backlog
-  3-8-build-and-mirror-the-all-provider-onnx-runtime: backlog
+  3-8-build-and-mirror-the-all-provider-onnx-runtime: in-progress
   3-9-choose-which-gpu-runs-generation: backlog
   3-10-give-backends-their-own-settings-tab: review
   3-11-choose-the-speech-language-per-backend: review
