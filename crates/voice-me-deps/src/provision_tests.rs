@@ -15,7 +15,7 @@ use voice_me_core::{
 
 use crate::DepsAdapter;
 use crate::provision::part_path;
-use crate::sources::{Asset, RuntimeArchive, Sources};
+use crate::sources::{Asset, LibraryEntry, RuntimeArchive, Sources};
 use crate::test_support::EnvGuard;
 
 /// How the server answers one path.
@@ -263,7 +263,10 @@ impl Fixture {
             let (rel, bytes) = extra.first().expect("a runtime archive to serve");
             RuntimeArchive {
                 archive: asset(rel, bytes),
-                library_entry,
+                library_entries: vec![LibraryEntry::new(
+                    library_entry,
+                    assets::runtime_dylib_file_name(),
+                )],
             }
         });
 
@@ -273,6 +276,9 @@ impl Fixture {
             sources: Sources {
                 model_files,
                 runtime,
+                runtime_all_providers: false,
+                cuda_runtime: None,
+                nvidia_wheels: Vec::new(),
                 espeak: None,
                 virtual_mic: None,
             },
@@ -605,6 +611,18 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// Every file in a runtime directory but the record of where the runtime
+/// came from.
+fn runtime_libraries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<_> = walk(dir)
+        .into_iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .filter(|name| name != assets::RUNTIME_SOURCE_FILE)
+        .collect();
+    names.sort();
+    names
+}
+
 /// A small `.tgz` shaped like the real one: the real library, a symlink
 /// chain onto it, and a provider bridge the CPU path never loads.
 fn fake_runtime_archive(library: &[u8]) -> Vec<u8> {
@@ -654,10 +672,7 @@ fn a_runtime_install_extracts_only_the_real_library_into_the_cache() {
     assert_eq!(result, Ok(()));
     let installed = assets::bundled_runtime_dylib(fixture.root());
     assert_eq!(std::fs::read(&installed).unwrap(), library);
-    let runtime_dir: Vec<_> = walk(installed.parent().unwrap())
-        .into_iter()
-        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
-        .collect();
+    let runtime_dir = runtime_libraries(installed.parent().unwrap());
     assert_eq!(
         runtime_dir,
         vec![assets::runtime_dylib_file_name().to_string()],
@@ -718,10 +733,7 @@ fn a_zip_runtime_install_extracts_only_the_real_library_into_the_cache() {
     assert_eq!(result, Ok(()));
     let installed = assets::bundled_runtime_dylib(fixture.root());
     assert_eq!(std::fs::read(&installed).unwrap(), library);
-    let runtime_dir: Vec<_> = walk(installed.parent().unwrap())
-        .into_iter()
-        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
-        .collect();
+    let runtime_dir = runtime_libraries(installed.parent().unwrap());
     assert_eq!(
         runtime_dir,
         vec![assets::runtime_dylib_file_name().to_string()],
@@ -1622,4 +1634,615 @@ fn the_linux_espeak_ng_provision_is_still_refused() {
     assert!(fixture.server.requests().is_empty());
     assert!(!assets::espeak_dir(fixture.root()).exists());
     assert!(matches!(finished(&events).as_slice(), [Err(_)]));
+}
+
+// ---------------------------------------------------------------------------
+// Story 3.8: voice-me's all-provider runtime, its CUDA provider, and the
+// NVIDIA wheels.
+// ---------------------------------------------------------------------------
+
+/// A `.tgz` holding `<dir>/lib/<name>` for each file, plus a licence that
+/// is never extracted.
+fn fake_release_tgz(dir: &str, files: &[(&str, &[u8])]) -> Vec<u8> {
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut builder = tar::Builder::new(encoder);
+    let mut add_file = |path: &str, bytes: &[u8]| {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, path, bytes).unwrap();
+    };
+    add_file(&format!("{dir}/LICENSE"), b"MIT");
+    for (name, bytes) in files {
+        add_file(&format!("{dir}/lib/{name}"), bytes);
+    }
+    builder.into_inner().unwrap().finish().unwrap()
+}
+
+/// A wheel is a zip: the libraries under `nvidia/<pkg>/lib/`, plus the
+/// Python files and headers voice-me never extracts.
+fn fake_wheel(files: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let mut add_file = |path: &str, bytes: &[u8]| {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    };
+    add_file("nvidia/__init__.py", b"");
+    add_file("nvidia/cudnn/include/cudnn.h", b"/* header */");
+    for (path, bytes) in files {
+        add_file(path, bytes);
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+const CORE_LIB: &[u8] = b"\x7fELF voice-me onnxruntime";
+const SHARED_LIB: &[u8] = b"\x7fELF providers_shared";
+const CUDA_LIB: &[u8] = b"\x7fELF providers_cuda";
+const CUDNN_LIB: &[u8] = b"\x7fELF libcudnn.so.9";
+const CUDART_LIB: &[u8] = b"\x7fELF libcudart.so.12";
+
+/// The fixture with voice-me's release pinned: the core, the CUDA
+/// provider, a cuDNN wheel and a CUDA runtime wheel, all served locally.
+fn all_provider_fixture() -> Fixture {
+    let lib = assets::runtime_dylib_file_name();
+    let provider = assets::cuda_provider_file_name();
+    let core = fake_release_tgz(
+        "core-9.9.9",
+        &[
+            ("libonnxruntime.so.9.9.9", CORE_LIB),
+            ("libonnxruntime_providers_shared.so", SHARED_LIB),
+        ],
+    );
+    let cuda = fake_release_tgz(
+        "cuda-9.9.9",
+        &[("libonnxruntime_providers_cuda.so", CUDA_LIB)],
+    );
+    let cudnn = fake_wheel(&[
+        ("nvidia/cudnn/lib/libcudnn.so.9", CUDNN_LIB),
+        ("nvidia/cudnn/lib/libcudnn_ops.so.9", b"not asked for"),
+    ]);
+    let cudart = fake_wheel(&[("nvidia/cuda_runtime/lib/libcudart.so.12", CUDART_LIB)]);
+    let mut fixture = Fixture::with_extra_files(
+        vec![
+            ("runtime/core-9.9.9.tgz".to_string(), core),
+            ("runtime/cuda-9.9.9.tgz".to_string(), cuda),
+            ("runtime/cuda/nvidia-cudnn.whl".to_string(), cudnn),
+            ("runtime/cuda/nvidia-cudart.whl".to_string(), cudart),
+        ],
+        None,
+    );
+    let archive = |rel: &str, entries: Vec<LibraryEntry>| {
+        let bytes = &fixture.files[rel];
+        RuntimeArchive {
+            archive: Asset {
+                relative_path: rel.to_string(),
+                url: format!("{}/{rel}", fixture.server.base),
+                size: bytes.len() as u64,
+                digest: crate::sources::Digest::Sha256(sha256(bytes)),
+            },
+            library_entries: entries,
+        }
+    };
+    let runtime = archive(
+        "runtime/core-9.9.9.tgz",
+        vec![
+            LibraryEntry::new("core-9.9.9/lib/libonnxruntime.so.9.9.9", lib),
+            LibraryEntry::new(
+                "core-9.9.9/lib/libonnxruntime_providers_shared.so",
+                "libonnxruntime_providers_shared.so",
+            ),
+        ],
+    );
+    let cuda_runtime = archive(
+        "runtime/cuda-9.9.9.tgz",
+        vec![LibraryEntry::new(
+            "cuda-9.9.9/lib/libonnxruntime_providers_cuda.so",
+            provider,
+        )],
+    );
+    let wheels = vec![
+        archive(
+            "runtime/cuda/nvidia-cudart.whl",
+            vec![LibraryEntry::new(
+                "nvidia/cuda_runtime/lib/libcudart.so.12",
+                "libcudart.so.12",
+            )],
+        ),
+        archive(
+            "runtime/cuda/nvidia-cudnn.whl",
+            vec![LibraryEntry::new(
+                "nvidia/cudnn/lib/libcudnn.so.9",
+                "libcudnn.so.9",
+            )],
+        ),
+    ];
+    fixture.sources.runtime = Some(runtime);
+    fixture.sources.runtime_all_providers = true;
+    fixture.sources.cuda_runtime = Some(cuda_runtime);
+    fixture.sources.nvidia_wheels = wheels;
+    fixture
+}
+
+fn local_request(target: voice_me_core::SpeechExecutionTarget) -> voice_me_core::CheckRequest {
+    voice_me_core::CheckRequest {
+        backend: voice_me_core::SpeechBackend::for_target(target),
+        selection: voice_me_core::BackendSelection::Local {
+            runtime: None,
+            target,
+        },
+        ..voice_me_core::CheckRequest::cpu()
+    }
+}
+
+impl Fixture {
+    fn provision_for(
+        &self,
+        kind: DependencyKind,
+        request: voice_me_core::CheckRequest,
+    ) -> (Result<(), String>, Vec<AppEvent>) {
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let result = self
+            .adapter()
+            .provision(kind, request, tx)
+            .map_err(|error| error.to_string());
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        (result, events)
+    }
+
+    fn rows_for(&self, request: voice_me_core::CheckRequest) -> Vec<voice_me_core::Dependency> {
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        self.adapter().check(request, tx).unwrap();
+        let Ok(AppEvent::DependencyCheckCompleted { report }) = rx.try_recv() else {
+            panic!("the check reports by event");
+        };
+        report.dependencies
+    }
+}
+
+/// Matrix row "CUDA": one Install fetches the core, the CUDA provider and
+/// every NVIDIA wheel in one download with one progress figure, and
+/// extracts only their shared libraries — the provider beside the runtime,
+/// NVIDIA's into `runtime/cuda/`.
+#[test]
+fn one_cuda_install_fetches_the_runtime_the_provider_and_the_nvidia_libraries() {
+    let fixture = all_provider_fixture();
+    let cuda = local_request(voice_me_core::SpeechExecutionTarget::Cuda);
+
+    let (result, events) = fixture.provision_for(DependencyKind::NvidiaLibraries, cuda.clone());
+
+    assert_eq!(result, Ok(()));
+    let root = fixture.root();
+    assert_eq!(
+        std::fs::read(assets::bundled_runtime_dylib(root)).unwrap(),
+        CORE_LIB
+    );
+    assert_eq!(
+        std::fs::read(assets::bundled_cuda_provider(root)).unwrap(),
+        CUDA_LIB
+    );
+    let cuda_dir = assets::cuda_libraries_dir(root);
+    assert_eq!(
+        runtime_libraries(&cuda_dir),
+        vec!["libcudart.so.12".to_string(), "libcudnn.so.9".to_string()],
+        "only the listed libraries: no wheel, no header, no decoy"
+    );
+    assert_eq!(
+        std::fs::read(cuda_dir.join("libcudnn.so.9")).unwrap(),
+        CUDNN_LIB
+    );
+    let mut top: Vec<_> = std::fs::read_dir(assets::runtime_dir(root))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    top.sort();
+    let mut expected = vec![
+        assets::RUNTIME_SOURCE_FILE.to_string(),
+        assets::CUDA_LIBRARIES_DIR.to_string(),
+        assets::cuda_provider_file_name().to_string(),
+        assets::runtime_dylib_file_name().to_string(),
+        "libonnxruntime_providers_shared.so".to_string(),
+    ];
+    expected.sort();
+    assert_eq!(top, expected, "no archive and no .part left behind");
+    let core = fixture.sources.runtime.as_ref().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(assets::runtime_source_file(root)).unwrap(),
+        format!(
+            "{} sha256:{}",
+            core.archive.url,
+            core.archive.digest.expected()
+        )
+    );
+
+    // One figure, on the row that was clicked, over all four archives.
+    let total: u64 = fixture
+        .files
+        .iter()
+        .filter(|(rel, _)| rel.starts_with("runtime/"))
+        .map(|(_, bytes)| size_of(bytes))
+        .sum();
+    let figures = progress(&events);
+    assert_eq!(figures.last(), Some(&(total, total)), "{figures:?}");
+    assert!(events.iter().all(|event| !matches!(
+        event,
+        AppEvent::ProvisioningProgress { kind, .. } if *kind != DependencyKind::NvidiaLibraries
+    )));
+    assert_eq!(finished(&events), vec![Ok(())]);
+
+    // Every CUDA row now reads ready, and Install on another of them has
+    // nothing left to fetch.
+    let rows = fixture.rows_for(cuda.clone());
+    for kind in [
+        DependencyKind::OnnxRuntime,
+        DependencyKind::CudaProvider,
+        DependencyKind::NvidiaLibraries,
+    ] {
+        let row = rows.iter().find(|row| row.kind == kind).unwrap();
+        assert!(!row.status.is_missing(), "{row:?}");
+    }
+    let requests = fixture.server.requests().len();
+    let (again, _) = fixture.provision_for(DependencyKind::CudaProvider, cuda);
+    assert_eq!(again, Ok(()));
+    assert_eq!(fixture.server.requests().len(), requests);
+}
+
+/// Matrix row "CPU user": with the release pinned, a CPU install fetches
+/// only the core archive — never the CUDA provider or a wheel.
+#[test]
+fn a_cpu_install_fetches_only_the_core_runtime() {
+    let fixture = all_provider_fixture();
+
+    let (result, _) = fixture.provision(DependencyKind::OnnxRuntime);
+
+    assert_eq!(result, Ok(()));
+    let requested: Vec<_> = fixture
+        .server
+        .requests()
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(requested, vec!["runtime/core-9.9.9.tgz".to_string()]);
+    assert!(!assets::bundled_cuda_provider(fixture.root()).exists());
+    assert!(!assets::cuda_libraries_dir(fixture.root()).exists());
+}
+
+/// Matrix row "A missing piece is its own row; Install fetches the rest":
+/// with the runtime already in place, only the missing wheel is fetched.
+#[test]
+fn a_cuda_install_fetches_only_the_missing_pieces() {
+    let fixture = all_provider_fixture();
+    let cuda = local_request(voice_me_core::SpeechExecutionTarget::Cuda);
+    let (first, _) = fixture.provision_for(DependencyKind::OnnxRuntime, cuda.clone());
+    assert_eq!(first, Ok(()));
+    let cudnn = assets::cuda_libraries_dir(fixture.root()).join("libcudnn.so.9");
+    std::fs::remove_file(&cudnn).unwrap();
+    let before = fixture.server.requests().len();
+
+    let (result, _) = fixture.provision_for(DependencyKind::NvidiaLibraries, cuda);
+
+    assert_eq!(result, Ok(()));
+    let requests = fixture.server.requests();
+    let later: Vec<_> = requests[before..]
+        .iter()
+        .map(|(path, _)| path.as_str())
+        .collect();
+    assert_eq!(later, ["runtime/cuda/nvidia-cudnn.whl"]);
+    assert_eq!(std::fs::read(&cudnn).unwrap(), CUDNN_LIB);
+}
+
+/// Matrix row "WebGPU" after pinning: the CPU-only runtime a user already
+/// has is replaced by voice-me's build, and a CUDA provider left from an
+/// older build goes with it.
+#[test]
+fn a_webgpu_install_replaces_a_cpu_only_runtime() {
+    let fixture = all_provider_fixture();
+    let root = fixture.root().to_path_buf();
+    std::fs::create_dir_all(assets::runtime_dir(&root)).unwrap();
+    std::fs::write(assets::bundled_runtime_dylib(&root), b"microsoft cpu build").unwrap();
+    std::fs::write(assets::bundled_cuda_provider(&root), b"old provider").unwrap();
+
+    let (result, _) = fixture.provision_for(
+        DependencyKind::OnnxRuntime,
+        local_request(voice_me_core::SpeechExecutionTarget::WebGpu),
+    );
+
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        std::fs::read(assets::bundled_runtime_dylib(&root)).unwrap(),
+        CORE_LIB
+    );
+    assert!(!assets::bundled_cuda_provider(&root).exists());
+    assert!(
+        !assets::cuda_libraries_dir(&root).exists(),
+        "WebGPU needs no NVIDIA library"
+    );
+}
+
+/// A core archive that lacks one of its libraries installs none of them:
+/// half a runtime would read as installed.
+#[test]
+fn a_core_archive_missing_a_library_installs_nothing() {
+    let mut fixture = all_provider_fixture();
+    let runtime = fixture.sources.runtime.as_mut().unwrap();
+    runtime.library_entries.push(LibraryEntry::new(
+        "core-9.9.9/lib/libwebgpu_dawn.so",
+        "libwebgpu_dawn.so",
+    ));
+
+    let (result, _) = fixture.provision(DependencyKind::OnnxRuntime);
+
+    let message = result.expect_err("the archive has no Dawn library");
+    assert!(
+        message.contains("Extraction of libwebgpu_dawn.so from core-9.9.9.tgz failed")
+            && message.contains("the archive has no core-9.9.9/lib/libwebgpu_dawn.so"),
+        "{message}"
+    );
+    assert!(!assets::bundled_runtime_dylib(fixture.root()).exists());
+    assert!(
+        runtime_libraries(&assets::runtime_dir(fixture.root()))
+            .iter()
+            .all(|name| name.ends_with(".tgz")),
+        "only the verified archive is kept"
+    );
+}
+
+/// Before the release is pinned (decision 7), Install for CUDA is refused
+/// with today's sentence, and nothing is fetched.
+#[test]
+fn before_pinning_a_cuda_install_is_refused_as_before() {
+    let fixture = Fixture::with_extra_files(
+        vec![(
+            "runtime/ort-9.9.9.tgz".to_string(),
+            fake_runtime_archive(b"lib"),
+        )],
+        Some("ort-9.9.9/lib/libonnxruntime.so.9.9.9".to_string()),
+    );
+
+    let (result, _) = fixture.provision_for(
+        DependencyKind::OnnxRuntime,
+        local_request(voice_me_core::SpeechExecutionTarget::Cuda),
+    );
+
+    let message = result.expect_err("no CUDA runtime source yet");
+    assert!(message.contains("not yet available"), "{message}");
+    assert!(fixture.server.requests().is_empty());
+}
+
+/// Deferred-work fix: Piper speaks on the CPU runtime, so Install on its
+/// runtime row works whatever GPU backend Chatterbox has saved.
+#[test]
+fn a_piper_runtime_install_uses_the_cpu_runtime_whatever_backend_is_saved() {
+    let fixture = Fixture::with_extra_files(
+        vec![(
+            "runtime/ort-9.9.9.tgz".to_string(),
+            fake_runtime_archive(b"lib"),
+        )],
+        Some("ort-9.9.9/lib/libonnxruntime.so.9.9.9".to_string()),
+    );
+    let request = voice_me_core::CheckRequest {
+        backend: voice_me_core::SpeechBackend::for_target(
+            voice_me_core::SpeechExecutionTarget::Cuda,
+        ),
+        selection: voice_me_core::BackendSelection::Piper,
+        ..voice_me_core::CheckRequest::cpu()
+    };
+
+    let (result, _) = fixture.provision_for(DependencyKind::OnnxRuntime, request);
+
+    assert_eq!(result, Ok(()));
+    assert!(assets::bundled_runtime_dylib(fixture.root()).exists());
+}
+
+/// The libraries of a failed rename go back as they were: the directory
+/// holds the old set or the new one, never a mix.
+#[test]
+fn a_failed_rename_puts_the_old_libraries_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("core.tgz");
+    std::fs::write(
+        &archive,
+        fake_release_tgz("core", &[("liba.so", b"new a"), ("libb.so", b"new b")]),
+    )
+    .unwrap();
+    let out = dir.path().join("runtime");
+    std::fs::create_dir_all(out.join("libb.so")).unwrap();
+    std::fs::write(out.join("libb.so").join("keep"), b"x").unwrap();
+    std::fs::write(out.join("liba.so"), b"old a").unwrap();
+    let entries = [
+        LibraryEntry::new("core/lib/liba.so", "liba.so"),
+        LibraryEntry::new("core/lib/libb.so", "libb.so"),
+    ];
+
+    let error = crate::provision::extract_libraries(&archive, &entries, &out)
+        .expect_err("libb.so cannot replace a directory");
+
+    assert!(error.to_string().contains("libb.so"), "{error}");
+    assert_eq!(std::fs::read(out.join("liba.so")).unwrap(), b"old a");
+    assert!(out.join("libb.so").join("keep").exists());
+    let mut left: Vec<_> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["liba.so", "libb.so"], "no .old, no .part");
+
+    // With the obstacle gone the new set lands whole, and the backups go.
+    std::fs::remove_dir_all(out.join("libb.so")).unwrap();
+    crate::provision::extract_libraries(&archive, &entries, &out).unwrap();
+    assert_eq!(std::fs::read(out.join("liba.so")).unwrap(), b"new a");
+    assert_eq!(std::fs::read(out.join("libb.so")).unwrap(), b"new b");
+    assert!(!out.join("liba.so.old").exists());
+}
+
+/// The old CUDA provider goes only once the new core is in place: a core
+/// that fails to extract leaves the provider where it was.
+#[test]
+fn a_failed_core_extraction_keeps_the_old_provider() {
+    let mut fixture = all_provider_fixture();
+    fixture
+        .sources
+        .runtime
+        .as_mut()
+        .unwrap()
+        .library_entries
+        .push(LibraryEntry::new("core-9.9.9/lib/missing.so", "missing.so"));
+    let provider = assets::bundled_cuda_provider(fixture.root());
+    std::fs::create_dir_all(provider.parent().unwrap()).unwrap();
+    std::fs::write(&provider, b"old provider").unwrap();
+
+    let (result, _) = fixture.provision_for(
+        DependencyKind::OnnxRuntime,
+        local_request(voice_me_core::SpeechExecutionTarget::WebGpu),
+    );
+
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&provider).unwrap(), b"old provider");
+}
+
+/// An archive on disk that no longer matches its pin (the pin changed
+/// since it was fetched) is fetched again rather than extracted.
+#[test]
+fn an_archive_on_disk_that_fails_its_pin_is_fetched_again() {
+    let fixture = all_provider_fixture();
+    let placed = fixture.root().join("runtime").join("core-9.9.9.tgz");
+    std::fs::create_dir_all(placed.parent().unwrap()).unwrap();
+    std::fs::write(&placed, b"an archive from an older pin").unwrap();
+
+    let (result, _) = fixture.provision(DependencyKind::OnnxRuntime);
+
+    assert_eq!(result, Ok(()));
+    let requested: Vec<_> = fixture
+        .server
+        .requests()
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(requested, ["runtime/core-9.9.9.tgz"]);
+    assert_eq!(
+        std::fs::read(assets::bundled_runtime_dylib(fixture.root())).unwrap(),
+        CORE_LIB
+    );
+}
+
+/// NVIDIA libraries from an older wheel pin are cleared before the new
+/// wheels are extracted, and the record names only the new ones.
+#[test]
+fn a_repinned_wheel_clears_the_nvidia_folder_first() {
+    let fixture = all_provider_fixture();
+    let cuda = local_request(voice_me_core::SpeechExecutionTarget::Cuda);
+    assert_eq!(
+        fixture
+            .provision_for(DependencyKind::NvidiaLibraries, cuda.clone())
+            .0,
+        Ok(())
+    );
+    let cuda_dir = assets::cuda_libraries_dir(fixture.root());
+    std::fs::write(cuda_dir.join("libcudnn_old.so.9"), b"from the old wheel").unwrap();
+    let marker = assets::cuda_libraries_source_file(fixture.root());
+    let recorded = std::fs::read_to_string(&marker).unwrap();
+    std::fs::write(&marker, recorded.replacen("sha256:", "sha256:00", 1)).unwrap();
+
+    let (result, _) = fixture.provision_for(DependencyKind::NvidiaLibraries, cuda);
+
+    assert_eq!(result, Ok(()));
+    assert!(!cuda_dir.join("libcudnn_old.so.9").exists());
+    assert_eq!(
+        assets::installed_cuda_libraries(fixture.root()),
+        ["libcudart.so.12", "libcudnn.so.9"]
+    );
+}
+
+/// With no runtime source for this system, Install on a runtime that is
+/// already there has nothing to do — and is not an error.
+#[test]
+fn a_cpu_install_with_nothing_missing_is_fine_without_a_source() {
+    let fixture = Fixture::new();
+    let installed = assets::bundled_runtime_dylib(fixture.root());
+    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    std::fs::write(&installed, b"lib").unwrap();
+
+    let (result, _) = fixture.provision(DependencyKind::OnnxRuntime);
+
+    assert_eq!(result, Ok(()));
+    std::fs::remove_file(&installed).unwrap();
+    let (result, _) = fixture.provision(DependencyKind::OnnxRuntime);
+    assert!(result.unwrap_err().contains("cannot install"));
+}
+
+/// Story 3.8 (Windows): with the runtime loaded in this process the new
+/// core and provider are staged for the next start, the loaded files are
+/// left alone, and the NVIDIA libraries go straight into `runtime/cuda/`.
+#[test]
+fn an_update_to_a_loaded_runtime_is_staged() {
+    let fixture = all_provider_fixture();
+    let root = fixture.root().to_path_buf();
+    std::fs::create_dir_all(assets::runtime_dir(&root)).unwrap();
+    std::fs::write(assets::bundled_runtime_dylib(&root), b"loaded cpu build").unwrap();
+    let adapter = fixture
+        .adapter()
+        .with_runtime_in_use(|| true)
+        .staging_when_in_use();
+    let (tx, _rx) = futures::channel::mpsc::unbounded();
+
+    let result = adapter.provision(
+        DependencyKind::OnnxRuntime,
+        local_request(voice_me_core::SpeechExecutionTarget::Cuda),
+        tx,
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        std::fs::read(assets::bundled_runtime_dylib(&root)).unwrap(),
+        b"loaded cpu build"
+    );
+    let staged = assets::staged_runtime_dir(&root);
+    assert_eq!(
+        std::fs::read(staged.join(assets::runtime_dylib_file_name())).unwrap(),
+        CORE_LIB
+    );
+    assert_eq!(
+        std::fs::read(staged.join(assets::cuda_provider_file_name())).unwrap(),
+        CUDA_LIB
+    );
+    assert!(crate::staged_runtime_pending(&root));
+    assert!(
+        assets::cuda_libraries_dir(&root)
+            .join("libcudnn.so.9")
+            .exists()
+    );
+
+    // A second Install waits for the restart instead of staging again.
+    let requests = fixture.server.requests().len();
+    let (again, _) = fixture.provision_for(
+        DependencyKind::CudaProvider,
+        local_request(voice_me_core::SpeechExecutionTarget::Cuda),
+    );
+    assert_eq!(again, Ok(()));
+    assert_eq!(fixture.server.requests().len(), requests);
+
+    // At the next start the staged set is put in place.
+    assert!(crate::apply_staged_runtime(&root).unwrap());
+    assert_eq!(
+        std::fs::read(assets::bundled_runtime_dylib(&root)).unwrap(),
+        CORE_LIB
+    );
+    assert_eq!(
+        std::fs::read(assets::bundled_cuda_provider(&root)).unwrap(),
+        CUDA_LIB
+    );
+    let rows = fixture.rows_for(local_request(voice_me_core::SpeechExecutionTarget::Cuda));
+    assert!(
+        rows.iter()
+            .filter(|row| row.kind != DependencyKind::ModelWeights
+                && row.kind != DependencyKind::BackendCapability
+                && row.kind != DependencyKind::VirtualMicrophone)
+            .all(|row| !row.status.is_missing()),
+        "{rows:?}"
+    );
 }

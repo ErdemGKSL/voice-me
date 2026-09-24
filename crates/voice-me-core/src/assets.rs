@@ -151,6 +151,108 @@ pub fn bundled_runtime_dylib(root: &Path) -> PathBuf {
     root.join(RUNTIME_DIR).join(runtime_dylib_file_name())
 }
 
+/// Story 3.8: where NVIDIA's CUDA libraries (cudart, cuBLAS, cuFFT, cuDNN)
+/// sit, inside [`RUNTIME_DIR`]. The engine loads them from here before it
+/// registers the CUDA provider, so the user's `PATH` and `LD_LIBRARY_PATH`
+/// are never involved.
+pub const CUDA_LIBRARIES_DIR: &str = "cuda";
+
+/// Records which archive the runtime in [`RUNTIME_DIR`] came from (its file
+/// name), so an older or CPU-only runtime can be told apart from the
+/// build that has the GPU providers. A runtime without one predates
+/// Story 3.8.
+pub const RUNTIME_SOURCE_FILE: &str = "installed-from.txt";
+
+/// `<root>/runtime`.
+pub fn runtime_dir(root: &Path) -> PathBuf {
+    root.join(RUNTIME_DIR)
+}
+
+/// `<root>/runtime/cuda`.
+pub fn cuda_libraries_dir(root: &Path) -> PathBuf {
+    runtime_dir(root).join(CUDA_LIBRARIES_DIR)
+}
+
+/// `<root>/runtime/installed-from.txt`.
+pub fn runtime_source_file(root: &Path) -> PathBuf {
+    runtime_dir(root).join(RUNTIME_SOURCE_FILE)
+}
+
+/// Story 3.8 (Windows): where a runtime update is put when the runtime in
+/// [`RUNTIME_DIR`] is loaded in this process and cannot be replaced. It is
+/// moved into place when voice-me next starts, before anything loads it.
+pub const STAGED_RUNTIME_DIR: &str = "staged";
+
+/// `<root>/runtime/staged`.
+pub fn staged_runtime_dir(root: &Path) -> PathBuf {
+    runtime_dir(root).join(STAGED_RUNTIME_DIR)
+}
+
+/// `<root>/runtime/cuda/installed-from.txt`: one line per NVIDIA wheel
+/// installed — its pinned identity, then the libraries taken from it
+/// ([`cuda_marker_line`]).
+pub fn cuda_libraries_source_file(root: &Path) -> PathBuf {
+    cuda_libraries_dir(root).join(RUNTIME_SOURCE_FILE)
+}
+
+/// One line of [`cuda_libraries_source_file`]: `stamp`, then each library's
+/// file name, tab-separated.
+pub fn cuda_marker_line(stamp: &str, libraries: &[&str]) -> String {
+    let mut line = stamp.to_string();
+    for library in libraries {
+        line.push('\t');
+        line.push_str(library);
+    }
+    line.push('\n');
+    line
+}
+
+/// The lines of [`cuda_libraries_source_file`], as `(stamp, libraries)`.
+/// Missing or unreadable reads as nothing installed.
+pub fn installed_cuda_wheels(root: &Path) -> Vec<(String, Vec<String>)> {
+    std::fs::read_to_string(cuda_libraries_source_file(root))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut fields = line.split('\t');
+            let stamp = fields.next().unwrap_or_default().to_string();
+            (stamp, fields.map(str::to_string).collect())
+        })
+        .collect()
+}
+
+/// Every NVIDIA library the installed wheels named — the only files in
+/// `runtime/cuda/` the engine loads.
+pub fn installed_cuda_libraries(root: &Path) -> Vec<String> {
+    installed_cuda_wheels(root)
+        .into_iter()
+        .flat_map(|(_, libraries)| libraries)
+        .collect()
+}
+
+/// The platform's file name for ONNX Runtime's CUDA execution provider,
+/// which ONNX Runtime loads from beside its own library.
+pub fn cuda_provider_file_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "onnxruntime_providers_cuda.dll"
+    } else {
+        "libonnxruntime_providers_cuda.so"
+    }
+}
+
+/// Where the bundled runtime's CUDA provider sits: beside the bundled
+/// library.
+pub fn bundled_cuda_provider(root: &Path) -> PathBuf {
+    runtime_dir(root).join(cuda_provider_file_name())
+}
+
+/// Whether `dylib` is the bundled runtime of `root` — the one voice-me
+/// installs, rather than a library the user added or configured.
+pub fn is_bundled_runtime(root: &Path, dylib: &Path) -> bool {
+    dylib == bundled_runtime_dylib(root)
+}
+
 /// How the ONNX Runtime library was located — which is half of what the
 /// Dependency Check has to report, since "not at the path you configured"
 /// and "not where we would have put it" are different problems with
@@ -461,6 +563,70 @@ mod tests {
             bundled_runtime_dylib(Path::new("/cache")),
             PathBuf::from("/cache/runtime").join(runtime_dylib_file_name())
         );
+    }
+
+    /// Story 3.8: the bundled runtime, its CUDA provider beside it, and
+    /// NVIDIA's libraries one level down — all inside `runtime/`.
+    #[test]
+    fn the_cuda_pieces_sit_inside_the_runtime_directory() {
+        let root = Path::new("/cache");
+        assert_eq!(runtime_dir(root), PathBuf::from("/cache/runtime"));
+        assert_eq!(
+            cuda_libraries_dir(root),
+            PathBuf::from("/cache/runtime/cuda")
+        );
+        assert_eq!(
+            bundled_cuda_provider(root).parent(),
+            bundled_runtime_dylib(root).parent()
+        );
+        assert!(
+            cuda_provider_file_name().contains("onnxruntime_providers_cuda"),
+            "{}",
+            cuda_provider_file_name()
+        );
+        assert_eq!(
+            runtime_source_file(root),
+            PathBuf::from("/cache/runtime/installed-from.txt")
+        );
+        assert!(is_bundled_runtime(root, &bundled_runtime_dylib(root)));
+        assert_eq!(
+            staged_runtime_dir(root),
+            PathBuf::from("/cache/runtime/staged")
+        );
+        assert!(!is_bundled_runtime(
+            root,
+            Path::new("/opt/ort/libonnxruntime.so")
+        ));
+    }
+
+    /// The NVIDIA marker names each wheel's identity and its libraries,
+    /// which are the only files the engine loads from `runtime/cuda/`.
+    #[test]
+    fn the_cuda_marker_round_trips_and_lists_only_named_libraries() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cuda_libraries_dir(root.path())).unwrap();
+        let text = cuda_marker_line("https://x/a.whl sha256:aa", &["liba.so.1"])
+            + &cuda_marker_line("https://x/b.whl sha256:bb", &["libb.so.1", "libc.so.1"]);
+        std::fs::write(cuda_libraries_source_file(root.path()), text).unwrap();
+
+        assert_eq!(
+            installed_cuda_wheels(root.path()),
+            vec![
+                (
+                    "https://x/a.whl sha256:aa".to_string(),
+                    vec!["liba.so.1".to_string()]
+                ),
+                (
+                    "https://x/b.whl sha256:bb".to_string(),
+                    vec!["libb.so.1".to_string(), "libc.so.1".to_string()]
+                ),
+            ]
+        );
+        assert_eq!(
+            installed_cuda_libraries(root.path()),
+            ["liba.so.1", "libb.so.1", "libc.so.1"]
+        );
+        assert!(installed_cuda_libraries(Path::new("/nonexistent-voice-me")).is_empty());
     }
 
     #[test]

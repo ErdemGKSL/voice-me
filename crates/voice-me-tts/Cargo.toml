@@ -7,17 +7,18 @@ edition.workspace = true
 voice-me-core = { path = "../voice-me-core" }
 # AD-12: Chatterbox-Multilingual runs in-process on ONNX Runtime — there is
 # no sidecar and no Python. `default-features = false` is load-bearing: ort's
-# defaults pull in `download-binaries`, which drags `ureq` (an HTTP client)
-# into the workspace and fetches a runtime at build time — exactly what AD-8
-# forbids. `load-dynamic` instead resolves `libonnxruntime.so` at run time
-# from `ORT_DYLIB_PATH`, so the binary CI builds carries no runtime and
-# downloads nothing.
+# defaults fetch a prebuilt runtime at build time (and drag an HTTP client
+# into the workspace) — exactly what AD-8 forbids. `load-dynamic` instead
+# resolves the library at run time: the one `voice-me-deps` installs into
+# the cache, `ORT_DYLIB_PATH`, or one the user added. The binary CI builds
+# carries no runtime and downloads nothing.
 #
 # `cuda` and `webgpu` (Story 3.3) only compile in the two execution
 # providers' *registration* code — under `load-dynamic` they link nothing and
 # download nothing. Whether a provider is actually there is a property of
-# the runtime library loaded at run time, which is exactly what the
-# `--probe-runtime` helper asks it.
+# the runtime library loaded at run time: voice-me's own build (Story 3.8)
+# has CPU, WebGPU and CUDA in one library, so switching between them is a
+# session rebuild.
 ort = { version = "2.0.0-rc.13", default-features = false, features = [
   "std",
   "ndarray",
@@ -25,7 +26,12 @@ ort = { version = "2.0.0-rc.13", default-features = false, features = [
   "api-27",
   "cuda",
   "webgpu",
+  "load-dynamic",
 ] }
+# Story 3.8: NVIDIA's libraries are loaded from the cache (`dlopen` with
+# `RTLD_GLOBAL` on Linux, `LoadLibraryExW` on Windows) before the CUDA
+# provider is registered. The same version `voice-me-deps` already uses.
+libloading = "0.8"
 # The version ort rc.13 itself depends on — a mismatch here means its
 # `try_extract_array` returns a type this crate cannot name.
 ndarray = "0.17"
@@ -56,30 +62,3 @@ tokio = { version = "1.53", default-features = false, features = ["rt", "rt-mult
 # Writing the generated buffer out as a wav, so it can be listened to.
 hound = "3.5"
 tempfile = "3.14"
-
-[features]
-default = ["dynamic-runtime"]
-
-# The AD-8 path, and the only one CI ever builds: ONNX Runtime is resolved at
-# run time from `ORT_DYLIB_PATH`, so the binary carries no runtime and the
-# build downloads nothing.
-#
-# It is a named feature rather than a flag glued onto the `ort` dependency
-# above because `webgpu-probe` has to be able to *turn it off*. Cargo features
-# are purely additive — `--features webgpu-probe` cannot unset a feature that
-# the dependency line always enables — and with `load-dynamic` on, ort-sys
-# skips its download entirely and the probe silently builds a CPU-only binary
-# that reports "WebGPU" on the command line. Splitting it out is what makes
-# `--no-default-features --features webgpu-probe` mean what it says.
-dynamic-runtime = ["ort/load-dynamic"]
-
-# Off by default, and never built in CI: the WebGPU execution provider is not
-# in Microsoft's linux-x64 tarball at all, so reaching it means ort's
-# `download-binaries` (pyke's Dawn-bundling distribution) — a build-time
-# download and a static link, i.e. the opposite of AD-8. It exists solely so
-# the spike could measure the Vulkan path; an architecture-clean WebGPU build
-# needs ONNX Runtime compiled from source with `--use_webgpu
-# --build_shared_lib` and mirrored per AD-7. Build it with
-# `--no-default-features --features webgpu-probe`; with the default feature
-# still on, `load-dynamic` wins and no WebGPU provider is linked at all.
-webgpu-probe = ["ort/download-binaries", "ort/webgpu", "ort/tls-rustls"]

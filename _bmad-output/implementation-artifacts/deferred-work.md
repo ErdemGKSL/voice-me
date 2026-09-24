@@ -184,6 +184,7 @@
   evidence: `piper::default_voice()` has its URLs fixed in code, so an adapter-level test cannot point it at a `TestServer`. Make the default voice's source injectable (e.g. through `PiperSources`) first.
 
 - source_spec: none
+  status: resolved by spec-3-8 (`provision_row` provisions the CPU runtime for a Piper selection; test `a_piper_runtime_install_uses_the_cpu_runtime_whatever_backend_is_saved`)
   summary: Install on Piper's ONNX Runtime row fails when the saved Chatterbox backend is a GPU one, because `provision_runtime` checks `request.backend` instead of the CPU runtime Piper's row is built for.
   evidence: `crates/voice-me-deps/src/lib.rs` `piper_rows` builds the row with `SpeechBackend::CPU` and `installable`, but `provision_row` passes `request.backend` to `provision_runtime`, which refuses any non-CPU target with `gpu_runtime_unavailable`. Found while investigating a Linux runtime auto-download request that turned out to be already served by the Install button.
 

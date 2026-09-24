@@ -26,9 +26,10 @@ use voice_me_core::{
     SpeechExecutionTarget,
 };
 
-/// Decision 5: CUDA's floor is compute capability 6.0 (spec-2-5 Decision 1
-/// — ONNX Runtime's prebuilt CUDA kernels start at sm_60 and ship no PTX
-/// to JIT an older GPU from). One constant; Story 3.8 may revisit it.
+/// Decision 5: CUDA's floor is compute capability 6.0 (spec-2-5 Decision 1).
+/// Story 3.8 decision 5 keeps it: voice-me's own ONNX Runtime build is
+/// compiled for `60;70;75;80;86;89;90;120` plus PTX for newer GPUs, and
+/// nothing older than sm_60.
 pub const CUDA_MIN_COMPUTE_CAPABILITY: (i32, i32) = (6, 0);
 
 /// How long one hardware probe may take before the check gives up on it.

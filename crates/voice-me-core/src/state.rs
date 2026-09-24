@@ -1063,6 +1063,14 @@ pub enum DependencyKind {
     /// The Piper voice the selection speaks in (Story 3.15). Blocking; its
     /// Install downloads the voice named in the request.
     PiperVoice,
+    /// ONNX Runtime's CUDA execution provider, beside the bundled runtime
+    /// (Story 3.8). Reported for a CUDA backend on the bundled runtime
+    /// only; blocking.
+    CudaProvider,
+    /// NVIDIA's CUDA libraries — cudart, cuBLAS, cuFFT, cuDNN — the CUDA
+    /// provider loads (Story 3.8). Reported with [`Self::CudaProvider`];
+    /// blocking.
+    NvidiaLibraries,
 }
 
 impl DependencyKind {
@@ -1077,6 +1085,8 @@ impl DependencyKind {
                 | DependencyKind::SystemVoiceEngine
                 | DependencyKind::EdgeTtsProgram
                 | DependencyKind::PiperVoice
+                | DependencyKind::CudaProvider
+                | DependencyKind::NvidiaLibraries
         )
     }
 }
@@ -1951,6 +1961,8 @@ mod tests {
             Some("tr_TR-fahrettin-medium")
         );
         assert!(DependencyKind::PiperVoice.blocks_speech());
+        assert!(DependencyKind::CudaProvider.blocks_speech());
+        assert!(DependencyKind::NvidiaLibraries.blocks_speech());
     }
 
     /// The First run row at core level: with nothing saved, Linux and

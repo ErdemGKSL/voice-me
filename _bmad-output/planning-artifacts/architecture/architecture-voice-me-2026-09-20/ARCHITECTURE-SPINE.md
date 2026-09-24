@@ -194,7 +194,8 @@ graph TD
 | tracing | latest stable — pin at implementation time |
 | directories | latest stable — pin at implementation time |
 | ort (ONNX Runtime bindings, AD-12) | 2.0.0-rc.13 — `load-dynamic` so the runtime library is provisioned by `voice-me-deps`, never downloaded by the build |
-| ONNX Runtime | one CI-built distribution matching the pinned `ort` rc, carrying the CPU, CUDA and WebGPU execution providers, built from source and mirrored per AD-7 |
+| ONNX Runtime | 1.28.2, built from source by `.github/workflows/onnxruntime.yml` with the CPU, WebGPU and CUDA 12.8 (sm 60–120 + PTX) providers in one shared library, mirrored per AD-7 as release `onnxruntime-1.28.2-voiceme.1`: per OS a core archive (`onnxruntime` + `onnxruntime_providers_shared`) for every backend, and a CUDA provider archive fetched only for CUDA. Microsoft's CPU archive stays the source until the release is pinned (Story 3.8) |
+| NVIDIA CUDA libraries | cudart 12.8, cuBLAS 12.8, cuFFT 11.3, cuDNN 9.8 from NVIDIA's PyPI wheels (`nvidia-*-cu12`), pinned by URL, size and SHA-256 (too large to mirror, AD-7); only their shared libraries are extracted to `<cache>/runtime/cuda/` and loaded before the CUDA provider is registered |
 | reqwest | latest stable — HTTP client with `rustls`; permitted only in `voice-me-deps` and `voice-me-tts-remote` (AD-8) |
 | serde_json | latest stable — remote provider request/response bodies (AD-13) |
 | eSpeak NG | system package, run as a process — Linux instant backend (GPL-3.0, not linked; AD-12) |

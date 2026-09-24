@@ -47,7 +47,7 @@ use crate::capability::{GpuProbe, SystemGpuProbe, SystemVoiceProbe};
 
 use crate::piper::{CatalogVoice, PiperSources};
 use crate::provision::{ProgressReporter, ProgressTarget};
-use crate::sources::{PlannedDownload, Sources};
+use crate::sources::{PlannedDownload, RuntimeArchive, Sources};
 
 /// `DependencyProvisioningPort` adapter.
 ///
@@ -60,6 +60,17 @@ use crate::sources::{PlannedDownload, Sources};
 pub struct DepsAdapter {
     sources: Arc<Sources>,
     in_flight: Arc<Mutex<HashSet<DependencyKind>>>,
+    /// Held for the whole of a runtime install (Story 3.8). Install on the
+    /// runtime, CUDA provider and NVIDIA rows fetches the same set of
+    /// files, so a second one waits for the first and then finds nothing
+    /// left to do, rather than writing to the same `.part` files.
+    runtime_install: Arc<Mutex<()>>,
+    /// Whether this process has the bundled runtime loaded (Story 3.8),
+    /// asked of the speech engine by the composition root.
+    runtime_in_use: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Whether a runtime update waits in `runtime/staged/` while the
+    /// runtime is in use: Windows, which cannot replace a loaded library.
+    stage_when_in_use: bool,
     /// What Install on the Virtual Microphone row runs: the Linux audio
     /// crate's own `install()`, or on Windows VB-CABLE's setup from the
     /// unpacked driver pack (Story 2.8). Injectable so the row's
@@ -125,6 +136,9 @@ impl DepsAdapter {
         Self {
             sources: Arc::new(sources),
             in_flight: Arc::default(),
+            runtime_install: Arc::default(),
+            runtime_in_use: Arc::new(|| false),
+            stage_when_in_use: cfg!(target_os = "windows"),
             virtual_mic_installer: Arc::new(install_virtual_microphone),
             gpu_probe: Arc::new(SystemGpuProbe),
             piper_sources: Arc::new(PiperSources::pinned()),
@@ -231,7 +245,19 @@ impl DepsAdapter {
                 let plan = self.sources.model_plan(&root, backend.weights)?;
                 fetch(kind, &plan, events)
             }
-            DependencyKind::OnnxRuntime => self.provision_runtime(backend, events),
+            // Story 3.8: one Install on any of the runtime's rows fetches
+            // everything the selected target still needs. Piper speaks on
+            // the CPU runtime whatever Chatterbox backend is saved.
+            DependencyKind::OnnxRuntime
+            | DependencyKind::CudaProvider
+            | DependencyKind::NvidiaLibraries => {
+                let backend = if request.selection.is_piper() {
+                    SpeechBackend::CPU
+                } else {
+                    backend
+                };
+                self.provision_runtime(kind, backend, events)
+            }
             DependencyKind::VirtualMicrophone => self.provision_virtual_mic(events),
             DependencyKind::PiperVoice => self.provision_piper_voice(request, events),
             // Story 3.16: where eSpeak NG has a pinned download (Windows
@@ -385,15 +411,18 @@ impl DepsAdapter {
     /// Decision 1: the runtime installs automatically on Linux x64 and
     /// Windows x64 only, and only into the cache — never over a path
     /// `ORT_DYLIB_PATH` names.
+    ///
+    /// Story 3.8: everything `backend` still needs, in one download with
+    /// one progress figure on `kind`'s row — the core runtime (also when an
+    /// older or CPU-only one is in the way of a GPU backend), and for CUDA
+    /// the CUDA provider and NVIDIA's libraries.
     fn provision_runtime(
         &self,
+        kind: DependencyKind,
         backend: SpeechBackend,
         events: &AppEventSender,
     ) -> Result<(), VoiceMeError> {
         let root = assets::model_cache_root()?;
-        if backend.target != SpeechExecutionTarget::Cpu {
-            return Err(VoiceMeError::Other(gpu_runtime_unavailable(backend)));
-        }
         // Only the bundled runtime is ever installed: a library the user
         // added is theirs, and its row is manual when it goes missing.
         let resolved = assets::resolve_runtime_dylib(&root, None);
@@ -405,31 +434,354 @@ impl DepsAdapter {
                 resolved.path.display()
             )));
         }
-        if resolved.path.exists() {
+        if !runtime_installable(&self.sources, backend.target) {
+            // Nothing Install could fetch — which is fine when nothing is
+            // missing.
+            if resolved.path.exists() {
+                return Ok(());
+            }
+            return Err(VoiceMeError::Other(
+                if backend.target != SpeechExecutionTarget::Cpu {
+                    gpu_runtime_unavailable(backend)
+                } else {
+                    "voice-me cannot install ONNX Runtime on this system; follow the steps on \
+                     the row."
+                        .to_string()
+                },
+            ));
+        }
+
+        let _one_at_a_time = self
+            .runtime_install
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pieces = runtime_pieces(&root, &self.sources, backend.target);
+        if pieces.is_empty() {
             return Ok(());
         }
-        let Some(runtime) = self.sources.runtime.as_ref() else {
-            return Err(VoiceMeError::Other(
-                "voice-me cannot install ONNX Runtime on this system; follow the steps on the row."
-                    .to_string(),
-            ));
-        };
+
+        // Libraries from a wheel that is no longer pinned go before any new
+        // one arrives (the wheels themselves download into that folder).
+        let cuda_dir = assets::cuda_libraries_dir(&root);
+        if pieces
+            .iter()
+            .any(|piece| piece.role == PieceRole::NvidiaWheel)
+            && nvidia_libraries_are_stale(&root, &self.sources)
+        {
+            remove_dir_if_present(&cuda_dir)?;
+        }
 
         // A verified archive left by a run whose extraction failed is not
-        // fetched again.
-        let archive = runtime.archive.destination(&root);
-        if !archive.exists() {
-            let plan = [PlannedDownload {
-                asset: runtime.archive.clone(),
-                destination: archive.clone(),
-            }];
-            fetch(DependencyKind::OnnxRuntime, &plan, events)?;
+        // fetched again; one that no longer matches its pin (the pin
+        // changed since) is.
+        let mut plan = Vec::new();
+        for piece in &pieces {
+            let destination = piece.source.archive.destination(&root);
+            if destination.exists() && !provision::is_verified(&piece.source.archive, &destination)
+            {
+                let _ = std::fs::remove_file(&destination);
+            }
+            if !destination.exists() {
+                plan.push(PlannedDownload {
+                    asset: piece.source.archive.clone(),
+                    destination,
+                });
+            }
         }
-        provision::extract_runtime_library(&archive, &runtime.library_entry, &resolved.path)?;
-        // Our own download, of no further use once the library is out of it.
-        let _ = std::fs::remove_file(&archive);
+        fetch(kind, &plan, events)?;
+
+        // Windows cannot replace a library this process has loaded: the
+        // new core and provider wait in `runtime/staged/` for the next start.
+        let stage = self.stage_when_in_use && (self.runtime_in_use)();
+        let staged = assets::staged_runtime_dir(&root);
+        if stage {
+            remove_dir_if_present(&staged)?;
+        }
+        // The core's record is written after the last runtime library of
+        // the set (the core, or its CUDA provider): in `staged/` its
+        // presence marks a complete set.
+        let core_installed = pieces.iter().any(|piece| piece.role == PieceRole::Core);
+        let last_runtime = pieces
+            .iter()
+            .rposition(|piece| piece.role != PieceRole::NvidiaWheel);
+        for (index, piece) in pieces.iter().enumerate() {
+            let archive = piece.source.archive.destination(&root);
+            if piece.role == PieceRole::NvidiaWheel {
+                provision::extract_libraries(&archive, &piece.source.library_entries, &cuda_dir)?;
+                let files: Vec<&str> = piece
+                    .source
+                    .library_entries
+                    .iter()
+                    .map(|entry| entry.file_name.as_str())
+                    .collect();
+                append_line(
+                    &assets::cuda_libraries_source_file(&root),
+                    &assets::cuda_marker_line(&archive_stamp(piece.source), &files),
+                )?;
+            } else {
+                let dir = if stage {
+                    staged.clone()
+                } else {
+                    assets::runtime_dir(&root)
+                };
+                provision::extract_libraries(&archive, &piece.source.library_entries, &dir)?;
+                if piece.role == PieceRole::Core && !stage {
+                    // A CUDA provider belongs to the core it was built
+                    // with; it goes only once the new core is in place.
+                    let _ = std::fs::remove_file(assets::bundled_cuda_provider(&root));
+                }
+                if core_installed
+                    && Some(index) == last_runtime
+                    && let Some(core) = self.sources.runtime.as_ref()
+                {
+                    let marker = dir.join(assets::RUNTIME_SOURCE_FILE);
+                    std::fs::write(&marker, archive_stamp(core)).map_err(|error| {
+                        VoiceMeError::Other(format!(
+                            "Could not write {}: {error}",
+                            marker.display()
+                        ))
+                    })?;
+                }
+            }
+            // Our own download, of no further use once the libraries are
+            // out of it.
+            let _ = std::fs::remove_file(&archive);
+        }
         Ok(())
     }
+
+    /// Replace whether this process has the bundled runtime loaded (Story
+    /// 3.8): the composition root asks the speech engine.
+    pub fn with_runtime_in_use(
+        mut self,
+        in_use: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.runtime_in_use = Arc::new(in_use);
+        self
+    }
+
+    /// Stage runtime updates whenever the runtime is in use, whatever the
+    /// OS — how the Windows path is tested anywhere.
+    #[cfg(test)]
+    fn staging_when_in_use(mut self) -> Self {
+        self.stage_when_in_use = true;
+        self
+    }
+}
+
+/// Append `line` to `file`, creating it.
+fn append_line(file: &Path, line: &str) -> Result<(), VoiceMeError> {
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file)
+        .and_then(|mut out| out.write_all(line.as_bytes()))
+        .map_err(|error| {
+            VoiceMeError::Other(format!("Could not write {}: {error}", file.display()))
+        })
+}
+
+/// What an archive is, for the records Install keeps: its release URL
+/// (which names the tag) and its pinned SHA-256. A re-pin under the same
+/// file names still reads as a different runtime.
+fn archive_stamp(archive: &RuntimeArchive) -> String {
+    format!(
+        "{} sha256:{}",
+        archive.archive.url,
+        archive.archive.digest.expected()
+    )
+}
+
+/// What a runtime install extracts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PieceRole {
+    Core,
+    CudaProvider,
+    NvidiaWheel,
+}
+
+/// One archive a runtime install extracts.
+struct RuntimePiece<'a> {
+    source: &'a RuntimeArchive,
+    role: PieceRole,
+}
+
+/// Whether Install can provide the bundled runtime `target` needs: any
+/// pinned runtime for CPU, voice-me's own build for WebGPU, and that build
+/// with its CUDA provider and the NVIDIA wheels for CUDA (Story 3.8).
+fn runtime_installable(sources: &Sources, target: SpeechExecutionTarget) -> bool {
+    match target {
+        SpeechExecutionTarget::Cpu => sources.runtime.is_some(),
+        SpeechExecutionTarget::WebGpu => sources.runtime.is_some() && sources.runtime_all_providers,
+        SpeechExecutionTarget::Cuda => sources.runtime.is_some() && sources.cuda_installable(),
+    }
+}
+
+/// Whether the bundled runtime in `root` is not the one `sources` pins
+/// (Story 3.8): a runtime installed before voice-me's own build was pinned
+/// — Microsoft's CPU-only one, which records nothing — or from an older
+/// release or pin. Only voice-me's own build is ever judged stale; until
+/// it is pinned, every runtime is the right one.
+fn runtime_is_stale(root: &Path, sources: &Sources) -> bool {
+    let Some(runtime) = sources
+        .runtime
+        .as_ref()
+        .filter(|_| sources.runtime_all_providers)
+    else {
+        return false;
+    };
+    let installed = std::fs::read_to_string(assets::runtime_source_file(root)).unwrap_or_default();
+    installed.trim() != archive_stamp(runtime)
+}
+
+/// Whether the bundled runtime is missing a library its source ships. A
+/// stale runtime is judged on its main library alone — it is replaced
+/// whole, and the CPU backend keeps using it meanwhile.
+fn core_incomplete(root: &Path, sources: &Sources) -> bool {
+    if !assets::bundled_runtime_dylib(root).exists() {
+        return true;
+    }
+    match sources.runtime.as_ref() {
+        Some(core) if !runtime_is_stale(root, sources) => core
+            .library_entries
+            .iter()
+            .any(|entry| !assets::runtime_dir(root).join(&entry.file_name).exists()),
+        _ => false,
+    }
+}
+
+/// Whether `runtime/cuda/` holds libraries from a wheel that is not pinned
+/// any more (the sonames do not change between versions, so only the
+/// record tells).
+fn nvidia_libraries_are_stale(root: &Path, sources: &Sources) -> bool {
+    let pinned: Vec<String> = sources.nvidia_wheels.iter().map(archive_stamp).collect();
+    assets::installed_cuda_wheels(root)
+        .iter()
+        .any(|(stamp, _)| !pinned.contains(stamp))
+}
+
+/// Whether one pinned NVIDIA wheel is installed: recorded under its
+/// current pin, with every library it names present.
+fn nvidia_wheel_installed(root: &Path, sources: &Sources, wheel: &RuntimeArchive) -> bool {
+    if nvidia_libraries_are_stale(root, sources) {
+        return false;
+    }
+    let stamp = archive_stamp(wheel);
+    let dir = assets::cuda_libraries_dir(root);
+    assets::installed_cuda_wheels(root)
+        .iter()
+        .any(|(recorded, _)| *recorded == stamp)
+        && wheel
+            .library_entries
+            .iter()
+            .all(|entry| dir.join(&entry.file_name).exists())
+}
+
+/// Everything the bundled runtime still lacks for `target`, in install
+/// order. Only what [`runtime_installable`] allows is ever listed; a core
+/// and provider already staged for the next start are not listed again.
+fn runtime_pieces<'a>(
+    root: &Path,
+    sources: &'a Sources,
+    target: SpeechExecutionTarget,
+) -> Vec<RuntimePiece<'a>> {
+    let mut pieces = Vec::new();
+    let Some(core) = sources.runtime.as_ref() else {
+        return pieces;
+    };
+    let staged = staged_runtime_pending(root);
+    let gpu = target != SpeechExecutionTarget::Cpu;
+    let core_needed =
+        !staged && (core_incomplete(root, sources) || (gpu && runtime_is_stale(root, sources)));
+    if core_needed {
+        pieces.push(RuntimePiece {
+            source: core,
+            role: PieceRole::Core,
+        });
+    }
+    if target != SpeechExecutionTarget::Cuda || !runtime_installable(sources, target) {
+        return pieces;
+    }
+    if let Some(provider) = sources.cuda_runtime.as_ref()
+        && !staged
+        && (core_needed || !assets::bundled_cuda_provider(root).exists())
+    {
+        pieces.push(RuntimePiece {
+            source: provider,
+            role: PieceRole::CudaProvider,
+        });
+    }
+    for wheel in &sources.nvidia_wheels {
+        if !nvidia_wheel_installed(root, sources, wheel) {
+            pieces.push(RuntimePiece {
+                source: wheel,
+                role: PieceRole::NvidiaWheel,
+            });
+        }
+    }
+    pieces
+}
+
+/// Story 3.8 (Windows): whether a complete runtime update waits in
+/// `runtime/staged/` for the next start. Its record is written last, so it
+/// marks a complete set.
+pub fn staged_runtime_pending(root: &Path) -> bool {
+    assets::staged_runtime_dir(root)
+        .join(assets::RUNTIME_SOURCE_FILE)
+        .is_file()
+}
+
+/// Story 3.8 (Windows): move a runtime update staged by an earlier run into
+/// `runtime/`. Called first thing at startup, before anything resolves or
+/// loads the runtime. `Ok(true)` when one was applied.
+///
+/// Only a complete set moves (its record last); an incomplete one is
+/// removed, and Install stages it again. A staged core without a CUDA
+/// provider takes the old provider away — it belongs to the old core.
+pub fn apply_staged_runtime(root: &Path) -> Result<bool, VoiceMeError> {
+    let staged = assets::staged_runtime_dir(root);
+    if !staged.is_dir() {
+        return Ok(false);
+    }
+    if !staged_runtime_pending(root) {
+        remove_dir_if_present(&staged)?;
+        return Ok(false);
+    }
+    let runtime = assets::runtime_dir(root);
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&staged)
+        .map_err(|error| {
+            VoiceMeError::Other(format!("Could not read {}: {error}", staged.display()))
+        })?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect();
+    // The record goes last, so an interrupted move is applied again.
+    files.sort_by_key(|path| {
+        path.file_name()
+            .is_some_and(|name| name == assets::RUNTIME_SOURCE_FILE)
+    });
+    if !files.iter().any(|path| {
+        path.file_name() == Some(std::ffi::OsStr::new(assets::cuda_provider_file_name()))
+    }) {
+        let _ = std::fs::remove_file(assets::bundled_cuda_provider(root));
+    }
+    for file in files {
+        let Some(name) = file.file_name() else {
+            continue;
+        };
+        let destination = runtime.join(name);
+        std::fs::rename(&file, &destination).map_err(|error| {
+            VoiceMeError::Other(format!(
+                "Could not move {} into {}: {error}",
+                file.display(),
+                runtime.display()
+            ))
+        })?;
+    }
+    remove_dir_if_present(&staged)?;
+    Ok(true)
 }
 
 impl DependencyProvisioningPort for DepsAdapter {
@@ -532,12 +884,7 @@ impl DepsAdapter {
         }
         let known = |key: &str| self.known_piper_voice(key).is_some();
         let mut rows = vec![
-            runtime_row(
-                root,
-                SpeechBackend::CPU,
-                None,
-                self.sources.runtime.is_some(),
-            ),
+            runtime_row(root, SpeechBackend::CPU, None, &self.sources),
             piper::piper_voice_row(root, request.piper_voice.as_deref(), &known),
         ];
         rows.extend(self.piper_espeak_rows());
@@ -738,10 +1085,128 @@ pub fn speech_engine_rows(
     added: Option<&Path>,
     sources: &Sources,
 ) -> Vec<Dependency> {
-    vec![
-        runtime_row(root, backend, added, sources.runtime.is_some()),
-        model_weights_row(root, backend.weights),
-    ]
+    let mut rows = vec![runtime_row(root, backend, added, sources)];
+    // Story 3.8: the bundled runtime's CUDA pieces, each its own row, once
+    // they can be installed. A library the user added or configured is
+    // theirs, and is reported exactly as before.
+    let bundled = !assets::resolve_runtime_dylib(root, added).configured && added.is_none();
+    if bundled
+        && backend.target == SpeechExecutionTarget::Cuda
+        && runtime_installable(sources, backend.target)
+    {
+        rows.push(cuda_provider_row(root, sources));
+        rows.push(nvidia_libraries_row(root, sources));
+    }
+    rows.push(model_weights_row(root, backend.weights));
+    rows
+}
+
+const CUDA_PROVIDER_LABEL: &str = "ONNX Runtime CUDA provider";
+const NVIDIA_LIBRARIES_LABEL: &str = "NVIDIA CUDA libraries";
+
+/// Story 3.8: the CUDA provider beside the bundled runtime.
+fn cuda_provider_row(root: &Path, sources: &Sources) -> Dependency {
+    let path = assets::bundled_cuda_provider(root);
+    if staged_runtime_pending(root) {
+        return Dependency::missing(
+            DependencyKind::CudaProvider,
+            CUDA_PROVIDER_LABEL,
+            "Installed; restart voice-me to finish installing it.".to_string(),
+        )
+        .manual([
+            "Restart voice-me — the CUDA provider is put in place as it starts.",
+            "The CPU backend keeps working until then.",
+        ]);
+    }
+    // A provider beside an older core belongs to that core: Install
+    // replaces both.
+    if path.exists() && !runtime_is_stale(root, sources) {
+        return Dependency::ready(
+            DependencyKind::CudaProvider,
+            CUDA_PROVIDER_LABEL,
+            format!("Found at {}.", path.display()),
+        );
+    }
+    Dependency::missing(
+        DependencyKind::CudaProvider,
+        CUDA_PROVIDER_LABEL,
+        format!(
+            "Not found at {}. Install fetches it together with everything else the CUDA \
+             backend needs.",
+            path.display()
+        ),
+    )
+}
+
+/// Story 3.8: NVIDIA's CUDA 12 runtime, cuBLAS, cuFFT and cuDNN 9, in
+/// `<cache>/runtime/cuda/`. The detail names the first missing library and
+/// how much Install would download.
+fn nvidia_libraries_row(root: &Path, sources: &Sources) -> Dependency {
+    let dir = assets::cuda_libraries_dir(root);
+    let expected: Vec<_> = sources
+        .nvidia_wheels
+        .iter()
+        .flat_map(|wheel| {
+            let dir = &dir;
+            wheel
+                .library_entries
+                .iter()
+                .map(move |entry| (wheel, dir.join(&entry.file_name)))
+        })
+        .collect();
+    // Libraries recorded from a wheel that is no longer pinned are all
+    // replaced, whatever their names say.
+    if nvidia_libraries_are_stale(root, sources) {
+        let download: u64 = sources
+            .nvidia_wheels
+            .iter()
+            .map(|wheel| wheel.archive.size)
+            .sum();
+        return Dependency::missing(
+            DependencyKind::NvidiaLibraries,
+            NVIDIA_LIBRARIES_LABEL,
+            format!(
+                "The libraries in {} are from an older version. Install replaces them with \
+                 NVIDIA's CUDA 12 and cuDNN 9 libraries ({}).",
+                dir.display(),
+                voice_me_core::format_bytes(download)
+            ),
+        );
+    }
+    let missing: Vec<_> = expected
+        .iter()
+        .filter(|(wheel, path)| !path.exists() || !nvidia_wheel_installed(root, sources, wheel))
+        .collect();
+    let Some((_, first)) = missing.first() else {
+        return Dependency::ready(
+            DependencyKind::NvidiaLibraries,
+            NVIDIA_LIBRARIES_LABEL,
+            format!(
+                "All {} libraries present in {}.",
+                expected.len(),
+                dir.display()
+            ),
+        );
+    };
+    let mut wheels: Vec<&RuntimeArchive> = Vec::new();
+    for (wheel, _) in &missing {
+        if !wheels.contains(wheel) {
+            wheels.push(wheel);
+        }
+    }
+    let download: u64 = wheels.iter().map(|wheel| wheel.archive.size).sum();
+    Dependency::missing(
+        DependencyKind::NvidiaLibraries,
+        NVIDIA_LIBRARIES_LABEL,
+        format!(
+            "Missing {} of {} libraries, starting with {}. Install downloads NVIDIA's CUDA 12 \
+             and cuDNN 9 libraries ({}).",
+            missing.len(),
+            expected.len(),
+            first.display(),
+            voice_me_core::format_bytes(download)
+        ),
+    )
 }
 
 /// The ONNX Runtime row, reporting on exactly the rule the engine will
@@ -757,10 +1222,61 @@ fn runtime_row(
     root: &Path,
     backend: SpeechBackend,
     added: Option<&Path>,
-    installable: bool,
+    sources: &Sources,
 ) -> Dependency {
     let resolved = assets::resolve_runtime_dylib(root, added);
     let path = resolved.path.display();
+    let bundled = !resolved.added && !resolved.configured;
+    let gpu = backend.target != SpeechExecutionTarget::Cpu;
+
+    // Story 3.8 (Windows): the new runtime is installed but waits for the
+    // next start, since this process has the old one loaded.
+    if bundled && gpu && staged_runtime_pending(root) {
+        return Dependency::missing(
+            DependencyKind::OnnxRuntime,
+            RUNTIME_LABEL,
+            "voice-me's build of ONNX Runtime is installed; restart voice-me to finish \
+             installing it."
+                .to_string(),
+        )
+        .manual([
+            "Restart voice-me — the new runtime is put in place as it starts.",
+            "The CPU backend keeps working until then.",
+        ]);
+    }
+
+    // Story 3.8: an older or CPU-only runtime in the cache cannot run a
+    // GPU backend; Install puts voice-me's build in its place. The CPU
+    // backend keeps using it — it works.
+    if bundled
+        && gpu
+        && resolved.path.exists()
+        && runtime_installable(sources, backend.target)
+        && runtime_is_stale(root, sources)
+    {
+        return Dependency::missing(
+            DependencyKind::OnnxRuntime,
+            RUNTIME_LABEL,
+            format!(
+                "Found at {path}, but it is an older or CPU-only build. Install replaces it with \
+                 voice-me's build of ONNX Runtime {}, which runs CPU, WebGPU and CUDA.",
+                sources::RUNTIME_VERSION
+            ),
+        );
+    }
+
+    // A runtime missing one of the libraries it ships with (the provider
+    // bridge, Dawn) is fetched again.
+    if bundled && resolved.path.exists() && core_incomplete(root, sources) {
+        return Dependency::missing(
+            DependencyKind::OnnxRuntime,
+            RUNTIME_LABEL,
+            format!(
+                "Found at {path}, but some of the libraries that come with it are missing. \
+                 Install fetches it again."
+            ),
+        );
+    }
 
     if resolved.path.exists() {
         return Dependency::ready(
@@ -814,8 +1330,9 @@ fn runtime_row(
         ]);
     }
 
-    // Decision 3: a GPU backend's runtime has no source until Story 3.8.
-    if backend.target != SpeechExecutionTarget::Cpu {
+    // Decision 3 (spec 3-2) and decision 7 (Story 3.8): until voice-me's
+    // own build is pinned, a GPU backend's runtime has no source.
+    if gpu && !runtime_installable(sources, backend.target) {
         return Dependency::missing(
             DependencyKind::OnnxRuntime,
             RUNTIME_LABEL,
@@ -832,7 +1349,7 @@ fn runtime_row(
         "Not found at {path}. {} is unset, so that is where voice-me looks.",
         assets::RUNTIME_DYLIB_ENV
     );
-    if installable {
+    if runtime_installable(sources, backend.target) {
         Dependency::missing(DependencyKind::OnnxRuntime, RUNTIME_LABEL, detail)
     } else {
         // Decision 1: only Linux x64 and Windows x64 have an automatic
@@ -1156,6 +1673,389 @@ mod tests {
             .unwrap_or_else(|| panic!("no {kind:?} row in {rows:?}"))
     }
 
+    /// The sources as they are before voice-me's release is pinned
+    /// (decision 7), whatever `Sources::pinned` says today.
+    fn unpinned_sources() -> Sources {
+        Sources {
+            runtime_all_providers: false,
+            cuda_runtime: None,
+            nvidia_wheels: Vec::new(),
+            ..Sources::pinned()
+        }
+    }
+
+    fn fake_archive(relative_path: &str, size: u64, entries: &[(&str, &str)]) -> RuntimeArchive {
+        RuntimeArchive {
+            archive: sources::Asset {
+                relative_path: relative_path.to_string(),
+                url: format!("https://example.invalid/{relative_path}"),
+                size,
+                digest: sources::Digest::Sha256("00".repeat(32)),
+            },
+            library_entries: entries
+                .iter()
+                .map(|(entry, file_name)| sources::LibraryEntry::new(*entry, *file_name))
+                .collect(),
+        }
+    }
+
+    /// Story 3.8 once pinned: voice-me's core, its CUDA provider, and two
+    /// NVIDIA wheels (the rows only read their file names and sizes).
+    fn all_provider_sources() -> Sources {
+        let lib = assets::runtime_dylib_file_name();
+        let provider = assets::cuda_provider_file_name();
+        Sources {
+            runtime: Some(fake_archive("runtime/core.tgz", 10, &[("core/lib/x", lib)])),
+            runtime_all_providers: true,
+            cuda_runtime: Some(fake_archive(
+                "runtime/cuda.tgz",
+                20,
+                &[("cuda/lib/x", provider)],
+            )),
+            nvidia_wheels: vec![
+                fake_archive(
+                    "runtime/cuda/cudart.whl",
+                    1_000_000,
+                    &[("nvidia/cuda_runtime/lib/libcudart.so.12", "libcudart.so.12")],
+                ),
+                fake_archive(
+                    "runtime/cuda/cudnn.whl",
+                    2_000_000,
+                    &[
+                        (
+                            "nvidia/cudnn/lib/libcudnn_graph.so.9",
+                            "libcudnn_graph.so.9",
+                        ),
+                        ("nvidia/cudnn/lib/libcudnn.so.9", "libcudnn.so.9"),
+                    ],
+                ),
+            ],
+            ..Sources::pinned()
+        }
+    }
+
+    fn mark_runtime_from(root: &Path, sources: &Sources) {
+        let marker = assets::runtime_source_file(root);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(marker, archive_stamp(sources.runtime.as_ref().unwrap())).unwrap();
+    }
+
+    /// Install's record of NVIDIA wheels, as if `wheels` were installed.
+    fn mark_wheels_installed(root: &Path, wheels: &[RuntimeArchive]) {
+        let marker = assets::cuda_libraries_source_file(root);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        let text: String = wheels
+            .iter()
+            .map(|wheel| {
+                let files: Vec<&str> = wheel
+                    .library_entries
+                    .iter()
+                    .map(|entry| entry.file_name.as_str())
+                    .collect();
+                assets::cuda_marker_line(&archive_stamp(wheel), &files)
+            })
+            .collect();
+        std::fs::write(marker, text).unwrap();
+    }
+
+    /// Story 3.8, matrix row "CUDA": on an empty cache every missing piece
+    /// is its own row, and every one of them offers Install.
+    #[test]
+    fn a_cuda_backend_on_the_bundled_runtime_reports_each_missing_piece() {
+        let _env = no_configured_runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let cuda = SpeechBackend::for_target(SpeechExecutionTarget::Cuda);
+
+        let rows = speech_engine_rows(dir.path(), cuda, None, &all_provider_sources());
+
+        let kinds: Vec<_> = rows.iter().map(|row| row.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                DependencyKind::OnnxRuntime,
+                DependencyKind::CudaProvider,
+                DependencyKind::NvidiaLibraries,
+                DependencyKind::ModelWeights
+            ]
+        );
+        for kind in &kinds[..3] {
+            let row = row(&rows, *kind);
+            assert!(row.status.is_missing(), "{row:?}");
+            assert!(row.automatable, "{row:?}");
+            assert!(row.kind.blocks_speech());
+        }
+        let nvidia = row(&rows, DependencyKind::NvidiaLibraries);
+        assert!(
+            nvidia.detail.contains("Missing 3 of 3 libraries"),
+            "{}",
+            nvidia.detail
+        );
+        assert!(
+            nvidia.detail.contains("libcudart.so.12"),
+            "{}",
+            nvidia.detail
+        );
+        assert!(nvidia.detail.contains("(3 MB)"), "{}", nvidia.detail);
+    }
+
+    #[test]
+    fn a_complete_cuda_install_reports_every_piece_ready() {
+        let _env = no_configured_runtime();
+        let dir = provisioned(SpeechWeights::Fp16);
+        let sources = all_provider_sources();
+        mark_runtime_from(dir.path(), &sources);
+        touch(&assets::bundled_cuda_provider(dir.path()));
+        let cuda_dir = assets::cuda_libraries_dir(dir.path());
+        for name in ["libcudart.so.12", "libcudnn_graph.so.9", "libcudnn.so.9"] {
+            touch(&cuda_dir.join(name));
+        }
+        mark_wheels_installed(dir.path(), &sources.nvidia_wheels);
+
+        let rows = speech_engine_rows(
+            dir.path(),
+            SpeechBackend::for_target(SpeechExecutionTarget::Cuda),
+            None,
+            &sources,
+        );
+
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert!(rows.iter().all(|row| !row.status.is_missing()), "{rows:?}");
+    }
+
+    /// Only the NVIDIA wheel still missing a library counts toward what
+    /// Install would download.
+    #[test]
+    fn the_nvidia_row_counts_only_what_is_still_missing() {
+        let _env = no_configured_runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let sources = all_provider_sources();
+        touch(&assets::cuda_libraries_dir(dir.path()).join("libcudart.so.12"));
+        mark_wheels_installed(dir.path(), &sources.nvidia_wheels[..1]);
+
+        let row = nvidia_libraries_row(dir.path(), &sources);
+
+        assert!(row.detail.contains("Missing 2 of 3"), "{}", row.detail);
+        assert!(row.detail.contains("(2 MB)"), "{}", row.detail);
+    }
+
+    /// Matrix row "WebGPU" after pinning: the CPU-only runtime already in
+    /// the cache (no record of its source) cannot run WebGPU, and Install
+    /// replaces it. The CPU backend keeps using it.
+    #[test]
+    fn a_cpu_only_runtime_in_the_cache_is_replaced_for_a_gpu_backend_only() {
+        let _env = no_configured_runtime();
+        let dir = provisioned(SpeechWeights::Fp16);
+        let sources = all_provider_sources();
+        let webgpu = SpeechBackend::for_target(SpeechExecutionTarget::WebGpu);
+
+        let stale = row(
+            &speech_engine_rows(dir.path(), webgpu, None, &sources),
+            DependencyKind::OnnxRuntime,
+        )
+        .clone();
+        assert!(stale.status.is_missing());
+        assert!(stale.automatable);
+        assert!(
+            stale.detail.contains("an older or CPU-only build"),
+            "{}",
+            stale.detail
+        );
+
+        let cpu = speech_engine_rows(dir.path(), SpeechBackend::CPU, None, &sources);
+        assert!(!row(&cpu, DependencyKind::OnnxRuntime).status.is_missing());
+
+        mark_runtime_from(dir.path(), &sources);
+        let current = speech_engine_rows(dir.path(), webgpu, None, &sources);
+        assert!(
+            !row(&current, DependencyKind::OnnxRuntime)
+                .status
+                .is_missing()
+        );
+        assert_eq!(current.len(), 2, "WebGPU needs no CUDA rows: {current:?}");
+    }
+
+    /// Matrix rows "Before pinning" and "Added runtime": no CUDA rows, and
+    /// the runtime row behaves exactly as before Story 3.8.
+    #[test]
+    fn cuda_rows_appear_only_for_the_bundled_runtime_once_pinned() {
+        let _env = no_configured_runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let cuda = SpeechBackend::for_target(SpeechExecutionTarget::Cuda);
+
+        let unpinned = speech_engine_rows(dir.path(), cuda, None, &unpinned_sources());
+        assert_eq!(unpinned.len(), 2, "{unpinned:?}");
+        assert!(!row(&unpinned, DependencyKind::OnnxRuntime).automatable);
+
+        let added = dir.path().join("mine").join("libonnxruntime.so");
+        touch(&added);
+        let rows = speech_engine_rows(dir.path(), cuda, Some(&added), &all_provider_sources());
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(!row(&rows, DependencyKind::OnnxRuntime).status.is_missing());
+    }
+
+    /// A re-pin under the same file names (voiceme.2) is still a
+    /// different runtime: the record holds the URL and SHA-256.
+    #[test]
+    fn a_repinned_core_reads_stale_and_its_provider_missing() {
+        let _env = no_configured_runtime();
+        let dir = provisioned(SpeechWeights::Fp16);
+        let old = all_provider_sources();
+        mark_runtime_from(dir.path(), &old);
+        touch(&assets::bundled_cuda_provider(dir.path()));
+        let mut repinned = all_provider_sources();
+        repinned.runtime.as_mut().unwrap().archive.digest =
+            sources::Digest::Sha256("11".repeat(32));
+        let cuda = SpeechBackend::for_target(SpeechExecutionTarget::Cuda);
+
+        assert!(!runtime_is_stale(dir.path(), &old));
+        assert!(runtime_is_stale(dir.path(), &repinned));
+        let rows = speech_engine_rows(dir.path(), cuda, None, &repinned);
+        assert!(row(&rows, DependencyKind::OnnxRuntime).status.is_missing());
+        let provider = row(&rows, DependencyKind::CudaProvider);
+        assert!(provider.status.is_missing(), "{provider:?}");
+        assert!(provider.automatable);
+    }
+
+    /// A pinned runtime missing one of the libraries it ships with is
+    /// fetched again.
+    #[test]
+    fn a_runtime_missing_a_shipped_library_is_missing() {
+        let _env = no_configured_runtime();
+        let dir = provisioned(SpeechWeights::Q4);
+        let mut sources = all_provider_sources();
+        sources
+            .runtime
+            .as_mut()
+            .unwrap()
+            .library_entries
+            .push(sources::LibraryEntry::new(
+                "core/lib/y",
+                "libonnxruntime_providers_shared.so",
+            ));
+        mark_runtime_from(dir.path(), &sources);
+
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, None, &sources);
+        let runtime = row(&rows, DependencyKind::OnnxRuntime);
+
+        assert!(runtime.status.is_missing(), "{runtime:?}");
+        assert!(runtime.automatable);
+        touch(&assets::runtime_dir(dir.path()).join("libonnxruntime_providers_shared.so"));
+        let rows = speech_engine_rows(dir.path(), SpeechBackend::CPU, None, &sources);
+        assert!(!row(&rows, DependencyKind::OnnxRuntime).status.is_missing());
+    }
+
+    /// NVIDIA libraries recorded under an older wheel pin are all replaced.
+    #[test]
+    fn nvidia_libraries_from_an_older_pin_are_missing() {
+        let _env = no_configured_runtime();
+        let dir = tempfile::tempdir().unwrap();
+        let sources = all_provider_sources();
+        let cuda_dir = assets::cuda_libraries_dir(dir.path());
+        for name in ["libcudart.so.12", "libcudnn_graph.so.9", "libcudnn.so.9"] {
+            touch(&cuda_dir.join(name));
+        }
+        let mut older = sources.nvidia_wheels.clone();
+        older[1].archive.digest = sources::Digest::Sha256("22".repeat(32));
+        mark_wheels_installed(dir.path(), &older);
+
+        let row = nvidia_libraries_row(dir.path(), &sources);
+
+        assert!(row.status.is_missing());
+        assert!(row.detail.contains("older version"), "{}", row.detail);
+        mark_wheels_installed(dir.path(), &sources.nvidia_wheels);
+        assert!(
+            !nvidia_libraries_row(dir.path(), &sources)
+                .status
+                .is_missing()
+        );
+    }
+
+    /// Story 3.8 (Windows): a staged update is the GPU runtime rows'
+    /// reason until restart; the CPU backend keeps its runtime.
+    #[test]
+    fn a_staged_runtime_asks_for_a_restart_on_gpu_rows() {
+        let _env = no_configured_runtime();
+        let dir = provisioned(SpeechWeights::Fp16);
+        let sources = all_provider_sources();
+        touch(&assets::staged_runtime_dir(dir.path()).join(assets::RUNTIME_SOURCE_FILE));
+
+        let rows = speech_engine_rows(
+            dir.path(),
+            SpeechBackend::for_target(SpeechExecutionTarget::Cuda),
+            None,
+            &sources,
+        );
+        for kind in [DependencyKind::OnnxRuntime, DependencyKind::CudaProvider] {
+            let row = row(&rows, kind);
+            assert!(row.status.is_missing());
+            assert!(!row.automatable, "{row:?}");
+            assert!(row.detail.contains("restart voice-me"), "{row:?}");
+        }
+        let cpu = speech_engine_rows(dir.path(), SpeechBackend::CPU, None, &sources);
+        assert!(!row(&cpu, DependencyKind::OnnxRuntime).status.is_missing());
+    }
+
+    /// A complete staged set moves into `runtime/` (its record too, the
+    /// old provider gone); an incomplete one is thrown away.
+    #[test]
+    fn a_staged_runtime_is_applied_at_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(assets::runtime_dir(root)).unwrap();
+        std::fs::write(assets::bundled_runtime_dylib(root), b"old").unwrap();
+        std::fs::write(assets::bundled_cuda_provider(root), b"old provider").unwrap();
+        let staged = assets::staged_runtime_dir(root);
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join(assets::runtime_dylib_file_name()), b"new").unwrap();
+
+        assert!(
+            !apply_staged_runtime(root).unwrap(),
+            "no record: incomplete"
+        );
+        assert!(!staged.exists());
+        assert_eq!(
+            std::fs::read(assets::bundled_runtime_dylib(root)).unwrap(),
+            b"old"
+        );
+
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join(assets::runtime_dylib_file_name()), b"new").unwrap();
+        std::fs::write(staged.join(assets::RUNTIME_SOURCE_FILE), b"stamp").unwrap();
+        assert!(staged_runtime_pending(root));
+
+        assert!(apply_staged_runtime(root).unwrap());
+        assert_eq!(
+            std::fs::read(assets::bundled_runtime_dylib(root)).unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            std::fs::read(assets::runtime_source_file(root)).unwrap(),
+            b"stamp"
+        );
+        assert!(!assets::bundled_cuda_provider(root).exists());
+        assert!(!staged.exists());
+        assert!(!staged_runtime_pending(root));
+        assert!(!apply_staged_runtime(root).unwrap());
+    }
+
+    /// A configured `ORT_DYLIB_PATH` is the user's too: no CUDA rows.
+    #[test]
+    fn a_configured_runtime_gets_no_cuda_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let configured = dir.path().join("mine").join("libonnxruntime.so");
+        touch(&configured);
+        let _env = EnvGuard::new().set(assets::RUNTIME_DYLIB_ENV, &configured);
+
+        let rows = speech_engine_rows(
+            dir.path(),
+            SpeechBackend::for_target(SpeechExecutionTarget::Cuda),
+            None,
+            &all_provider_sources(),
+        );
+
+        assert_eq!(rows.len(), 2, "{rows:?}");
+    }
+
     #[test]
     fn a_fully_provisioned_cpu_cache_reports_every_row_ready() {
         let _env = no_configured_runtime();
@@ -1275,9 +2175,10 @@ mod tests {
         );
     }
 
-    /// Decision 3: a GPU backend's runtime has no source until Story 3.8,
-    /// so its row is manual and says so rather than offering an Install
-    /// that would fetch the CPU runtime.
+    /// Decision 3 (spec 3-2), and decision 7 of Story 3.8: until voice-me's
+    /// own build is pinned, a GPU backend's runtime has no source, so its
+    /// row is manual and says so rather than offering an Install that
+    /// would fetch the CPU runtime.
     #[test]
     fn a_gpu_backends_missing_runtime_is_manual() {
         let _env = no_configured_runtime();
@@ -1288,7 +2189,7 @@ mod tests {
             weights: SpeechWeights::Fp16,
         };
 
-        let rows = speech_engine_rows(dir.path(), backend, None, &Sources::pinned());
+        let rows = speech_engine_rows(dir.path(), backend, None, &unpinned_sources());
         let runtime = row(&rows, DependencyKind::OnnxRuntime);
 
         assert!(!runtime.automatable);

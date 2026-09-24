@@ -221,7 +221,60 @@ impl TtsAdapter {
         // actually asked of the engine, naming the dylib, instead of at
         // launch.
         sessions::init_runtime(&self.runtime)?;
+
+        // Story 3.8: on the bundled runtime, the GPU providers come from
+        // voice-me's own build. One that Install put in place after this
+        // process loaded the old library only runs after a restart.
+        let bundled = assets::is_bundled_runtime(self.cache.root(), &self.runtime);
+        let gpu = self.target != ExecutionTarget::Cpu;
+        if replaced_runtime_needs_restart(bundled, gpu, sessions::committed_runtime_replaced()) {
+            return Err(VoiceMeError::SpeechEngine(format!(
+                "ONNX Runtime at {} was replaced since voice-me loaded it; restart voice-me to \
+                 use the new one",
+                self.runtime.display()
+            )));
+        }
+        // …and CUDA's NVIDIA libraries are loaded from the cache before the
+        // provider is registered. A library the user added or configured
+        // finds its own, exactly as before.
+        let preload_failures = match preload_dir(self.cache.root(), &self.runtime, self.target) {
+            Some(dir) => sessions::preload_cuda_libraries(
+                &dir,
+                &assets::installed_cuda_libraries(self.cache.root()),
+            ),
+            None => Vec::new(),
+        };
         Sessions::build(&self.cache, self.variant, self.target, false)
+            .map_err(|error| with_preload_failures(error, &preload_failures))
+    }
+}
+
+/// Story 3.8: the one restart rule for a runtime Install replaced on disk
+/// after this process loaded it. Only the bundled runtime is replaced, and
+/// only a GPU target needs the new one — CPU runs on the old library.
+pub fn replaced_runtime_needs_restart(bundled: bool, gpu: bool, replaced: bool) -> bool {
+    bundled && gpu && replaced
+}
+
+/// Where the NVIDIA libraries are loaded from before a session is built:
+/// `<root>/runtime/cuda/` for CUDA on the bundled runtime, nowhere
+/// otherwise.
+fn preload_dir(root: &Path, runtime: &Path, target: ExecutionTarget) -> Option<PathBuf> {
+    (assets::is_bundled_runtime(root, runtime) && matches!(target, ExecutionTarget::Cuda { .. }))
+        .then(|| assets::cuda_libraries_dir(root))
+}
+
+/// The engine's error, with the NVIDIA libraries that did not load named
+/// after it — usually the reason the CUDA provider failed.
+fn with_preload_failures(error: VoiceMeError, failures: &[String]) -> VoiceMeError {
+    match error {
+        VoiceMeError::SpeechEngine(reason) if !failures.is_empty() => {
+            VoiceMeError::SpeechEngine(format!(
+                "{reason} (these NVIDIA libraries did not load: {})",
+                failures.join("; ")
+            ))
+        }
+        error => error,
     }
 }
 
@@ -597,6 +650,7 @@ mod tests {
     /// with the engine's reason — and never an acquired CPU session.
     #[test]
     fn an_unreachable_target_reports_failed_and_never_cpu() {
+        let _lock = sessions::committed_test_lock();
         let dir = tempfile::tempdir().unwrap();
         for path in assets::required_model_files(dir.path(), SpeechWeights::Fp16) {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -718,5 +772,67 @@ mod tests {
             assets::resolve_runtime_dylib(cache.path(), None).path
         );
         assert_eq!(bundled.runtime(), configured);
+    }
+
+    /// Story 3.8: NVIDIA's libraries are preloaded for CUDA on the bundled
+    /// runtime only.
+    #[test]
+    fn only_cuda_on_the_bundled_runtime_preloads_nvidia_libraries() {
+        let root = Path::new("/cache");
+        let bundled = assets::bundled_runtime_dylib(root);
+        let added = Path::new("/opt/ort/libonnxruntime.so");
+        let cuda = ExecutionTarget::Cuda { device_id: 0 };
+
+        assert_eq!(
+            preload_dir(root, &bundled, cuda),
+            Some(assets::cuda_libraries_dir(root))
+        );
+        assert_eq!(preload_dir(root, added, cuda), None);
+        assert_eq!(preload_dir(root, &bundled, ExecutionTarget::Cpu), None);
+        assert_eq!(
+            preload_dir(root, &bundled, ExecutionTarget::WebGpu { device_id: 0 }),
+            None
+        );
+    }
+
+    #[test]
+    fn nvidia_libraries_that_did_not_load_are_named_in_the_engine_error() {
+        let failures = vec![
+            "libcudnn.so.9: bad".to_string(),
+            "libcufft.so.11: gone".to_string(),
+        ];
+
+        let merged = with_preload_failures(
+            VoiceMeError::SpeechEngine("CUDA provider failed".to_string()),
+            &failures,
+        );
+
+        let VoiceMeError::SpeechEngine(reason) = merged else {
+            panic!("still an engine error: {merged:?}");
+        };
+        assert_eq!(
+            reason,
+            "CUDA provider failed (these NVIDIA libraries did not load: libcudnn.so.9: bad; \
+             libcufft.so.11: gone)"
+        );
+        let untouched = with_preload_failures(VoiceMeError::SpeechEngine("fine".to_string()), &[]);
+        assert!(matches!(&untouched, VoiceMeError::SpeechEngine(reason) if reason == "fine"));
+        let missing = with_preload_failures(
+            VoiceMeError::MissingRuntimeAsset {
+                path: PathBuf::from("/x"),
+            },
+            &failures,
+        );
+        assert!(matches!(missing, VoiceMeError::MissingRuntimeAsset { .. }));
+    }
+
+    /// One rule: a replaced runtime needs a restart only when it is the
+    /// bundled one and the target is a GPU.
+    #[test]
+    fn a_replaced_runtime_needs_a_restart_only_for_a_bundled_gpu_session() {
+        assert!(replaced_runtime_needs_restart(true, true, true));
+        assert!(!replaced_runtime_needs_restart(false, true, true));
+        assert!(!replaced_runtime_needs_restart(true, false, true));
+        assert!(!replaced_runtime_needs_restart(true, true, false));
     }
 }

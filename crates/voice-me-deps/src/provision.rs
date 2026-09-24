@@ -22,7 +22,7 @@ use reqwest::header::{CONTENT_RANGE, RANGE};
 use sha2::{Digest as _, Sha256};
 use voice_me_core::{AppEvent, AppEventSender, DependencyKind, VoiceMeError, format_bytes};
 
-use crate::sources::{Asset, Digest, PlannedDownload};
+use crate::sources::{Asset, Digest, LibraryEntry, PlannedDownload};
 
 /// The fastest a row's progress is reported: about ten times a second.
 /// Faster only floods the one channel every other event shares.
@@ -380,102 +380,211 @@ fn remove_part(part: &Path, dir: &Path) -> Result<(), VoiceMeError> {
     }
 }
 
-/// Pull the one real runtime library out of the verified archive and give
-/// it its final name — `.part` then rename, like every download.
+/// Pull the named shared libraries out of a verified archive into `dir`,
+/// each under its [`LibraryEntry::file_name`] — `.part` then rename, like
+/// every download (Story 3.8: the core runtime carries two, a cuDNN wheel
+/// eight).
 ///
 /// The format follows the archive's extension: `.zip` (the Windows
-/// release) is read as a zip, anything else as a `.tgz` (the Linux one).
-/// Only a regular-file entry counts: the Linux archive's
-/// `libonnxruntime.so` is a symlink chain, and extracting a symlink into
-/// the cache would leave the engine loading whatever it points at.
-pub fn extract_runtime_library(
+/// release, and NVIDIA's `.whl` wheels, which are zip files) is read as a
+/// zip, anything else as a `.tgz` (the Linux one). Only a regular-file
+/// entry counts: the Linux archive's `libonnxruntime.so` is a symlink
+/// chain, and extracting a symlink into the cache would leave the engine
+/// loading whatever it points at.
+///
+/// All or nothing: every library is written to its `.part` first, and
+/// only when the archive held all of them are they renamed into place. An
+/// archive missing one leaves no library behind, so the Dependency Check
+/// never sees half a runtime as installed.
+pub fn extract_libraries(
     archive: &Path,
-    entry_name: &str,
-    destination: &Path,
+    entries: &[LibraryEntry],
+    dir: &Path,
 ) -> Result<(), VoiceMeError> {
-    let library = destination
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
     let archive_name = archive
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let failed = |reason: String| {
+    let library = |entry: &LibraryEntry| entry.file_name.clone();
+    let first = entries.first().map(library).unwrap_or_default();
+    let failed_for = |library: &str, reason: String| {
         VoiceMeError::Other(format!(
             "Extraction of {library} from {archive_name} failed: {reason}"
         ))
     };
+    let failed = |reason: String| failed_for(&first, reason);
 
-    let dir = destination
-        .parent()
-        .ok_or_else(|| failed("no directory to extract into".to_string()))?;
     std::fs::create_dir_all(dir)
         .map_err(|error| failed(format!("could not create {}: {error}", dir.display())))?;
 
     let file = File::open(archive).map_err(|error| failed(error.to_string()))?;
-    let is_zip = archive
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"));
-    let found = if is_zip {
-        extract_zip_entry(file, entry_name, destination, dir, &failed)?
+    let is_zip = archive.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("zip") || extension.eq_ignore_ascii_case("whl")
+    });
+    let written = if is_zip {
+        extract_zip_entries(file, entries, dir, &failed)
     } else {
-        extract_tar_entry(file, entry_name, destination, dir, &failed)?
+        extract_tar_entries(file, entries, dir, &failed)
     };
-    if found {
-        Ok(())
-    } else {
-        Err(failed(format!("the archive has no {entry_name}")))
+    let remove_parts = |found: &[bool]| {
+        for (entry, _) in entries.iter().zip(found).filter(|(_, found)| **found) {
+            let _ = std::fs::remove_file(part_path(&dir.join(&entry.file_name)));
+        }
+    };
+    let found = match written {
+        Ok(found) => found,
+        Err((found, error)) => {
+            remove_parts(&found);
+            return Err(error);
+        }
+    };
+    if let Some(missing) = entries.iter().zip(&found).find(|(_, found)| !**found) {
+        remove_parts(&found);
+        return Err(failed_for(
+            &missing.0.file_name,
+            format!("the archive has no {}", missing.0.entry),
+        ));
     }
+    // Every existing library steps aside to `<name>.old` before its new
+    // copy takes the name. Any failure puts every one of them back, so the
+    // directory holds the old set or the new one, never a mix.
+    let mut placed: Vec<(PathBuf, Option<PathBuf>)> = Vec::with_capacity(entries.len());
+    let restore = |placed: &[(PathBuf, Option<PathBuf>)]| {
+        for (destination, backup) in placed.iter().rev() {
+            let _ = std::fs::remove_file(destination);
+            if let Some(backup) = backup {
+                let _ = std::fs::rename(backup, destination);
+            }
+        }
+    };
+    for entry in entries {
+        let destination = dir.join(&entry.file_name);
+        let backup = if destination.is_file() {
+            let backup = backup_path(&destination);
+            let _ = std::fs::remove_file(&backup);
+            if let Err(error) = std::fs::rename(&destination, &backup) {
+                restore(&placed);
+                remove_parts(&found);
+                return Err(failed_for(
+                    &entry.file_name,
+                    format!(
+                        "could not move the old one aside in {}: {error}",
+                        dir.display()
+                    ),
+                ));
+            }
+            Some(backup)
+        } else {
+            None
+        };
+        if let Err(error) = std::fs::rename(part_path(&destination), &destination) {
+            if let Some(backup) = &backup {
+                let _ = std::fs::rename(backup, &destination);
+            }
+            restore(&placed);
+            remove_parts(&found);
+            return Err(failed_for(
+                &entry.file_name,
+                format!("could not move it into place in {}: {error}", dir.display()),
+            ));
+        }
+        placed.push((destination, backup));
+    }
+    // Only now is the old set of no further use. A backup Windows still
+    // holds open (a loaded DLL) stays until a later run.
+    for (_, backup) in placed {
+        if let Some(backup) = backup {
+            let _ = std::fs::remove_file(backup);
+        }
+    }
+    Ok(())
 }
 
-/// The `.tgz` reader: `Ok(false)` when no regular file has that name.
-fn extract_tar_entry(
+/// `<destination>.old`: where an existing library waits while its new copy
+/// is moved in.
+fn backup_path(destination: &Path) -> PathBuf {
+    let mut name = destination
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(".old");
+    destination.with_file_name(name)
+}
+
+/// Which of `entries` an extractor wrote to its `.part` — or, on failure,
+/// that list so far with the error.
+type Extracted = Result<Vec<bool>, (Vec<bool>, VoiceMeError)>;
+
+/// The `.tgz` reader: one pass, taking every regular file whose path is one
+/// of `entries`.
+fn extract_tar_entries(
     file: File,
-    entry_name: &str,
-    destination: &Path,
+    entries: &[LibraryEntry],
     dir: &Path,
     failed: &dyn Fn(String) -> VoiceMeError,
-) -> Result<bool, VoiceMeError> {
+) -> Extracted {
+    let mut found = vec![false; entries.len()];
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
-    let entries = tar.entries().map_err(|error| failed(error.to_string()))?;
-    for entry in entries {
-        let mut entry = entry.map_err(|error| failed(error.to_string()))?;
-        let is_library = entry
-            .path()
-            .map(|path| path == Path::new(entry_name))
-            .unwrap_or(false);
-        if !is_library || !entry.header().entry_type().is_file() {
+    let members = match tar.entries() {
+        Ok(members) => members,
+        Err(error) => return Err((found, failed(error.to_string()))),
+    };
+    for member in members {
+        let mut member = match member {
+            Ok(member) => member,
+            Err(error) => return Err((found, failed(error.to_string()))),
+        };
+        if !member.header().entry_type().is_file() {
             continue;
         }
-        write_entry(&mut entry, destination, dir, failed)?;
-        return Ok(true);
+        let Some(index) = member.path().ok().and_then(|path| {
+            entries
+                .iter()
+                .position(|entry| path == Path::new(&entry.entry))
+        }) else {
+            continue;
+        };
+        if found[index] {
+            continue;
+        }
+        let part = part_path(&dir.join(&entries[index].file_name));
+        if let Err(error) = write_part(&mut member, &part, dir, failed) {
+            return Err((found, error));
+        }
+        found[index] = true;
     }
-    Ok(false)
+    Ok(found)
 }
 
-/// The `.zip` reader: the entry is taken by its exact name and must be a
-/// regular file — not a directory, not a symlink. `Ok(false)` when there is
-/// no such file.
-fn extract_zip_entry(
+/// The `.zip` reader: each entry is taken by its exact name and must be a
+/// regular file — not a directory, not a symlink.
+fn extract_zip_entries(
     file: File,
-    entry_name: &str,
-    destination: &Path,
+    entries: &[LibraryEntry],
     dir: &Path,
     failed: &dyn Fn(String) -> VoiceMeError,
-) -> Result<bool, VoiceMeError> {
-    let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
-        .map_err(|error| failed(error.to_string()))?;
-    let mut entry = match zip.by_name(entry_name) {
-        Ok(entry) => entry,
-        Err(zip::result::ZipError::FileNotFound) => return Ok(false),
-        Err(error) => return Err(failed(error.to_string())),
+) -> Extracted {
+    let mut found = vec![false; entries.len()];
+    let mut zip = match zip::ZipArchive::new(std::io::BufReader::new(file)) {
+        Ok(zip) => zip,
+        Err(error) => return Err((found, failed(error.to_string()))),
     };
-    if !entry.is_file() || entry.is_symlink() {
-        return Ok(false);
+    for (index, entry) in entries.iter().enumerate() {
+        let mut member = match zip.by_name(&entry.entry) {
+            Ok(member) => member,
+            Err(zip::result::ZipError::FileNotFound) => continue,
+            Err(error) => return Err((found, failed(error.to_string()))),
+        };
+        if !member.is_file() || member.is_symlink() {
+            continue;
+        }
+        let part = part_path(&dir.join(&entry.file_name));
+        if let Err(error) = write_part(&mut member, &part, dir, failed) {
+            return Err((found, error));
+        }
+        found[index] = true;
     }
-    write_entry(&mut entry, destination, dir, failed)?;
-    Ok(true)
+    Ok(found)
 }
 
 /// Unpack a whole verified `.zip` into `dir` (Story 2.8: the VB-CABLE
@@ -554,20 +663,7 @@ fn write_entry(
     failed: &dyn Fn(String) -> VoiceMeError,
 ) -> Result<(), VoiceMeError> {
     let part = part_path(destination);
-    let mut out = File::create(&part)
-        .map_err(|error| failed(format!("could not write to {}: {error}", dir.display())))?;
-    std::io::copy(entry, &mut out)
-        .and_then(|_| out.sync_all())
-        .map_err(|error| {
-            let _ = std::fs::remove_file(&part);
-            failed(format!("could not write to {}: {error}", dir.display()))
-        })?;
-    drop(out);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755));
-    }
+    write_part(entry, &part, dir, failed)?;
     std::fs::rename(&part, destination).map_err(|error| {
         let _ = std::fs::remove_file(&part);
         failed(format!(
@@ -575,6 +671,31 @@ fn write_entry(
             dir.display()
         ))
     })
+}
+
+/// Write one archive entry to `part`, made executable on unix. A failed
+/// write leaves no `.part` behind.
+fn write_part(
+    entry: &mut dyn std::io::Read,
+    part: &Path,
+    dir: &Path,
+    failed: &dyn Fn(String) -> VoiceMeError,
+) -> Result<(), VoiceMeError> {
+    let mut out = File::create(part)
+        .map_err(|error| failed(format!("could not write to {}: {error}", dir.display())))?;
+    std::io::copy(entry, &mut out)
+        .and_then(|_| out.sync_all())
+        .map_err(|error| {
+            let _ = std::fs::remove_file(part);
+            failed(format!("could not write to {}: {error}", dir.display()))
+        })?;
+    drop(out);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(part, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok(())
 }
 
 fn kept_sentence(kept: u64, size: u64) -> String {

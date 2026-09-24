@@ -557,8 +557,65 @@ fn selection_library(selection: &BackendSelection) -> Option<PathBuf> {
 /// committed a runtime library and the new selection needs a different
 /// one. Nothing committed yet, the same library, or no library at all (a
 /// remote selection) all apply without one.
-fn needs_restart(committed: Option<&Path>, wanted: Option<&Path>) -> bool {
-    matches!((committed, wanted), (Some(committed), Some(wanted)) if committed != wanted)
+///
+/// Story 3.8: CPU, WebGPU and CUDA all live in the one bundled library, so
+/// switching among them never needs a restart — with one exception,
+/// `replaced_for_gpu`: Install put voice-me's all-provider build where the
+/// CPU-only library this process loaded was, and the selection is a GPU
+/// one, which only the new library can run.
+fn needs_restart(committed: Option<&Path>, wanted: Option<&Path>, replaced_for_gpu: bool) -> bool {
+    matches!(
+        (committed, wanted),
+        (Some(committed), Some(wanted)) if committed != wanted || replaced_for_gpu
+    )
+}
+
+/// Story 3.8: whether a runtime install leaves a restart due for
+/// `selection`. Either Install replaced the bundled library this process
+/// loaded (voice-me-tts's one rule: bundled, GPU, replaced), or it staged
+/// the new one for the next start because this process has the old one
+/// loaded (Windows). Either way only a GPU selection needs the new library.
+fn runtime_restart_due(
+    selection: &BackendSelection,
+    committed_is_bundled: bool,
+    replaced: bool,
+    staged: bool,
+) -> bool {
+    let gpu = is_gpu_selection(selection);
+    voice_me_tts::replaced_runtime_needs_restart(committed_is_bundled, gpu, replaced)
+        || (gpu && staged)
+}
+
+/// Whether `committed` is the bundled runtime in the cache.
+fn committed_is_bundled(committed: Option<&Path>) -> bool {
+    let Ok(root) = voice_me_core::assets::model_cache_root() else {
+        return false;
+    };
+    committed.is_some_and(|committed| voice_me_core::assets::is_bundled_runtime(&root, committed))
+}
+
+/// Whether a runtime update waits for the next start (Story 3.8, Windows).
+fn runtime_staged() -> bool {
+    voice_me_core::assets::model_cache_root()
+        .is_ok_and(|root| voice_me_deps::staged_runtime_pending(&root))
+}
+
+/// Story 3.8 (Windows): put a runtime update staged by the last run in
+/// place, before anything resolves or loads the runtime.
+fn apply_staged_runtime() {
+    let Ok(root) = voice_me_core::assets::model_cache_root() else {
+        return;
+    };
+    if let Err(error) = voice_me_deps::apply_staged_runtime(&root) {
+        eprintln!("could not finish installing the staged ONNX Runtime: {error}");
+    }
+}
+
+/// Whether `selection` runs on a GPU execution provider.
+fn is_gpu_selection(selection: &BackendSelection) -> bool {
+    selection
+        .local_target()
+        .is_some_and(|target| target != SpeechExecutionTarget::Cpu)
 }
 
 /// Wait for the instance that relaunched this one to exit, so the tray and
@@ -603,7 +660,11 @@ fn relaunch() -> Result<(), String> {
 /// for its voices through the System voice's own crate — `voice-me-deps`
 /// never calls a TTS adapter.
 fn deps_adapter() -> DepsAdapter {
-    let adapter = DepsAdapter::new();
+    // Story 3.8: whether the bundled runtime is loaded here, which Windows
+    // cannot replace in place — asked of the speech engine, never by deps.
+    let adapter = DepsAdapter::new().with_runtime_in_use(|| {
+        committed_is_bundled(voice_me_tts::sessions::committed_runtime().as_deref())
+    });
     #[cfg(target_os = "windows")]
     let adapter = adapter.with_system_voice_probe(voice_me_tts_system_windows::count_voices);
     adapter
@@ -2066,18 +2127,103 @@ mod tests {
             let cuda = Path::new("/opt/ort/libonnxruntime.so");
 
             assert!(
-                !needs_restart(None, Some(cuda)),
+                !needs_restart(None, Some(cuda), false),
                 "nothing committed yet: the switch applies to the next Speak Action"
             );
             assert!(
-                !needs_restart(Some(bundled), Some(bundled)),
+                !needs_restart(Some(bundled), Some(bundled), false),
                 "same library: no restart"
             );
-            assert!(needs_restart(Some(bundled), Some(cuda)));
+            assert!(needs_restart(Some(bundled), Some(cuda), false));
             assert!(
-                !needs_restart(Some(bundled), None),
+                !needs_restart(Some(bundled), None, false),
                 "a remote selection loads no library"
             );
+            assert!(
+                !needs_restart(None, Some(bundled), true),
+                "nothing loaded yet: the new library is the one that will be"
+            );
+        }
+
+        /// Story 3.8, matrix row "Switch": CPU → CUDA → WebGPU → CPU on the
+        /// bundled runtime is one library, so every switch is a session
+        /// rebuild — while an added library keeps Decision 2's rule.
+        #[test]
+        fn switching_targets_on_the_bundled_runtime_never_needs_a_restart() {
+            let _lock = super::cache_root_lock();
+            let bundled_on = |target| BackendSelection::Local {
+                runtime: None,
+                target,
+            };
+            let switches = [
+                SpeechExecutionTarget::Cpu,
+                SpeechExecutionTarget::Cuda,
+                SpeechExecutionTarget::WebGpu,
+                SpeechExecutionTarget::Cpu,
+            ];
+            let committed = selection_library(&bundled_on(SpeechExecutionTarget::Cpu));
+            assert!(committed.is_some());
+            for target in switches {
+                let selection = bundled_on(target);
+                let wanted = selection_library(&selection);
+                assert_eq!(wanted, committed, "{target:?}: one bundled library");
+                assert!(
+                    !needs_restart(committed.as_deref(), wanted.as_deref(), false),
+                    "{target:?}"
+                );
+            }
+
+            let added = BackendSelection::Local {
+                runtime: Some(PathBuf::from("/opt/ort/libonnxruntime.so")),
+                target: SpeechExecutionTarget::Cuda,
+            };
+            assert!(needs_restart(
+                committed.as_deref(),
+                selection_library(&added).as_deref(),
+                false
+            ));
+        }
+
+        /// The one exception: Install replaced the bundled library this
+        /// process loaded, or staged the new one for the next start. A GPU
+        /// selection needs the new one; CPU keeps running on the old one
+        /// without a restart, and an added library is never replaced.
+        #[test]
+        fn a_replaced_or_staged_bundled_library_needs_a_restart_for_a_gpu_selection_only() {
+            let bundled = Path::new("/cache/runtime/libonnxruntime.so");
+            let gpu = BackendSelection::Local {
+                runtime: None,
+                target: SpeechExecutionTarget::WebGpu,
+            };
+            let cpu = BackendSelection::Local {
+                runtime: None,
+                target: SpeechExecutionTarget::Cpu,
+            };
+
+            assert!(is_gpu_selection(&gpu));
+            assert!(!is_gpu_selection(&cpu));
+            assert!(!is_gpu_selection(&BackendSelection::Piper));
+
+            // bundled, replaced, staged
+            assert!(runtime_restart_due(&gpu, true, true, false));
+            assert!(
+                !runtime_restart_due(&gpu, false, true, false),
+                "only the bundled library is ever replaced"
+            );
+            assert!(runtime_restart_due(&gpu, true, false, true));
+            assert!(!runtime_restart_due(&gpu, true, false, false));
+            assert!(!runtime_restart_due(&cpu, true, true, true));
+
+            assert!(needs_restart(
+                Some(bundled),
+                Some(bundled),
+                runtime_restart_due(&gpu, true, true, false)
+            ));
+            assert!(!needs_restart(
+                Some(bundled),
+                Some(bundled),
+                runtime_restart_due(&cpu, true, true, false)
+            ));
         }
 
         #[test]
@@ -2924,6 +3070,9 @@ fn main() {
     // "Restart now": let the previous instance release the tray and the
     // hotkey before this one claims them.
     wait_for_previous_instance();
+    // Story 3.8: once the old instance has let go of the runtime, a staged
+    // update takes its place — before anything resolves or loads it.
+    apply_staged_runtime();
 
     let file_store =
         Arc::new(FileSettingsStore::new().expect("failed to resolve settings/data directories"));
@@ -3594,7 +3743,14 @@ fn main() {
                         drop(errors);
                         let committed = voice_me_tts::sessions::committed_runtime();
                         let wanted = selection_library(&selection);
-                        if needs_restart(committed.as_deref(), wanted.as_deref()) {
+                        let replaced_for_gpu = runtime_restart_due(
+                            &selection,
+                            committed_is_bundled(committed.as_deref()),
+                            voice_me_tts::sessions::committed_runtime_replaced(),
+                            runtime_staged(),
+                        );
+                        if needs_restart(committed.as_deref(), wanted.as_deref(), replaced_for_gpu)
+                        {
                             restart_pending.set(true);
                         } else {
                             restart_pending.set(false);
@@ -4467,6 +4623,32 @@ fn main() {
                         };
                         let recheck =
                             apply_provisioning_event(&mut provisioning.borrow_mut(), &event);
+
+                        // Story 3.8: a runtime install for a GPU selection
+                        // that only a restart can load says so at once.
+                        if finished_ok
+                            && matches!(
+                                kind,
+                                DependencyKind::OnnxRuntime
+                                    | DependencyKind::CudaProvider
+                                    | DependencyKind::NvidiaLibraries
+                            )
+                        {
+                            let selection = settings_store
+                                .load()
+                                .map(|settings| settings.backend_selection)
+                                .unwrap_or_default();
+                            if runtime_restart_due(
+                                &selection,
+                                committed_is_bundled(
+                                    voice_me_tts::sessions::committed_runtime().as_deref(),
+                                ),
+                                voice_me_tts::sessions::committed_runtime_replaced(),
+                                runtime_staged(),
+                            ) {
+                                restart_pending.set(true);
+                            }
+                        }
 
                         // A successful finish is dropped from the held map
                         // but deliberately not pushed: the open view keeps
