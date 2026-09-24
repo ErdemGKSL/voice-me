@@ -216,3 +216,6 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-8-windows-virtual-microphone-via-vb-cable.md`
   summary: Update the PRD's FR-6, the PRD addendum's driver notes and the "single executable" distribution claim for VB-CABLE on Windows.
   evidence: only PRD Open Question 2 and the architecture spine were updated in spec-2-8; the planning documents that name the old driver belong to a correct-course pass.
+- source_spec: `_bmad-output/implementation-artifacts/spec-fix-espeak-ng-install-without-msiexec.md`
+  summary: The eSpeak NG MSI unpacker's end-to-end test runs only when `VOICE_ME_ESPEAK_MSI` points at the real package, so CI never exercises the table join, cabinet read and write path.
+  evidence: `the_real_espeak_ng_package_unpacks_into_its_install_layout` returns early without the variable. Settle it with a test that builds a small MSI (`msi::Package::create`) holding an embedded cabinet (`cab::CabinetBuilder`), or by caching the pinned MSI in CI.

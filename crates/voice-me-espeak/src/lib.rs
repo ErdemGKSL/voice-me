@@ -46,7 +46,7 @@ pub use os_release::{
     read_os_release,
 };
 #[cfg(target_os = "windows")]
-pub use process::{CREATE_NO_WINDOW, run_raw};
+pub use process::CREATE_NO_WINDOW;
 pub use process::{RunError, run};
 
 /// The program, by the fixed name it is looked up by on PATH.
@@ -64,8 +64,7 @@ pub use voice_me_core::assets::{
 /// The data directory a self-contained eSpeak NG keeps beside its program.
 pub const DATA_DIR: &str = "espeak-ng-data";
 
-/// Where the program sits in an eSpeak NG unpacked into `espeak_dir` (the
-/// MSI's administrative image): `<espeak_dir>\eSpeak NG\espeak-ng.exe`.
+/// Where the program sits in an eSpeak NG unpacked into `espeak_dir`: `<espeak_dir>\eSpeak NG\espeak-ng.exe`.
 pub fn unpacked_program(espeak_dir: &Path) -> PathBuf {
     voice_me_core::assets::espeak_program(espeak_dir)
 }

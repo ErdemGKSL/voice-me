@@ -114,8 +114,8 @@ eSpeak NG is linked.
   `C:\Program Files\eSpeak NG\`, then on `PATH`. When none is found, the
   eSpeak NG row's **Install** downloads the official eSpeak NG 1.52.0
   `espeak-ng.msi` (12.8 MB, pinned SHA-256), unpacks it into
-  `<cache>\espeak-ng\` with `msiexec /a` (no admin prompt, no registry or
-  `PATH` change), and deletes the `.msi`. Delete that directory to remove it.
+  `<cache>\espeak-ng\` by reading the package itself (no `msiexec`, no
+  admin prompt, no registry or `PATH` change), and deletes the `.msi`. Delete that directory to remove it.
 
 For reference, the weights come from
 `onnx-community/chatterbox-multilingual-ONNX` (MIT), pinned to revision

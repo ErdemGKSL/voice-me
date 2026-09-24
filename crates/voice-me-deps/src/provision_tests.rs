@@ -1408,14 +1408,13 @@ fn provision_espeak_with(adapter: DepsAdapter) -> (Result<(), String>, Vec<AppEv
     (result, events)
 }
 
-/// Lays out what `msiexec /a` leaves in `target`: the program, its data
-/// directory, and a copy of the package.
-fn fake_admin_image(target: &Path) {
+/// Lays out what unpacking the MSI leaves in `target`: the program, its data
+/// directory and its library.
+fn fake_unpacked_image(target: &Path) {
     let dir = target.join("eSpeak NG");
     std::fs::create_dir_all(dir.join("espeak-ng-data")).unwrap();
     std::fs::write(dir.join("espeak-ng.exe"), b"MZ").unwrap();
     std::fs::write(dir.join("libespeak-ng.dll"), b"MZ").unwrap();
-    std::fs::write(target.join(ESPEAK_MSI), b"stripped").unwrap();
 }
 
 fn espeak_dirs(fixture: &Fixture) -> (PathBuf, PathBuf, PathBuf) {
@@ -1442,7 +1441,7 @@ fn an_espeak_install_unpacks_the_verified_msi_and_deletes_it() {
             seen.lock()
                 .unwrap()
                 .push((std::fs::read(package).unwrap(), target.to_path_buf()));
-            fake_admin_image(target);
+            fake_unpacked_image(target);
             Ok(())
         });
 
@@ -1454,10 +1453,6 @@ fn an_espeak_install_unpacks_the_verified_msi_and_deletes_it() {
     let program = espeak_dir.join("eSpeak NG").join("espeak-ng.exe");
     assert!(program.is_file());
     assert!(espeak_dir.join("eSpeak NG").join("espeak-ng-data").is_dir());
-    assert!(
-        !espeak_dir.join(ESPEAK_MSI).exists(),
-        "the image's copy is gone"
-    );
     assert!(!staging.exists());
     assert!(!msi_path.exists(), "the .msi is deleted afterwards");
     assert!(!part_path(&msi_path).exists());
@@ -1509,7 +1504,7 @@ fn a_stale_espeak_msi_in_the_cache_is_fetched_again_before_unpacking() {
     let (result, _) = provision_espeak_with(fixture.adapter().with_espeak_unpacker(
         move |package: &Path, target: &Path| {
             seen.lock().unwrap().push(std::fs::read(package).unwrap());
-            fake_admin_image(target);
+            fake_unpacked_image(target);
             Ok(())
         },
     ));
@@ -1528,7 +1523,7 @@ fn an_unpacked_espeak_ng_takes_a_leftover_msi_with_it() {
     let msi = fake_espeak_msi();
     let fixture = espeak_fixture(msi.clone(), &msi);
     let (espeak_dir, _, msi_path) = espeak_dirs(&fixture);
-    fake_admin_image(&espeak_dir);
+    fake_unpacked_image(&espeak_dir);
     std::fs::write(&msi_path, &msi).unwrap();
 
     let (result, _) = provision_espeak_with(
@@ -1580,15 +1575,15 @@ fn a_failed_espeak_unpack_leaves_no_install_behind() {
             std::fs::create_dir_all(target.join("eSpeak NG")).unwrap();
             std::fs::write(target.join("eSpeak NG").join("espeak-ng.exe"), b"half").unwrap();
             Err(voice_me_core::VoiceMeError::Other(
-                "Could not unpack eSpeak NG: msiexec exit code: 1603.".to_string(),
+                "Could not unpack eSpeak NG: the package is damaged.".to_string(),
             ))
         }));
 
     let error = result.unwrap_err();
-    assert!(error.contains("exit code: 1603"), "{error}");
+    assert!(error.contains("the package is damaged"), "{error}");
     assert!(!espeak_dir.exists(), "no half-installed program");
     assert!(!staging.exists());
-    assert!(matches!(finished(&events).as_slice(), [Err(reason)] if reason.contains("1603")));
+    assert!(matches!(finished(&events).as_slice(), [Err(reason)] if reason.contains("damaged")));
 }
 
 /// An unpack that "succeeds" without `espeak-ng.exe` is refused, and

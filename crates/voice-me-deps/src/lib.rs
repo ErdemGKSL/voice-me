@@ -22,6 +22,7 @@
 //!   means. `deps` never depends on `tts`.
 
 pub mod capability;
+mod msi_unpack;
 pub mod piper;
 pub mod provision;
 #[cfg(test)]
@@ -89,8 +90,8 @@ type VirtualMicInstaller = dyn Fn(Option<&Path>) -> Result<(), VoiceMeError> + S
 
 /// What Install on the Windows eSpeak NG row runs once the MSI is verified
 /// (Story 3.16): unpack `msi` into `target`, a directory that does not
-/// exist yet. `msiexec /a` on Windows; injectable so the whole flow is
-/// testable on any OS.
+/// exist yet. voice-me's own MSI reader ([`msi_unpack`]); injectable so the
+/// whole flow is testable without a package.
 type EspeakUnpacker = dyn Fn(&Path, &Path) -> Result<(), VoiceMeError> + Send + Sync;
 
 impl std::fmt::Debug for DepsAdapter {
@@ -125,7 +126,7 @@ impl DepsAdapter {
             piper_sources: Arc::new(PiperSources::pinned()),
             piper_catalog: Arc::default(),
             piper_in_flight: Arc::default(),
-            espeak_unpacker: Arc::new(unpack_espeak_msi),
+            espeak_unpacker: Arc::new(msi_unpack::unpack),
         }
     }
 
@@ -291,12 +292,6 @@ impl DepsAdapter {
             let _ = std::fs::remove_dir_all(&staging);
             return Err(error);
         }
-        // An administrative image carries a copy of the package itself; it
-        // is of no use once the files are out.
-        if let Some(name) = msi.file_name() {
-            let _ = std::fs::remove_file(staging.join(name));
-        }
-
         // A directory without the program is a stale leftover, not an
         // install: it gives way to the complete one.
         let swapped = remove_dir_if_present(&target).and_then(|()| {
@@ -606,10 +601,6 @@ impl PiperCatalogPort for DepsAdapter {
 /// only a complete unpack is renamed to [`assets::ESPEAK_DIR`].
 const ESPEAK_STAGING_DIR: &str = "espeak-ng.tmp";
 
-/// How long `msiexec /a` may take to unpack eSpeak NG (~25 MB, 443 files).
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-const ESPEAK_UNPACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
-
 /// Remove `dir` and everything in it, if it is there.
 fn remove_dir_if_present(dir: &Path) -> Result<(), VoiceMeError> {
     match std::fs::remove_dir_all(dir) {
@@ -620,59 +611,6 @@ fn remove_dir_if_present(dir: &Path) -> Result<(), VoiceMeError> {
             dir.display()
         ))),
     }
-}
-
-/// The real eSpeak NG unpacker on Windows (Story 3.16, the user's
-/// Decision): an administrative install, `msiexec /a <msi> /qn
-/// TARGETDIR=<target>` — no admin prompt, no registry or PATH change — run
-/// through the one bounded runner (AD-12), so with `CREATE_NO_WINDOW` and a
-/// two-minute deadline.
-#[cfg(target_os = "windows")]
-fn unpack_espeak_msi(msi: &Path, target: &Path) -> Result<(), VoiceMeError> {
-    let (args, target_arg) = msiexec_unpack_args(msi, target);
-    voice_me_espeak::run_raw(
-        std::ffi::OsStr::new("msiexec"),
-        &args,
-        &[target_arg],
-        &[],
-        ESPEAK_UNPACK_DEADLINE,
-    )
-    .map(|_| ())
-    .map_err(|error| match error {
-        voice_me_espeak::RunError::Failed { status, .. } => {
-            VoiceMeError::Other(format!("Could not unpack eSpeak NG: msiexec {status}."))
-        }
-        other => VoiceMeError::Other(format!("Could not unpack eSpeak NG: msiexec {other}.")),
-    })
-}
-
-/// `msiexec`'s arguments for an administrative install of `msi` into
-/// `target`: the ones quoted as usual (`/a <msi> /qn`), and the one raw
-/// `TARGETDIR="<target>"`. msiexec parses `PROPERTY="value"` itself, so
-/// that one goes on the command line exactly as written, quoted for a path
-/// with spaces.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn msiexec_unpack_args(msi: &Path, target: &Path) -> (Vec<std::ffi::OsString>, std::ffi::OsString) {
-    use std::ffi::OsString;
-    let mut target_arg = OsString::from("TARGETDIR=\"");
-    target_arg.push(target.as_os_str());
-    target_arg.push("\"");
-    (
-        vec![
-            OsString::from("/a"),
-            msi.as_os_str().to_os_string(),
-            OsString::from("/qn"),
-        ],
-        target_arg,
-    )
-}
-
-/// Off Windows nothing unpacks an MSI; no pinned source asks for it.
-#[cfg(not(target_os = "windows"))]
-fn unpack_espeak_msi(_msi: &Path, _target: &Path) -> Result<(), VoiceMeError> {
-    Err(VoiceMeError::Other(
-        "voice-me cannot unpack eSpeak NG on this system.".to_string(),
-    ))
 }
 
 /// Removes its row from the in-flight set when dropped — including when the
@@ -2059,29 +1997,6 @@ mod tests {
             ready.detail.contains(&program.display().to_string()),
             "{}",
             ready.detail
-        );
-    }
-
-    /// Story 3.16: msiexec's command line — an administrative, quiet
-    /// install, with `TARGETDIR` quoted whole for a path with a space.
-    #[test]
-    fn the_msiexec_command_line_is_admin_quiet_and_quotes_its_target() {
-        let msi = Path::new("C:/Users/Ada Lovelace/cache/espeak-ng.msi");
-        let target = Path::new("C:/Users/Ada Lovelace/cache/espeak-ng.tmp");
-
-        let (args, raw) = msiexec_unpack_args(msi, target);
-
-        assert_eq!(
-            args,
-            vec![
-                std::ffi::OsString::from("/a"),
-                msi.as_os_str().to_os_string(),
-                std::ffi::OsString::from("/qn"),
-            ]
-        );
-        assert_eq!(
-            raw,
-            std::ffi::OsString::from("TARGETDIR=\"C:/Users/Ada Lovelace/cache/espeak-ng.tmp\"")
         );
     }
 

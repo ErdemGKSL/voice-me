@@ -35,6 +35,14 @@ tar = { version = "0.4", default-features = false }
 # extraction. Unconditional, so the zip path is tested on every OS; only
 # deflate, the method Microsoft's archive uses.
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+# eSpeak NG's `espeak-ng.msi` is unpacked by reading the package itself:
+# `msiexec`, even `/a`, needs an administrator for this per-machine
+# package. `msi` reads its tables and streams, `cab` its embedded cabinet:
+# the `cab-superewald` fork of `cab` 0.6, whose `all_files` reads a folder
+# in one pass (upstream decompresses the folder anew for every file).
+# Unconditional, so the unpacking is tested on every OS.
+msi = "0.10"
+cab = { package = "cab-superewald", version = "0.6.1" }
 # Story 3.3: the CUDA capability probe opens the NVIDIA driver library
 # (`libcuda.so.1` / `nvcuda.dll`) at run time — a missing driver is a
 # "not found" answer, never a link error. The version `ash` already uses.
@@ -59,8 +67,7 @@ voice-me-espeak = { path = "../voice-me-espeak" }
 voice-me-tts-edge = { path = "../voice-me-tts-edge" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-# Story 3.16: where `espeak-ng.exe` is, asked of the crate that runs it, and
-# the one bounded runner Install's `msiexec /a` goes through (AD-12).
+# Story 3.16: where `espeak-ng.exe` is, asked of the crate that runs it.
 voice-me-espeak = { path = "../voice-me-espeak" }
 # Story 2.8: whether VB-CABLE's "CABLE Input" is present, and the elevated
 # launch of VB's own setup, are *asked of* the crate that plays to it —

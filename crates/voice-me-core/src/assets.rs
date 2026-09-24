@@ -228,8 +228,8 @@ pub fn piper_dir(root: &Path) -> PathBuf {
 }
 
 /// Where an eSpeak NG unpacked by `voice-me-deps` lives inside the cache
-/// root on Windows (Story 3.16): the MSI's administrative image, so the
-/// program sits at `<root>/espeak-ng/eSpeak NG/espeak-ng.exe`.
+/// root on Windows (Story 3.16): the MSI's files as it would install them, so
+/// the program sits at `<root>/espeak-ng/eSpeak NG/espeak-ng.exe`.
 pub const ESPEAK_DIR: &str = "espeak-ng";
 
 /// `<root>/espeak-ng`.
@@ -238,14 +238,13 @@ pub fn espeak_dir(root: &Path) -> PathBuf {
 }
 
 /// The directory eSpeak NG's MSI installs into, under Program Files — and,
-/// in an administrative image, under its target directory.
+/// unpacked by voice-me, under [`ESPEAK_DIR`].
 pub const ESPEAK_WINDOWS_INSTALL_DIR: &str = "eSpeak NG";
 
 /// The program's file name on Windows.
 pub const ESPEAK_WINDOWS_PROGRAM: &str = "espeak-ng.exe";
 
-/// Where the program sits in an eSpeak NG unpacked into `espeak_dir` (the
-/// MSI's administrative image): `<espeak_dir>/eSpeak NG/espeak-ng.exe`.
+/// Where the program sits in an eSpeak NG unpacked into `espeak_dir`: `<espeak_dir>/eSpeak NG/espeak-ng.exe`.
 pub fn espeak_program(espeak_dir: &Path) -> PathBuf {
     espeak_dir
         .join(ESPEAK_WINDOWS_INSTALL_DIR)

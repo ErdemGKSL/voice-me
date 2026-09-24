@@ -63,26 +63,6 @@ pub fn run(
     run_command(command, input, deadline)
 }
 
-/// [`run`] for a program with its own command-line parser (Story 3.16:
-/// `msiexec`, which wants `PROPERTY="value"` exactly as written): `args`
-/// are quoted as usual, then `raw_args` are appended verbatim.
-#[cfg(target_os = "windows")]
-pub fn run_raw(
-    program: &OsStr,
-    args: &[OsString],
-    raw_args: &[OsString],
-    input: &[u8],
-    deadline: Duration,
-) -> Result<Vec<u8>, RunError> {
-    use std::os::windows::process::CommandExt as _;
-    let mut command = Command::new(program);
-    command.args(args);
-    for raw in raw_args {
-        command.raw_arg(raw);
-    }
-    run_command(command, input, deadline)
-}
-
 /// One bounded run of `command`, whose program and arguments are set.
 fn run_command(
     mut command: Command,
