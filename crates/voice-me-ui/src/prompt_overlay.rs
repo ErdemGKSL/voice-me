@@ -39,7 +39,7 @@ use std::time::Duration;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, Sizable as _, ThemeStyled as _,
+    ActiveTheme as _, Icon, Root, Sizable as _, ThemeStyled as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     kbd::Kbd,
@@ -482,12 +482,13 @@ impl PromptOverlayView {
         h_flex()
             .id("prompt-overlay-bar")
             .test_support()
-            // Its own height, not the window's: the confirm-first window
-            // asks to shrink to the bar, and a compositor that is slow to
-            // (or never does) must still get a bar, not a tall pill.
-            .w_full()
-            .h(px(PROMPT_BAR_HEIGHT))
-            .flex_shrink_0()
+            // The window's height, never more than the bar's own: a window
+            // whose client area comes out shorter than asked still holds
+            // the whole bar, and the confirm-first window, taller until the
+            // compositor applies its resize, still gets a bar, not a pill
+            // stretched to its height.
+            .size_full()
+            .max_h(px(PROMPT_BAR_HEIGHT))
             .px_5()
             .gap_3()
             .bg(cx.theme().popover)
@@ -516,6 +517,15 @@ impl PromptOverlayView {
                     .text_color(cx.theme().muted_foreground)
             }))
             .into_any_element()
+    }
+}
+
+impl PromptOverlayView {
+    /// The overlay window's `Root`. Transparent: `Root` otherwise fills the
+    /// whole window with the theme background, which shows as a square
+    /// behind the pill's rounded ends (and behind the card's corners).
+    pub fn root(view: Entity<Self>, window: &mut Window, cx: &mut Context<Root>) -> Root {
+        Root::new(view, window, cx).bg(gpui_kit::transparent_black())
     }
 }
 
@@ -676,7 +686,7 @@ mod tests {
         let (event_tx, event_rx) = mpsc::unbounded::<AppEvent>();
         let handle = cx.open_window(size(px(560.), px(PROMPT_BAR_HEIGHT)), |window, cx| {
             let view = cx.new(|cx| PromptOverlayView::new(event_tx.clone(), window, cx));
-            Root::new(view, window, cx)
+            PromptOverlayView::root(view, window, cx)
         });
         Harness {
             handle,
@@ -694,7 +704,7 @@ mod tests {
             let view = cx.new(|cx| {
                 PromptOverlayView::blocked(event_tx.clone(), blocker.clone(), window, cx)
             });
-            Root::new(view, window, cx)
+            PromptOverlayView::root(view, window, cx)
         });
         Harness {
             handle,
@@ -729,6 +739,27 @@ mod tests {
         .unwrap();
     }
 
+    /// A window whose client area comes out shorter than the bar asked for
+    /// (window chrome the platform kept) still holds the whole bar: it
+    /// shrinks to fit rather than running off the bottom.
+    #[gpui_kit::test]
+    fn the_bar_fits_a_window_shorter_than_asked(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let (event_tx, _event_rx) = mpsc::unbounded::<AppEvent>();
+        let handle = cx.open_window(size(px(560.), px(40.)), |window, cx| {
+            let view = cx.new(|cx| PromptOverlayView::new(event_tx.clone(), window, cx));
+            PromptOverlayView::root(view, window, cx)
+        });
+        cx.executor()
+            .advance_clock(Duration::from_millis(SUMMON_MS + 50));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let bar = window.find("prompt-overlay-bar").bounds();
+            assert_eq!(bar.size, size(px(560.), px(40.)), "{bar:?}");
+        })
+        .unwrap();
+    }
+
     /// The Story 3.6 shape, with a counter standing in for the root's
     /// "record the confirmation" callback.
     fn open_disclosure(cx: &mut TestAppContext) -> (Harness, Rc<std::cell::Cell<usize>>) {
@@ -750,7 +781,7 @@ mod tests {
                     cx,
                 )
             });
-            Root::new(view, window, cx)
+            PromptOverlayView::root(view, window, cx)
         });
         (
             Harness {

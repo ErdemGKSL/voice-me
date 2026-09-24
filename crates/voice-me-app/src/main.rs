@@ -3627,7 +3627,7 @@ fn main() {
                         *overlay_slot_on_close.borrow_mut() = None;
                         true
                     });
-                    cx.new(|cx| Root::new(view, window, cx))
+                    cx.new(|cx| PromptOverlayView::root(view, window, cx))
                 }) {
                     Ok(handle) => handle,
                     Err(error) => {

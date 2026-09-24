@@ -27,6 +27,10 @@ context: []
 - `DESIGN.md` updated: the `prompt-bar` component, radius and spacing, and the Shapes and Components prose.
 - Not verified visually: this container has no Vulkan driver, so the overlay cannot open here. Verified with 123 `voice-me-ui` tests (including bar geometry, the bar after confirming, and focus kept when clicking the bar) and an `AppAssets` test.
 
+## Spec Change Log
+
+- User report after release (screenshot): the bar ran off the bottom of a window whose client area came out much shorter than 56px, and a white square showed behind the pill's rounded ends. Amended: the overlay's `Root` is transparent (`PromptOverlayView::root`), since `Root` fills its window with the theme background. The bar now fills the window up to `PROMPT_BAR_HEIGHT` instead of a fixed height, so it never overflows. Why that window's client area is so short is not settled yet. KEEP: the bar is capped at its own height, so a taller confirm-first window never stretches it.
+
 ## Review Triage Log
 
 - high (patched): after confirm-first, the 196px window made the bar a tall pill. `confirm()` now resizes, the bar has its own height, and there is a test.
