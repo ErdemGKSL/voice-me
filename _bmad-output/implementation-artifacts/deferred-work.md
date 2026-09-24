@@ -186,3 +186,7 @@
 - source_spec: none
   summary: Install on Piper's ONNX Runtime row fails when the saved Chatterbox backend is a GPU one, because `provision_runtime` checks `request.backend` instead of the CPU runtime Piper's row is built for.
   evidence: `crates/voice-me-deps/src/lib.rs` `piper_rows` builds the row with `SpeechBackend::CPU` and `installable`, but `provision_row` passes `request.backend` to `provision_runtime`, which refuses any non-CPU target with `gpu_runtime_unavailable`. Found while investigating a Linux runtime auto-download request that turned out to be already served by the Install button.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-settings-window-title-bar.md`
+  summary: The Settings window has no title, so with the native title bar gone nothing names it in the taskbar, Alt-Tab or the window list.
+  evidence: `TitleBar::title_bar_options()` sets `title: None`, and the old `WindowOptions::default()` titlebar had no title either, so this predates the change. Setting `titlebar.title` in `SettingsView::window_options()` would fix it.

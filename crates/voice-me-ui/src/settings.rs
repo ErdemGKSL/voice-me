@@ -7,17 +7,18 @@
 //! showing; each section keeps its own state in its own entity.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::component::{
-    ActiveTheme as _,
+    ActiveTheme as _, Sizable as _, TitleBar,
     tab::{Tab, TabBar},
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
-    Subscription, Window, div,
+    App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, Styled as _, Subscription, Window, WindowOptions, div, px, size,
 };
 use voice_me_core::{
     AppEventSender, DependencyKind, DependencyOutcome, DependencyProvisioningPort, HotkeyPort,
@@ -87,10 +88,36 @@ pub struct SettingsView {
     dependencies: Entity<DependenciesView>,
     piper_voices: Entity<PiperVoicesView>,
     active_tab: usize,
+    /// What the title bar's own close button does (Linux only; Windows and
+    /// macOS close through the platform, which runs the window's
+    /// should-close handler itself).
+    on_close: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl SettingsView {
+    /// The window options the tab strip's title bar needs: the platform
+    /// title bar gives way to it, so dragging its background moves the
+    /// window and it draws the window controls where the OS expects them.
+    ///
+    /// The minimum size keeps all five tabs and the window controls in the
+    /// bar: the tabs do not shrink, so a narrower window would push the
+    /// controls past its right edge.
+    pub fn window_options() -> WindowOptions {
+        WindowOptions {
+            window_min_size: Some(size(px(720.), px(480.))),
+            ..TitleBar::window_options()
+        }
+    }
+
+    /// What the title bar's close button runs on Linux, where the button is
+    /// ours and closing through it skips the window's should-close handler.
+    /// It has to leave the composition root in the same state that handler
+    /// does, and then remove the window.
+    pub fn set_on_close(&mut self, on_close: impl Fn(&mut Window, &mut App) + 'static) {
+        self.on_close = Some(Rc::new(on_close));
+    }
+
     /// `has_active_sample`/`selected_mic_device` are the Voice tab's startup
     /// state (Story 1.5); `saved_hotkey`/`hotkey_startup_error` are the
     /// Hotkey tab's. All of them come from the composition root's single
@@ -166,6 +193,7 @@ impl SettingsView {
             dependencies,
             piper_voices,
             active_tab: VOICE_TAB,
+            on_close: None,
             _subscriptions: vec![open_backend, open_piper_voices],
         }
     }
@@ -232,25 +260,44 @@ impl SettingsView {
 
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let on_close = self.on_close.clone();
         v_flex()
             .size_full()
             .bg(cx.theme().background)
             .child(
-                TabBar::new("settings-tabs")
-                    .selected_index(self.active_tab)
-                    .child(Tab::new().label("Voice"))
-                    .child(Tab::new().label("Hotkey"))
-                    .child(Tab::new().label("Backend"))
-                    .child(Tab::new().label("Dependencies"))
-                    .child(Tab::new().label("Piper voices"))
-                    .on_click(cx.listener(|this, index: &usize, _window, cx| {
-                        if *index == PIPER_VOICES_TAB {
-                            this.show_piper_voices(cx);
-                        } else {
-                            this.active_tab = *index;
-                            cx.notify();
-                        }
-                    })),
+                // The tab strip is the window's title bar: its empty
+                // background drags the window and it carries the window
+                // controls. `occlude` keeps the tabs themselves out of the
+                // drag area, so pressing one never starts a move (Linux)
+                // or turns into a caption hit (Windows).
+                TitleBar::new()
+                    .when_some(on_close, |bar, on_close| {
+                        bar.on_close_window(move |_, window, cx| on_close(window, cx))
+                    })
+                    .child(
+                        div().id("settings-tabs-strip").occlude().h_full().child(
+                            // Pills paint no background or bottom border
+                            // of their own, so the title bar's are the only
+                            // ones, and they sit centred in its height.
+                            TabBar::new("settings-tabs")
+                                .pill()
+                                .small()
+                                .selected_index(self.active_tab)
+                                .child(Tab::new().label("Voice"))
+                                .child(Tab::new().label("Hotkey"))
+                                .child(Tab::new().label("Backend"))
+                                .child(Tab::new().label("Dependencies"))
+                                .child(Tab::new().label("Piper voices"))
+                                .on_click(cx.listener(|this, index: &usize, _window, cx| {
+                                    if *index == PIPER_VOICES_TAB {
+                                        this.show_piper_voices(cx);
+                                    } else {
+                                        this.active_tab = *index;
+                                        cx.notify();
+                                    }
+                                })),
+                        ),
+                    ),
             )
             .child(
                 div()

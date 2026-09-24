@@ -3415,34 +3415,48 @@ fn main() {
                     },
                 };
                 let view_slot = settings_view_slot.clone();
-                let handle = match cx.open_window(WindowOptions::default(), move |window, cx| {
-                    let view = cx.new(|cx| {
-                        SettingsView::new(
-                            settings_store.clone(),
-                            hotkey_port.clone(),
-                            has_active_sample,
-                            selected_mic_device,
-                            saved_hotkey,
-                            hotkey_startup_error,
-                            dependencies,
-                            window,
-                            cx,
-                        )
-                    });
-                    *view_slot.borrow_mut() = Some(view.clone());
-                    window.on_window_should_close(cx, move |_window, _cx| {
-                        *window_slot_on_close.borrow_mut() = None;
-                        *view_slot_on_close.borrow_mut() = None;
-                        true
-                    });
-                    cx.new(|cx| Root::new(view, window, cx))
-                }) {
-                    Ok(handle) => handle,
-                    Err(error) => {
-                        eprintln!("failed to open window: {error}");
-                        return;
-                    }
-                };
+                let handle =
+                    match cx.open_window(SettingsView::window_options(), move |window, cx| {
+                        let view = cx.new(|cx| {
+                            SettingsView::new(
+                                settings_store.clone(),
+                                hotkey_port.clone(),
+                                has_active_sample,
+                                selected_mic_device,
+                                saved_hotkey,
+                                hotkey_startup_error,
+                                dependencies,
+                                window,
+                                cx,
+                            )
+                        });
+                        *view_slot.borrow_mut() = Some(view.clone());
+                        // However the window closes, the slots are emptied, or
+                        // the next "Open Settings" would activate a window that
+                        // is gone and open nothing.
+                        let forget_window: Rc<dyn Fn()> = Rc::new(move || {
+                            *window_slot_on_close.borrow_mut() = None;
+                            *view_slot_on_close.borrow_mut() = None;
+                        });
+                        view.update(cx, |view, _| {
+                            let forget_window = forget_window.clone();
+                            view.set_on_close(move |window, _| {
+                                forget_window();
+                                window.remove_window();
+                            });
+                        });
+                        window.on_window_should_close(cx, move |_window, _cx| {
+                            forget_window();
+                            true
+                        });
+                        cx.new(|cx| Root::new(view, window, cx))
+                    }) {
+                        Ok(handle) => handle,
+                        Err(error) => {
+                            eprintln!("failed to open window: {error}");
+                            return;
+                        }
+                    };
 
                 *window_slot.borrow_mut() = Some(handle);
             }
