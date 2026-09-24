@@ -234,3 +234,12 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-3-13-speak-instantly-with-the-windows-speech-engine.md`
   summary: `voice-me-tts-system-windows/src/wav.rs` is an extended copy of `voice-me-tts-system-linux/src/wav.rs`, so fixes and formats can diverge between the two System voices.
   evidence: The Windows copy reads 24/32-bit PCM, float and extensible headers; the Linux one reads 16-bit PCM only. A small shared audio-decode crate (not an adapter, so AD-2 allows it) would hold one decoder.
+- source_spec: `_bmad-output/implementation-artifacts/spec-overlay-vertical-position.md`
+  summary: After a disclosure is confirmed, the overlay shrinks from 196 px to the 56 px prompt bar but keeps its top edge, so the bar ends up above the chosen vertical position (about 140 px high at 100%).
+  evidence: `PromptOverlayView::confirm` (`voice-me-ui/src/prompt_overlay.rs`) calls `window.resize` only. Fixing it needs the position in the view, plus a way to move the window.
+- source_spec: `_bmad-output/implementation-artifacts/spec-overlay-vertical-position.md`
+  summary: On Linux/X11, gpui-pre 0.3.5's `visible_bounds()` is the full display, so at 0% or 100% the overlay can sit under a top or bottom panel.
+  evidence: gpui overrides `visible_bounds` only on Windows. Settle it on an X11 desktop with a panel; fix it upstream or read `_NET_WORKAREA`.
+- source_spec: `_bmad-output/implementation-artifacts/spec-overlay-vertical-position.md`
+  summary: No test checks that the overlay-open closure in `main()` uses the persisted `overlay_position` on each summon, or that `SettingsView` hands the value through to the Hotkey tab.
+  evidence: Only the pure helpers are tested. Extract the size-and-position choice into a pure helper next to `overlay_bounds_in` and test it.

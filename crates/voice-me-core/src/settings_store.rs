@@ -16,9 +16,10 @@ use crate::error::VoiceMeError;
 use crate::ports::SettingsStore;
 use crate::state::{
     ActiveBackend, ApiKeys, AppState, BackendSelection, DEFAULT_AZURE_LOCALE,
-    DEFAULT_EDGE_TTS_LOCALE, DEFAULT_PIPER_LOCALE, DEFAULT_SPEECH_LANGUAGE, DependencyOutcome,
-    LanguageBackend, LocalRuntime, RemoteProvider, RemoteSample, SpeechBackend,
-    SpeechExecutionTarget, SpeechLanguages, SpeechVoices, parse_azure_region,
+    DEFAULT_EDGE_TTS_LOCALE, DEFAULT_OVERLAY_POSITION, DEFAULT_PIPER_LOCALE,
+    DEFAULT_SPEECH_LANGUAGE, DependencyOutcome, LanguageBackend, LocalRuntime, RemoteProvider,
+    RemoteSample, SpeechBackend, SpeechExecutionTarget, SpeechLanguages, SpeechVoices,
+    parse_azure_region,
 };
 
 const SETTINGS_FILE_NAME: &str = "settings.toml";
@@ -97,6 +98,16 @@ struct SettingsFile {
         skip_serializing_if = "Vec::is_empty"
     )]
     remote_samples: Vec<RemoteSample>,
+    /// Where the Prompt Overlay opens vertically, in percent. Lenient: an
+    /// unreadable value is the default (centred in the free area), and one
+    /// outside 0–100 is clamped on load. Read as `i64` so `250` or `-3`
+    /// clamps rather than failing to fit; clamped, it is held as a `u8`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_percent",
+        skip_serializing_if = "Option::is_none"
+    )]
+    overlay_position: Option<u8>,
 }
 
 /// How [`SpeechLanguages`] is written to TOML, keyed by backend slug:
@@ -324,6 +335,15 @@ where
     Ok(T::deserialize(value).ok())
 }
 
+/// The same leniency for a percentage, clamped to 0–100 as it loads — the
+/// one clamp on the way in.
+fn lenient_percent<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(lenient::<_, i64>(deserializer)?.map(|percent| percent.clamp(0, 100) as u8))
+}
+
 /// The same leniency for the API keys: an unreadable table reads as no keys.
 fn lenient_keys<'de, D>(deserializer: D) -> Result<ApiKeys, D::Error>
 where
@@ -393,6 +413,7 @@ impl Default for SettingsFile {
             azure_region: None,
             confirmed_disclosures: Vec::new(),
             remote_samples: Vec::new(),
+            overlay_position: None,
         }
     }
 }
@@ -552,6 +573,10 @@ impl FileSettingsStore {
             edge_tts_voices: Vec::new(),
             // Read from the cache by the composition root, never a file.
             piper_voices: Vec::new(),
+            // Clamped to 0–100 as it loads.
+            overlay_position: settings
+                .overlay_position
+                .unwrap_or(DEFAULT_OVERLAY_POSITION),
         }
     }
 }
@@ -689,6 +714,13 @@ impl SettingsStore for FileSettingsStore {
         };
         let mut settings = self.read_settings_file()?;
         settings.azure_region = region;
+        self.write_settings_file(&settings)?;
+        Ok(self.build_state(settings))
+    }
+
+    fn save_overlay_position(&self, percent: u8) -> Result<AppState, VoiceMeError> {
+        let mut settings = self.read_settings_file()?;
+        settings.overlay_position = Some(percent.min(100));
         self.write_settings_file(&settings)?;
         Ok(self.build_state(settings))
     }
@@ -1347,6 +1379,51 @@ mod tests {
 
         assert_eq!(state.api_keys, ApiKeys::default());
         assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
+    }
+
+    #[test]
+    fn overlay_position_defaults_to_centred_and_round_trips() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = store_in(config_dir.path(), data_dir.path());
+        store.save_hotkey(Some("Ctrl+Alt+KeyV")).unwrap();
+        let written = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
+        assert!(!written.contains("overlay_position"), "{written}");
+        assert_eq!(store.load().unwrap().overlay_position, 50);
+
+        let state = store.save_overlay_position(30).unwrap();
+        assert_eq!(state.overlay_position, 30);
+        assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
+        let written = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
+        assert!(written.contains("overlay_position = 30"), "{written}");
+
+        let reloaded = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+        assert_eq!(reloaded.overlay_position, 30);
+        assert_eq!(reloaded.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
+
+        assert_eq!(store.save_overlay_position(0).unwrap().overlay_position, 0);
+        assert_eq!(
+            store.save_overlay_position(200).unwrap().overlay_position,
+            100
+        );
+    }
+
+    #[test]
+    fn a_bad_overlay_position_loads_as_the_default_or_clamped() {
+        for (value, expected) in [("\"x\"", 50), ("250", 100), ("-3", 0), ("12.5", 50)] {
+            let config_dir = tempfile::tempdir().unwrap();
+            let data_dir = tempfile::tempdir().unwrap();
+            fs::write(
+                config_dir.path().join(SETTINGS_FILE_NAME),
+                format!("hotkey = \"Ctrl+Alt+KeyV\"\noverlay_position = {value}\n"),
+            )
+            .unwrap();
+
+            let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+
+            assert_eq!(state.overlay_position, expected, "{value}");
+            assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"), "{value}");
+        }
     }
 
     /// Story 3.14: the region, locale and voice round trip; a new locale

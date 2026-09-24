@@ -995,6 +995,10 @@ mod tests {
             unimplemented!("not exercised by these tests")
         }
 
+        fn save_overlay_position(&self, _percent: u8) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
         fn save_disclosure_confirmed(
             &self,
             _provider: voice_me_core::RemoteProvider,

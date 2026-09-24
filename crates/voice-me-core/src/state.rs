@@ -5,6 +5,21 @@ use serde::{Deserialize, Serialize};
 /// The interface language when nothing has been saved yet.
 pub const DEFAULT_UI_LANGUAGE: &str = "en";
 
+/// The Prompt Overlay's default vertical position, in percent of the free
+/// vertical space: centred in the free area of the primary display's visible
+/// area (taskbar and panels excluded).
+pub const DEFAULT_OVERLAY_POSITION: u8 = 50;
+
+/// The top edge of a window placed `pct` percent of the way down the free
+/// vertical space of a visible area: `0` puts the window's top on the
+/// area's top, `100` its bottom on the area's bottom, `50` centres it.
+/// `pct` above 100 counts as 100. A window taller than the area gets the
+/// area's top, never a position above it.
+pub fn overlay_origin_y(visible_top: f32, visible_height: f32, window_height: f32, pct: u8) -> f32 {
+    let free = (visible_height - window_height).max(0.0);
+    visible_top + free * f32::from(pct.min(100)) / 100.0
+}
+
 /// The language generated speech is produced in when nothing has been saved
 /// yet (spec-2-6 Decision 2).
 ///
@@ -1281,6 +1296,10 @@ pub struct AppState {
     /// The Piper voices installed in the cache (Story 3.15), read from disk
     /// by the composition root. Not persisted.
     pub piper_voices: Vec<StockVoice>,
+    /// Where the Prompt Overlay opens vertically, 0 (top) to 100 (bottom)
+    /// percent of the free space in the primary display's visible area.
+    /// Persisted; set from Settings → Hotkey. Always `0..=100`.
+    pub overlay_position: u8,
 }
 
 /// Hand-written rather than derived so the two language fields default to
@@ -1308,6 +1327,7 @@ impl Default for AppState {
             azure_voices: Vec::new(),
             edge_tts_voices: Vec::new(),
             piper_voices: Vec::new(),
+            overlay_position: DEFAULT_OVERLAY_POSITION,
         }
     }
 }
@@ -1349,6 +1369,23 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_overlay_sits_its_percentage_down_the_free_space() {
+        // A 1080 px visible area starting under a 40 px panel, 200 px window.
+        assert_eq!(overlay_origin_y(40.0, 1000.0, 200.0, 0), 40.0);
+        assert_eq!(overlay_origin_y(40.0, 1000.0, 200.0, 100), 840.0);
+        assert_eq!(overlay_origin_y(40.0, 1000.0, 200.0, 50), 440.0);
+        assert_eq!(overlay_origin_y(40.0, 1000.0, 200.0, 20), 200.0);
+        // Out of range counts as the bottom; a too-tall window, the top.
+        assert_eq!(overlay_origin_y(40.0, 1000.0, 200.0, 250), 840.0);
+        assert_eq!(overlay_origin_y(40.0, 100.0, 200.0, 70), 40.0);
+    }
+
+    #[test]
+    fn the_overlay_defaults_to_centred() {
+        assert_eq!(AppState::default().overlay_position, 50);
+    }
 
     #[test]
     fn byte_figures_read_the_way_the_spec_writes_them() {

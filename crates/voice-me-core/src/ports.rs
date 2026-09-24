@@ -417,6 +417,11 @@ pub trait SettingsStore {
     /// error and nothing is saved. Returns the resulting `AppState`.
     fn save_azure_region(&self, region: Option<&str>) -> Result<AppState, VoiceMeError>;
 
+    /// Persist where the Prompt Overlay opens vertically, in percent of the
+    /// free space (0 top, 100 bottom). Above 100 is saved as 100. Returns
+    /// the resulting `AppState`.
+    fn save_overlay_position(&self, percent: u8) -> Result<AppState, VoiceMeError>;
+
     /// Record that the user confirmed `provider`'s disclosure — what is
     /// sent, and to whom (Story 3.6). Idempotent. Returns the resulting
     /// `AppState`.

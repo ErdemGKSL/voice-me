@@ -16,6 +16,10 @@
 //! it offers the `gdbus call` summon command, under "Show steps", for the
 //! user to bind in their compositor. Which of the two applies is injected
 //! as [`HotkeyDesktop`] — this crate never depends on the hotkey adapter.
+//!
+//! Under the hotkey, "Overlay position" sets how high the Prompt Overlay
+//! opens (spec-overlay-vertical-position). The slider's label follows every
+//! drag step; the value is saved through `SettingsStore` only on release.
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -24,13 +28,16 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _,
     alert::Alert,
     button::{Button, ButtonVariants as _},
-    h_flex, v_flex,
+    h_flex,
+    slider::{Slider, SliderEvent, SliderState},
+    v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    Context, FocusHandle, Focusable, FontWeight, InteractiveElement as _, IntoElement,
-    KeyDownEvent, Modifiers, ModifiersChangedEvent, ParentElement as _, Render, SharedString,
-    Styled as _, TestSupportExt as _, Window, div, px,
+    AppContext as _, Context, Entity, FocusHandle, Focusable, FontWeight, InteractiveElement as _,
+    IntoElement, KeyDownEvent, Modifiers, ModifiersChangedEvent, ParentElement as _, Render,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, TestSupportExt as _,
+    Window, div, px,
 };
 use voice_me_core::{HotkeyPort, SettingsStore, VoiceMeError};
 
@@ -40,6 +47,15 @@ const MODIFIER_ONLY_MESSAGE: &str =
 const UNSUPPORTED_KEY_MESSAGE: &str = "That key can't be used as a hotkey. Try another.";
 const CONFLICT_MESSAGE: &str = "This combination is already in use. Try another.";
 const NO_HOTKEY_LABEL: &str = "None set";
+const OVERLAY_POSITION_HELP: &str =
+    "How high the prompt overlay opens: 0% is the top of the screen, 100% the bottom.";
+const OVERLAY_POSITION_WAYLAND_NOTE: &str =
+    "On Wayland the compositor decides where windows open, so this may have no effect.";
+
+/// The slider's reading as a whole percentage, 0–100.
+fn slider_percent(value: f32) -> u8 {
+    value.round().clamp(0.0, 100.0) as u8
+}
 
 /// What a key press during capture amounts to. Pure — no view state, no
 /// window, no OS — so every row of the story's capture matrix can be
@@ -354,6 +370,19 @@ pub struct HotkeyView {
     /// Why "Open keyboard settings" could not open them. Kept apart from
     /// `hotkey_error` so it never replaces a conflict or permission message.
     open_settings_error: Option<SharedString>,
+    overlay_slider: Entity<SliderState>,
+    /// What the label shows: the live value while dragging, else the saved one.
+    overlay_position: u8,
+    /// What `settings.toml` holds, as far as this view knows.
+    saved_overlay_position: u8,
+    /// A drag is under way: a `Change` has arrived without its `Release`.
+    overlay_dragging: bool,
+    /// Why the last overlay-position save failed, if it did.
+    overlay_position_error: Option<SharedString>,
+    /// Whether this is a Wayland session, where the compositor places the
+    /// overlay and the setting may do nothing.
+    wayland: bool,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl HotkeyView {
@@ -361,13 +390,52 @@ impl HotkeyView {
     /// the message from a failed `start_listening` at launch (a Wayland
     /// session without `input`-group membership, most importantly), which is
     /// shown here rather than being left to stderr alone.
+    /// `overlay_position` is the saved `AppState.overlay_position`, and
+    /// `wayland` whether this session is Wayland.
     pub fn new(
         settings_store: Arc<dyn SettingsStore>,
         hotkey_port: Arc<dyn HotkeyPort>,
         saved_hotkey: Option<String>,
         startup_error: Option<String>,
+        overlay_position: u8,
+        wayland: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let overlay_position = overlay_position.min(100);
+        let overlay_slider = cx.new(|_| {
+            SliderState::new()
+                .min(0.)
+                .max(100.)
+                .step(1.)
+                .default_value(f32::from(overlay_position))
+        });
+        let subscriptions = vec![
+            cx.subscribe_in(
+                &overlay_slider,
+                window,
+                |this, _, event: &SliderEvent, window, cx| match event {
+                    SliderEvent::Change(value) => {
+                        this.overlay_dragging = true;
+                        this.overlay_position = slider_percent(value.end());
+                        cx.notify();
+                    }
+                    SliderEvent::Release(value) => {
+                        this.overlay_dragging = false;
+                        this.save_overlay_position(slider_percent(value.end()), window, cx);
+                    }
+                },
+            ),
+            // The accessibility Increment/Decrement actions go through
+            // `set_value`, which emits no event: save those here. Drags are
+            // saved on release only.
+            cx.observe_in(&overlay_slider, window, |this, slider, window, cx| {
+                let percent = slider_percent(slider.read(cx).value().end());
+                if !this.overlay_dragging && percent != this.saved_overlay_position {
+                    this.save_overlay_position(percent, window, cx);
+                }
+            }),
+        ];
         Self {
             settings_store,
             hotkey_port,
@@ -381,7 +449,99 @@ impl HotkeyView {
             desktop: HotkeyDesktop::Plain,
             steps_shown: false,
             open_settings_error: None,
+            overlay_slider,
+            overlay_position,
+            saved_overlay_position: overlay_position,
+            overlay_dragging: false,
+            overlay_position_error: None,
+            wayland,
+            _subscriptions: subscriptions,
         }
+    }
+
+    /// Persist the slider value. The next overlay open reads it. A failed
+    /// save puts the label and the thumb back on the saved value, so they
+    /// never show a position the overlay will not open at.
+    fn save_overlay_position(&mut self, percent: u8, window: &mut Window, cx: &mut Context<Self>) {
+        match self.settings_store.save_overlay_position(percent) {
+            Ok(_state) => {
+                self.saved_overlay_position = percent;
+                self.overlay_position = percent;
+                self.overlay_position_error = None;
+            }
+            Err(error) => {
+                let saved = self.saved_overlay_position;
+                self.overlay_position = saved;
+                self.overlay_position_error =
+                    Some(format!("Couldn't save the overlay position: {error}").into());
+                self.overlay_slider.update(cx, |slider, cx| {
+                    slider.set_value(f32::from(saved), window, cx)
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    fn overlay_position_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .id("hotkey-overlay-position")
+            .test_support()
+            .flex_none()
+            .mt_2()
+            .gap_2()
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(div().text_lg().child("Overlay position"))
+                    .child(
+                        div()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(OVERLAY_POSITION_HELP),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .id("hotkey-overlay-position-slider")
+                            .test_support()
+                            .flex_1()
+                            .min_w_0()
+                            .child(Slider::new(&self.overlay_slider).horizontal()),
+                    )
+                    .child(
+                        div()
+                            .id("hotkey-overlay-position-value")
+                            .test_support()
+                            .w(px(40.))
+                            .flex_none()
+                            .text_right()
+                            .font_family("monospace")
+                            .child(format!("{}%", self.overlay_position)),
+                    ),
+            )
+            .when(self.wayland, |el| {
+                el.child(
+                    div()
+                        .id("hotkey-overlay-position-note")
+                        .test_support()
+                        .text_size(px(12.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(OVERLAY_POSITION_WAYLAND_NOTE),
+                )
+            })
+            .when_some(self.overlay_position_error.clone(), |el, message| {
+                el.child(
+                    div()
+                        .id("hotkey-overlay-position-error")
+                        .test_support()
+                        .text_size(px(12.))
+                        .text_color(cx.theme().danger)
+                        .child(message),
+                )
+            })
     }
 
     /// Set what the desktop adds to this tab (see [`HotkeyDesktop`]).
@@ -544,6 +704,7 @@ impl Render for HotkeyView {
                 },
             ))
             .size_full()
+            .overflow_y_scroll()
             .p_6()
             .gap_4()
             .bg(cx.theme().background)
@@ -722,6 +883,7 @@ impl Render for HotkeyView {
                         }),
                 ),
             })
+            .child(self.overlay_position_section(cx))
     }
 }
 
@@ -734,7 +896,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{AppContext as _, TestAppContext, component::Root, px, size};
+    use gpui_kit::{TestAppContext, component::Root, px, size};
     use voice_me_core::{AppEventSender, AppState, SettingsStore, VoiceMeError};
 
     use super::*;
@@ -781,15 +943,20 @@ mod tests {
     #[derive(Default)]
     struct FakeSettingsStore {
         saved_hotkeys: Mutex<Vec<Option<String>>>,
+        saved_overlay_positions: Mutex<Vec<u8>>,
         save_fails: Mutex<bool>,
     }
 
     impl FakeSettingsStore {
         fn failing() -> Self {
             Self {
-                saved_hotkeys: Mutex::new(Vec::new()),
                 save_fails: Mutex::new(true),
+                ..Self::default()
             }
+        }
+
+        fn saved_overlay_positions(&self) -> Vec<u8> {
+            self.saved_overlay_positions.lock().unwrap().clone()
         }
 
         fn saved_hotkeys(&self) -> Vec<Option<String>> {
@@ -870,6 +1037,17 @@ mod tests {
             Ok(AppState::default())
         }
 
+        fn save_overlay_position(&self, percent: u8) -> Result<AppState, VoiceMeError> {
+            if *self.save_fails.lock().unwrap() {
+                return Err(VoiceMeError::Other("fake overlay save failure".to_string()));
+            }
+            self.saved_overlay_positions.lock().unwrap().push(percent);
+            Ok(AppState {
+                overlay_position: percent,
+                ..AppState::default()
+            })
+        }
+
         fn save_hotkey(&self, hotkey: Option<&str>) -> Result<AppState, VoiceMeError> {
             if *self.save_fails.lock().unwrap() {
                 return Err(VoiceMeError::Other("fake hotkey save failure".to_string()));
@@ -906,6 +1084,9 @@ mod tests {
                     port_dyn.clone(),
                     saved.clone(),
                     startup_error.clone(),
+                    50,
+                    false,
+                    window,
                     cx,
                 )
             });
@@ -1233,6 +1414,9 @@ mod tests {
                     port_dyn.clone(),
                     Some("Ctrl+Alt+KeyV".to_string()),
                     None,
+                    50,
+                    false,
+                    window,
                     cx,
                 );
                 view.set_desktop(desktop.clone(), cx);
@@ -1327,6 +1511,9 @@ mod tests {
                     port_dyn.clone(),
                     Some("Ctrl+Alt+KeyV".to_string()),
                     None,
+                    50,
+                    false,
+                    window,
                     cx,
                 );
                 view.hotkey_error =
@@ -1388,6 +1575,146 @@ mod tests {
             );
         })
         .unwrap();
+    }
+
+    /// A window tall enough that the Overlay position section is on screen,
+    /// and the view itself so its state can be read.
+    fn open_overlay(
+        cx: &mut TestAppContext,
+        settings_store: Arc<FakeSettingsStore>,
+        overlay_position: u8,
+        wayland: bool,
+    ) -> (gpui_kit::WindowHandle<Root>, gpui_kit::Entity<HotkeyView>) {
+        cx.update(gpui_kit::init);
+        let store_dyn: Arc<dyn SettingsStore> = settings_store;
+        let port_dyn: Arc<dyn HotkeyPort> = Arc::new(FakeHotkeyPort::default());
+        let slot = Rc::new(std::cell::RefCell::new(None));
+        let view_slot = slot.clone();
+        let handle = cx.open_window(size(px(640.), px(900.)), |window, cx| {
+            let view = cx.new(|cx| {
+                HotkeyView::new(
+                    store_dyn.clone(),
+                    port_dyn.clone(),
+                    None,
+                    None,
+                    overlay_position,
+                    wayland,
+                    window,
+                    cx,
+                )
+            });
+            *view_slot.borrow_mut() = Some(view.clone());
+            Root::new(view, window, cx)
+        });
+        let view = slot.borrow_mut().take().unwrap();
+        (handle, view)
+    }
+
+    #[gpui_kit::test]
+    fn the_overlay_slider_shows_the_saved_position(cx: &mut TestAppContext) {
+        let store = Arc::new(FakeSettingsStore::default());
+        let (handle, view) = open_overlay(cx, store.clone(), 30, false);
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("hotkey-overlay-position").is_some());
+            assert!(window.try_find("hotkey-overlay-position-slider").is_some());
+            assert!(window.try_find("hotkey-overlay-position-value").is_some());
+            assert!(
+                window.try_find("hotkey-overlay-position-note").is_none(),
+                "the Wayland note shows on Wayland sessions only"
+            );
+            assert!(window.try_find("hotkey-overlay-position-error").is_none());
+            let view = view.read(cx);
+            assert_eq!(view.overlay_position, 30);
+            assert_eq!(view.overlay_slider.read(cx).value().end(), 30.);
+        })
+        .unwrap();
+        assert!(
+            store.saved_overlay_positions().is_empty(),
+            "opening saves nothing"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn on_wayland_the_overlay_position_says_it_may_do_nothing(cx: &mut TestAppContext) {
+        let (handle, _view) = open_overlay(cx, Arc::new(FakeSettingsStore::default()), 50, true);
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("hotkey-overlay-position-note").is_some());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn releasing_the_overlay_slider_saves_its_value(cx: &mut TestAppContext) {
+        let store = Arc::new(FakeSettingsStore::default());
+        let (handle, view) = open_overlay(cx, store.clone(), 50, false);
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let slider = window.find("hotkey-overlay-position-slider").bounds();
+            // Press near the left end and release there: one Change, one
+            // Release.
+            window.click_at(
+                "hotkey-overlay-position-slider",
+                gpui_kit::point(slider.size.width * 0.2, slider.size.height / 2.),
+                cx,
+            );
+            window.render_frame(cx);
+        })
+        .unwrap();
+
+        let saved = store.saved_overlay_positions();
+        assert_eq!(saved.len(), 1, "one release, one save: {saved:?}");
+        assert!(saved[0] < 50, "the slider moved toward the top: {saved:?}");
+        cx.update(|cx| assert_eq!(view.read(cx).overlay_position, saved[0]));
+    }
+
+    #[gpui_kit::test]
+    fn a_failed_overlay_position_save_shows_on_the_tab(cx: &mut TestAppContext) {
+        let store = Arc::new(FakeSettingsStore::failing());
+        let (handle, view) = open_overlay(cx, store.clone(), 50, false);
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let slider = window.find("hotkey-overlay-position-slider").bounds();
+            window.click_at(
+                "hotkey-overlay-position-slider",
+                gpui_kit::point(slider.size.width * 0.2, slider.size.height / 2.),
+                cx,
+            );
+        })
+        .unwrap();
+        // The release's save runs once the click's update has finished.
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("hotkey-overlay-position-error").is_some());
+            // The label and the thumb go back to what is saved.
+            let view = view.read(cx);
+            assert_eq!(view.overlay_position, 50);
+            assert_eq!(view.overlay_slider.read(cx).value().end(), 50.);
+        })
+        .unwrap();
+        assert!(store.saved_overlay_positions().is_empty());
+    }
+
+    /// The accessibility Increment/Decrement actions call `set_value`, which
+    /// emits no slider event; the change is still shown and saved.
+    #[gpui_kit::test]
+    fn a_value_set_without_a_drag_is_saved(cx: &mut TestAppContext) {
+        let store = Arc::new(FakeSettingsStore::default());
+        let (handle, view) = open_overlay(cx, store.clone(), 50, false);
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            let slider = view.read(cx).overlay_slider.clone();
+            slider.update(cx, |slider, cx| slider.set_value(51., window, cx));
+        })
+        .unwrap();
+
+        assert_eq!(store.saved_overlay_positions(), vec![51]);
+        cx.update(|cx| assert_eq!(view.read(cx).overlay_position, 51));
     }
 
     #[gpui_kit::test]

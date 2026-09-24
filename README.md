@@ -15,6 +15,10 @@ Pressing the global hotkey summons the prompt overlay: a borderless window
 with a single focused field. Type a line and press `Enter` to send it;
 `Escape`, or clicking away, closes it and discards what you typed. Dismissing
 the overlay never quits the app — it stays in the tray either way.
+Settings → Hotkey → "Overlay position" sets how high it opens (0% top,
+100% bottom, default 50% centred in the free area; saved as
+`overlay_position` in `settings.toml`) — on Wayland the compositor may
+ignore it.
 
 A confirmed line is now actually generated (Story 2.6), in the speech
 language from `settings.toml` (`speech_language`, default `tr`), in the voice

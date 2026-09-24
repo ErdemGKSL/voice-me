@@ -70,8 +70,8 @@ use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui_kit::component::Root;
 use gpui_kit::{
-    App, AppContext as _, QuitMode, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
-    WindowHandle, WindowKind, WindowOptions, px, size,
+    App, AppContext as _, Bounds, Pixels, QuitMode, Size, WindowBackgroundAppearance, WindowBounds,
+    WindowDecorations, WindowHandle, WindowKind, WindowOptions, point, px, size,
 };
 use voice_me_core::VoiceMeError;
 use voice_me_core::{
@@ -149,6 +149,51 @@ const OVERLAY_BLOCKED_HEIGHT: f32 = 84.;
 /// things sent, and the two buttons. It keeps this height after confirming.
 const OVERLAY_DISCLOSURE_HEIGHT: f32 = 196.;
 
+/// Where the overlay window sits in a display's visible area (taskbar and
+/// panels excluded): horizontally centred, and `overlay_position` percent of
+/// the way down the free vertical space (spec-overlay-vertical-position).
+/// An area narrower (or shorter) than the window gets the window at its
+/// left (or top) edge, never off-screen before it.
+fn overlay_bounds_in(
+    visible: Bounds<Pixels>,
+    window_size: Size<Pixels>,
+    overlay_position: u8,
+) -> Bounds<Pixels> {
+    let x = (visible.center().x - window_size.width / 2.).max(visible.origin.x);
+    let y = voice_me_core::overlay_origin_y(
+        f32::from(visible.origin.y),
+        f32::from(visible.size.height),
+        f32::from(window_size.height),
+        overlay_position,
+    );
+    Bounds {
+        origin: point(x, px(y)),
+        size: window_size,
+    }
+}
+
+/// The overlay's bounds on the primary display, or on the first display
+/// GPUI lists when there is no primary one. With no display at all, GPUI's
+/// `WindowBounds::centered` has nothing to centre on and puts the window at
+/// the origin (0, 0).
+fn overlay_window_bounds(
+    window_size: Size<Pixels>,
+    overlay_position: u8,
+    cx: &App,
+) -> WindowBounds {
+    match cx
+        .primary_display()
+        .or_else(|| cx.displays().into_iter().next())
+    {
+        Some(display) => WindowBounds::Windowed(overlay_bounds_in(
+            display.visible_bounds(),
+            window_size,
+            overlay_position,
+        )),
+        None => WindowBounds::centered(window_size, cx),
+    }
+}
+
 /// Always-on-top is a two-tier capability, mirroring Story 2.3's two hotkey
 /// backends. `WindowKind::PopUp` is a real override-redirect, taskbar-less,
 /// above-everything window under X11. Wayland has no equivalent in this GPUI
@@ -175,6 +220,19 @@ fn overlay_window_kind_for(session: voice_me_hotkey_linux::SessionKind) -> Windo
         // like `Normal`. Saying `Normal` keeps the code honest about what
         // this session actually gets.
         voice_me_hotkey_linux::SessionKind::Wayland => WindowKind::Normal,
+    }
+}
+
+/// Whether this is a Wayland session, where the compositor places the
+/// overlay itself and its position setting may do nothing.
+fn is_wayland_session() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        voice_me_hotkey_linux::session_kind() == voice_me_hotkey_linux::SessionKind::Wayland
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
     }
 }
 
@@ -1421,6 +1479,10 @@ mod tests {
             unimplemented!("not exercised by these tests")
         }
 
+        fn save_overlay_position(&self, _percent: u8) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
         fn save_disclosure_confirmed(
             &self,
             _provider: voice_me_core::RemoteProvider,
@@ -1795,7 +1857,48 @@ mod tests {
         );
     }
 
+    /// spec-overlay-vertical-position: the overlay sits its percentage
+    /// down the visible area's free space, horizontally centred.
+    #[test]
+    fn the_overlay_is_placed_its_percentage_down_the_visible_area() {
+        // A 1920×1080 display with a 40 px top panel.
+        let visible = Bounds {
+            origin: point(px(0.), px(40.)),
+            size: size(px(1920.), px(1040.)),
+        };
+        let window = size(px(OVERLAY_WIDTH), px(40.));
+
+        let top = overlay_bounds_in(visible, window, 0);
+        assert_eq!(top.origin, point(px(680.), px(40.)));
+        assert_eq!(top.size, window, "the size is never changed");
+
+        let bottom = overlay_bounds_in(visible, window, 100);
+        assert_eq!(bottom.origin.y + bottom.size.height, px(1080.));
+
+        let twenty = overlay_bounds_in(visible, window, 20);
+        assert_eq!(twenty.origin, point(px(680.), px(240.)));
+
+        let centred = overlay_bounds_in(visible, window, 50);
+        assert_eq!(centred.origin, point(px(680.), px(540.)));
+    }
+
+    /// A visible area narrower than the overlay keeps the window's left
+    /// edge on it rather than off-screen to the left.
+    #[test]
+    fn the_overlay_stays_on_a_display_narrower_than_itself() {
+        let visible = Bounds {
+            origin: point(px(100.), px(0.)),
+            size: size(px(400.), px(600.)),
+        };
+        let window = size(px(OVERLAY_WIDTH), px(40.));
+
+        let bounds = overlay_bounds_in(visible, window, 0);
+        assert_eq!(bounds.origin, point(px(100.), px(0.)));
+        assert_eq!(bounds.size, window);
+    }
+
     /// Story 3.4's gate, as a decision: which shape a hotkey press opens.
+
     mod overlay_gate {
         use voice_me_core::{Dependency, DependencyKind, DependencyReport, SpeechBackend};
 
@@ -3897,6 +4000,11 @@ fn main() {
                     .as_ref()
                     .is_some_and(|state| state.reference_voice_sample.is_some());
                 let saved_hotkey = loaded_state.as_ref().and_then(|state| state.hotkey.clone());
+                let overlay_position = loaded_state
+                    .as_ref()
+                    .map_or(voice_me_core::DEFAULT_OVERLAY_POSITION, |state| {
+                        state.overlay_position
+                    });
                 let selected_mic_device = loaded_state.and_then(|state| state.selected_mic_device);
                 let hotkey_startup_error = hotkey_startup_error.borrow().clone();
 
@@ -3936,6 +4044,8 @@ fn main() {
                             selected_mic_device,
                             saved_hotkey,
                             hotkey_startup_error,
+                            overlay_position,
+                            is_wayland_session(),
                             dependencies,
                             window,
                             cx,
@@ -4058,7 +4168,9 @@ fn main() {
                     // window possible at all on Linux.
                     window_decorations: Some(WindowDecorations::Client),
                     window_background: WindowBackgroundAppearance::Transparent,
-                    window_bounds: Some(WindowBounds::centered(
+                    // Read from settings at every open, so a slider moved
+                    // in Settings applies to the next summon.
+                    window_bounds: Some(overlay_window_bounds(
                         size(
                             px(OVERLAY_WIDTH),
                             px(if disclosure.is_some() {
@@ -4069,6 +4181,7 @@ fn main() {
                                 PROMPT_BAR_HEIGHT
                             }),
                         ),
+                        state.overlay_position,
                         cx,
                     )),
                     kind: overlay_window_kind(),

@@ -128,7 +128,9 @@ impl SettingsView {
 
     /// `has_active_sample`/`selected_mic_device` are the Voice tab's startup
     /// state (Story 1.5); `saved_hotkey`/`hotkey_startup_error` are the
-    /// Hotkey tab's. All of them come from the composition root's single
+    /// Hotkey tab's, with `overlay_position` (the saved
+    /// `AppState.overlay_position`) and `wayland` (whether this is a Wayland
+    /// session). All of them come from the composition root's single
     /// `settings_store.load()` — no view reads the store at render time.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -138,6 +140,8 @@ impl SettingsView {
         selected_mic_device: Option<String>,
         saved_hotkey: Option<String>,
         hotkey_startup_error: Option<String>,
+        overlay_position: u8,
+        wayland: bool,
         dependencies: DependenciesTab,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -157,6 +161,9 @@ impl SettingsView {
                 hotkey_port,
                 saved_hotkey,
                 hotkey_startup_error,
+                overlay_position,
+                wayland,
+                window,
                 cx,
             )
         });
@@ -390,6 +397,10 @@ mod tests {
             unimplemented!("not exercised by these tests")
         }
 
+        fn save_overlay_position(&self, _percent: u8) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
         fn save_disclosure_confirmed(
             &self,
             _provider: voice_me_core::RemoteProvider,
@@ -499,6 +510,8 @@ mod tests {
                     None,
                     None,
                     None,
+                    50,
+                    false,
                     DependenciesTab {
                         deps_port: Arc::new(StubDepsPort),
                         events: event_tx.clone(),
@@ -581,6 +594,8 @@ mod tests {
                     None,
                     None,
                     None,
+                    50,
+                    false,
                     DependenciesTab {
                         deps_port: Arc::new(StubDepsPort),
                         events: event_tx.clone(),
@@ -645,6 +660,8 @@ mod tests {
                     None,
                     None,
                     None,
+                    50,
+                    false,
                     DependenciesTab {
                         deps_port: Arc::new(StubDepsPort),
                         events: event_tx.clone(),
@@ -721,6 +738,8 @@ mod tests {
                     None,
                     None,
                     None,
+                    50,
+                    false,
                     DependenciesTab {
                         deps_port: Arc::new(StubDepsPort),
                         events: event_tx.clone(),
