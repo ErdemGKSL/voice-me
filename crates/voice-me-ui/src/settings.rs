@@ -272,6 +272,10 @@ mod tests {
             unimplemented!("not exercised by these tests")
         }
 
+        fn save_azure_region(&self, _region: Option<&str>) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
         fn save_disclosure_confirmed(
             &self,
             _provider: voice_me_core::RemoteProvider,

@@ -25,6 +25,12 @@ pub struct CheckRequest {
     /// Whether the selected remote provider has an API key. Meaningless
     /// for a local selection.
     pub has_api_key: bool,
+    /// Whether the selected remote provider has a region saved (Story
+    /// 3.14: Azure). Meaningless for any other selection.
+    pub has_region: bool,
+    /// Whether the selected backend has a voice saved (Story 3.14: Azure,
+    /// which has no default voice). Meaningless for any other selection.
+    pub has_voice: bool,
 }
 
 impl CheckRequest {
@@ -34,6 +40,8 @@ impl CheckRequest {
             backend: SpeechBackend::CPU,
             selection: BackendSelection::BUNDLED_CPU,
             has_api_key: false,
+            has_region: false,
+            has_voice: false,
         }
     }
 }
@@ -312,6 +320,11 @@ pub trait SettingsStore {
         provider: RemoteProvider,
         key: Option<&str>,
     ) -> Result<AppState, VoiceMeError>;
+
+    /// Persist the Azure region (Story 3.14), or `None` to remove it. The
+    /// region is trimmed and lowercased; anything but `[a-z0-9]+` is an
+    /// error and nothing is saved. Returns the resulting `AppState`.
+    fn save_azure_region(&self, region: Option<&str>) -> Result<AppState, VoiceMeError>;
 
     /// Record that the user confirmed `provider`'s disclosure — what is
     /// sent, and to whom (Story 3.6). Idempotent. Returns the resulting

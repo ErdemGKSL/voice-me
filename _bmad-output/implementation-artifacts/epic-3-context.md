@@ -20,9 +20,9 @@ The app finds its own missing runtime dependencies and fixes them with one click
 - Story 3.10: Give Backends Their Own Settings Tab
 - Story 3.11: Choose the Speech Language per Backend
 - Story 3.12: Speak Instantly With eSpeak NG on Linux
-- Story 3.13: Speak Naturally and Instantly With Piper on Linux
-- Story 3.14: Speak Instantly With the Windows Speech Engine
-- Story 3.15: Generate Through Azure Neural TTS
+- Story 3.13: Speak Instantly With the Windows Speech Engine
+- Story 3.14: Generate Through Azure Neural TTS
+- Story 3.15: Speak Naturally and Instantly With Piper on Linux
 - Story 3.16: Speak With Piper on Windows
 
 ## Requirements & Constraints
@@ -57,5 +57,5 @@ The app finds its own missing runtime dependencies and fixes them with one click
 
 - Stories 3.1, 3.2, 3.3 and 3.4 share one asset vocabulary in core, used by the check, the provisioning plan and the engine. Do not fork it.
 - Story 3.8 blocks the GPU backends (3.9, and CUDA/WebGPU provisioning in 3.2). It does not block CPU. When 3.8 lands, it should only swap URLs in the pinned source table.
-- Stories 3.10 and 3.11 depend on 3.5, 3.6 and 3.7. Stories 3.12–3.16 add entries to the Backend tab. 3.13 (Piper) extracts `voice-me-espeak` from 3.12's crate.
+- Stories 3.10 and 3.11 depend on 3.5, 3.6 and 3.7. Stories 3.12–3.16 add entries to the Backend tab. 3.15 (Piper, next up) extracts `voice-me-espeak` from 3.12's crate.
 - Windows items depend on Epic 2's Windows tray and hotkey work and on Story 2.8 (Windows virtual mic control surface, still unresolved) before they can be verified by hand.

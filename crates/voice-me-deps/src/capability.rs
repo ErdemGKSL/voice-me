@@ -328,6 +328,18 @@ pub fn capability_row(request: &CheckRequest, probe: &dyn GpuProbe) -> Option<De
                         provider.label()
                     ),
                 )),
+                // Story 3.14: key → region → voice, and nothing probed —
+                // the voice list is fetched by the composition root, not
+                // by the check.
+                RemoteProvider::Azure if !request.has_region => Some(cannot_run(
+                    selection,
+                    "Azure has no region — add one in Settings → Backend.",
+                )),
+                RemoteProvider::Azure if !request.has_voice => Some(cannot_run(
+                    selection,
+                    "Azure has no voice selected — pick one in Settings → Backend.",
+                )),
+                RemoteProvider::Azure => None,
             }
         }
         // Story 3.12: on Linux the System voice's readiness is the eSpeak
@@ -525,6 +537,8 @@ mod tests {
                 target,
             },
             has_api_key: false,
+            has_region: false,
+            has_voice: false,
         }
     }
 
@@ -533,6 +547,8 @@ mod tests {
             backend: SpeechBackend::CPU,
             selection: BackendSelection::Remote(RemoteProvider::DeepInfra),
             has_api_key,
+            has_region: false,
+            has_voice: false,
         }
     }
 
@@ -708,6 +724,8 @@ mod tests {
             backend: SpeechBackend::CPU,
             selection: BackendSelection::SystemVoice,
             has_api_key: false,
+            has_region: false,
+            has_voice: false,
         }
     }
 
@@ -756,6 +774,37 @@ mod tests {
             &row,
             "Remote generation through fal.ai arrives in a later voice-me release",
         );
+    }
+
+    fn azure(has_api_key: bool, has_region: bool, has_voice: bool) -> CheckRequest {
+        CheckRequest {
+            backend: SpeechBackend::CPU,
+            selection: BackendSelection::Remote(RemoteProvider::Azure),
+            has_api_key,
+            has_region,
+            has_voice,
+        }
+    }
+
+    /// Story 3.14: key, then region, then voice — each its own blocking
+    /// row, and nothing probed.
+    #[test]
+    fn azure_blocks_on_key_then_region_then_voice() {
+        let probe = good_gpu();
+        let row = capability_row(&azure(false, false, false), &probe).unwrap();
+        assert_blocks(
+            &row,
+            "Azure has no API key — add one in Settings → Backend.",
+        );
+        let row = capability_row(&azure(true, false, false), &probe).unwrap();
+        assert_blocks(&row, "Azure has no region — add one in Settings → Backend.");
+        let row = capability_row(&azure(true, true, false), &probe).unwrap();
+        assert_blocks(
+            &row,
+            "Azure has no voice selected — pick one in Settings → Backend.",
+        );
+        assert_eq!(capability_row(&azure(true, true, true), &probe), None);
+        assert_eq!(probe.asked.load(Ordering::SeqCst), 0);
     }
 
     /// The deadline wrapper hands back what the probe returned.

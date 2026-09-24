@@ -529,7 +529,7 @@ So that I pick a kind of backend, then one backend, and see only what that one n
 
 **Given** Settings is open
 **When** I open the Backend tab
-**Then** I choose Local or Remote first, then a backend of that kind (Local: Chatterbox — the bundled CPU runtime and each added runtime's targets — and the instant System voice from Story 3.12/3.14, and Piper from 3.13/3.16, once built; Remote: DeepInfra, fal.ai, Azure)
+**Then** I choose Local or Remote first, then a backend of that kind (Local: Chatterbox — the bundled CPU runtime and each added runtime's targets — and the instant System voice from Story 3.12/3.13, and Piper from 3.15/3.16, once built; Remote: DeepInfra, fal.ai, Azure)
 **And** only the selected backend's options appear — added runtimes for Local; API key with its plaintext notice, and remote sample state for a cloning provider
 **And** the Selected / Active lines and the "CPU mode" badge move here unchanged (AD-9, UX-DR18)
 **And** Settings → Dependencies keeps only dependency rows and the speech-blocking capability row, which links to the Backend tab (UX-DR23)
@@ -567,7 +567,39 @@ So that a line is spoken the moment I press Enter, even without the model downlo
 **And** `espeak-ng` missing from PATH is a dependency row with the distro's install command as manual steps, and blocks speech while this backend is selected (Story 3.4)
 **And** a failure (non-zero exit, timeout, unreadable output) is one notification naming eSpeak NG and the reason
 
-### Story 3.13: Speak Naturally and Instantly With Piper on Linux
+### Story 3.13: Speak Instantly With the Windows Speech Engine
+
+As Erdem,
+I want an instant local voice on Windows,
+So that Windows gets the same no-download, no-key option Linux has.
+
+**Acceptance Criteria:**
+
+**Given** I select Local → System voice in Settings → Backend on Windows
+**When** I perform a Speak Action
+**Then** `voice-me-tts-system-windows` generates it with WinRT `SpeechSynthesizer::SynthesizeTextToStreamAsync` — never to the speaker — decoded and resampled to 24 kHz mono f32 (AD-11)
+**And** the speech language and voice lists come from the installed voices (`SpeechSynthesizer::AllVoices`); a language with no installed voice is a speech-blocking row naming Windows' steps to add one
+**And** it is labelled "stock voice", never receives the Reference Voice Sample, opens no socket and needs no disclosure
+**And** the crate compiles and its unit tests pass on CI's Windows job; manual verification waits until the Windows app can start (Story 2.8, tray)
+
+### Story 3.14: Generate Through Azure Neural TTS
+
+As Erdem,
+I want to use Azure's standard neural voices with my own key,
+So that I have a fast remote option even when I don't need my cloned voice.
+
+**Acceptance Criteria:**
+
+**Given** I select Remote → Azure in Settings → Backend
+**When** I enter my key and region and open the voice picker
+**Then** the voice list is fetched from Azure with the key alone — the one request allowed before the disclosure (AD-13) — and filtered to the selected locale
+**And** Azure is a stock-voice `SpeechProvider` in `voice-me-tts-remote` behind the same `TtsPort`; it never receives the Reference Voice Sample and shows no "sample held on provider" line
+**And** before the first line, the one-time disclosure names Azure, lists the typed text, the language and the voice name, and says speech will be in a Microsoft voice, not mine; core enforces it (FR10)
+**And** generation requests SSML with `riff-24khz-16bit-mono-pcm`, which plays through the Virtual Microphone unchanged (AD-11)
+**And** no key, no region, or no voice selected is a speech-blocking capability row naming what is missing; a provider failure (rejected key, timeout, provider error) is one notification naming Azure and the reason, never re-sent
+**And** the key stays plaintext-with-notice and out of logs; the region is stored beside it
+
+### Story 3.15: Speak Naturally and Instantly With Piper on Linux
 
 As Erdem,
 I want a natural-sounding on-device voice that speaks as fast as eSpeak NG,
@@ -585,38 +617,6 @@ So that I get a usable voice from the first run without a 1.56 GB download or a 
 **And** with no backend in settings, core resolves Piper (AD-9); an explicit selection is never changed; Settings does not auto-open for a missing Reference Voice Sample while Piper is selected
 **And** `voice-me-tts-system-linux` now uses `voice-me-espeak` too, with Story 3.12's behaviour unchanged
 **And** a failure (phonemizer, unknown phoneme, inference) is one notification naming Piper and the reason
-
-### Story 3.14: Speak Instantly With the Windows Speech Engine
-
-As Erdem,
-I want an instant local voice on Windows,
-So that Windows gets the same no-download, no-key option Linux has.
-
-**Acceptance Criteria:**
-
-**Given** I select Local → System voice in Settings → Backend on Windows
-**When** I perform a Speak Action
-**Then** `voice-me-tts-system-windows` generates it with WinRT `SpeechSynthesizer::SynthesizeTextToStreamAsync` — never to the speaker — decoded and resampled to 24 kHz mono f32 (AD-11)
-**And** the speech language and voice lists come from the installed voices (`SpeechSynthesizer::AllVoices`); a language with no installed voice is a speech-blocking row naming Windows' steps to add one
-**And** it is labelled "stock voice", never receives the Reference Voice Sample, opens no socket and needs no disclosure
-**And** the crate compiles and its unit tests pass on CI's Windows job; manual verification waits until the Windows app can start (Story 2.8, tray)
-
-### Story 3.15: Generate Through Azure Neural TTS
-
-As Erdem,
-I want to use Azure's standard neural voices with my own key,
-So that I have a fast remote option even when I don't need my cloned voice.
-
-**Acceptance Criteria:**
-
-**Given** I select Remote → Azure in Settings → Backend
-**When** I enter my key and region and open the voice picker
-**Then** the voice list is fetched from Azure with the key alone — the one request allowed before the disclosure (AD-13) — and filtered to the selected locale
-**And** Azure is a stock-voice `SpeechProvider` in `voice-me-tts-remote` behind the same `TtsPort`; it never receives the Reference Voice Sample and shows no "sample held on provider" line
-**And** before the first line, the one-time disclosure names Azure, lists the typed text, the language and the voice name, and says speech will be in a Microsoft voice, not mine; core enforces it (FR10)
-**And** generation requests SSML with `riff-24khz-16bit-mono-pcm`, which plays through the Virtual Microphone unchanged (AD-11)
-**And** no key, no region, or no voice selected is a speech-blocking capability row naming what is missing; a provider failure (rejected key, timeout, provider error) is one notification naming Azure and the reason, never re-sent
-**And** the key stays plaintext-with-notice and out of logs; the region is stored beside it
 
 ### Story 3.16: Speak With Piper on Windows
 

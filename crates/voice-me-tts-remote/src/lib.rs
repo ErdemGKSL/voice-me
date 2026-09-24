@@ -17,9 +17,16 @@
 //! sample file's SHA-256, so a re-recorded sample is uploaded afresh (and
 //! the stale voice deleted, best effort).
 //!
+//! Azure (Story 3.14) is a stock-voice provider and sits beside that
+//! abstraction rather than behind it: [`AzureTtsAdapter`] never touches the
+//! Reference Voice Sample, and [`list_azure_voices`] is the one call made
+//! before the disclosure — the key only, no text.
+//!
 //! AD-8: this and `voice-me-deps` are the only crates that open sockets.
 
+mod azure;
 mod deepinfra;
+mod http;
 mod provider;
 mod wav;
 
@@ -28,9 +35,13 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest as _, Sha256};
 use voice_me_core::{
-    AudioBuffer, RemoteProvider, RemoteSample, SettingsStore, TtsPort, VoiceMeError,
+    AudioBuffer, RemoteProvider, RemoteSample, SettingsStore, StockVoice, TtsPort, VoiceMeError,
 };
 
+pub use azure::{
+    AZURE_KEY_HEADER, AZURE_OUTPUT_FORMAT, AZURE_SPEECH_PATH, AZURE_VOICES_PATH, Azure,
+    AzureDeadlines, ssml,
+};
 pub use deepinfra::{
     DEEPINFRA_BASE_URL, DEEPINFRA_MODEL, Deadlines, DeepInfra, UPLOAD_DESCRIPTION, UPLOAD_NAME,
 };
@@ -201,7 +212,102 @@ pub fn delete_held_sample(
             "{} does not hold voice samples in this voice-me release.",
             provider.label()
         ))),
+        RemoteProvider::Azure => Err(VoiceMeError::Other(format!(
+            "{} holds no voice samples — it speaks in a stock Microsoft voice.",
+            provider.label()
+        ))),
     }
+}
+
+/// `TtsPort` over Azure Neural TTS (Story 3.14): a stock Microsoft voice.
+///
+/// The key and region are read from the store at every `generate`, so a
+/// change in Settings reaches the very next line. `reference_clip` is never
+/// read — Azure never receives the Reference Voice Sample.
+pub struct AzureTtsAdapter {
+    azure: Azure,
+    store: SharedSettingsStore,
+}
+
+impl AzureTtsAdapter {
+    pub fn new(azure: Azure, store: SharedSettingsStore) -> Self {
+        Self { azure, store }
+    }
+}
+
+impl TtsPort for AzureTtsAdapter {
+    /// Nothing to build: a remote provider has no sessions.
+    fn warm_up(&self) -> Result<(), VoiceMeError> {
+        Ok(())
+    }
+
+    /// Always ready — there is no engine start to warn about.
+    fn is_ready(&self) -> bool {
+        true
+    }
+
+    fn generate(
+        &self,
+        text: &str,
+        _reference_clip: Option<&Path>,
+        language: &str,
+        voice: Option<&str>,
+    ) -> Result<AudioBuffer, VoiceMeError> {
+        let provider = RemoteProvider::Azure;
+        let label = provider.label();
+        if text.trim().is_empty() {
+            return Err(VoiceMeError::EmptyText);
+        }
+        let refuse = |reason: &str| VoiceMeError::Provider {
+            provider: label.to_string(),
+            reason: reason.to_string(),
+        };
+        let Some(voice) = voice.filter(|voice| !voice.trim().is_empty()) else {
+            return Err(refuse(
+                "Azure has no voice selected — pick one in Settings → Backend.",
+            ));
+        };
+        let key = api_key(self.store.as_ref(), provider)?;
+        let Some(region) = self.store.load()?.azure_region else {
+            return Err(refuse(
+                "Azure has no region — add one in Settings → Backend.",
+            ));
+        };
+
+        // One line at a time (AD-10), like every remote provider.
+        let _held = lock_samples();
+        let bytes = block_on(async {
+            self.azure
+                .synthesize(&key, &region, language, voice, text)
+                .await
+                .map_err(|error| error.into_domain(provider))
+        })?;
+        decode_wav(&bytes).map_err(|error| VoiceMeError::Provider {
+            provider: label.to_string(),
+            reason: format!("{label} returned audio voice-me could not read: {error}"),
+        })
+    }
+}
+
+/// Azure's voice list for `region`, with `key` (Story 3.14, D1): the only
+/// Azure call made before the disclosure — the key, and no text. Blocking;
+/// the caller runs it off the main thread. A failure names Azure.
+pub fn list_azure_voices(key: &str, region: &str) -> Result<Vec<StockVoice>, VoiceMeError> {
+    list_azure_voices_with(&Azure::new(), key, region)
+}
+
+/// [`list_azure_voices`] against a given [`Azure`] (a mock, in tests).
+pub fn list_azure_voices_with(
+    azure: &Azure,
+    key: &str,
+    region: &str,
+) -> Result<Vec<StockVoice>, VoiceMeError> {
+    block_on(async {
+        azure
+            .list_voices(key, region)
+            .await
+            .map_err(|error| error.into_domain(RemoteProvider::Azure))
+    })
 }
 
 /// [`delete_held_sample`] against a given provider (a mock, in tests).
@@ -269,6 +375,8 @@ fn block_on<T>(future: impl Future<Output = Result<T, VoiceMeError>>) -> Result<
     }
 }
 
+#[cfg(test)]
+mod azure_tests;
 #[cfg(test)]
 mod mock;
 #[cfg(test)]

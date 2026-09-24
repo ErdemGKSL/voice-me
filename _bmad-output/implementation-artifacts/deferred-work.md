@@ -150,11 +150,11 @@
   summary: Implement the Windows `NotificationPort` (toast notifications) in `voice-me-notify-windows`, which still returns "not implemented on Windows yet".
   evidence: Split from the 2026-09-23 "build all unimplemented Windows parts" intent; the user chose to do the Windows tray and hotkey first. A toast also needs a registered AppUserModelID, which is an installer concern.
 - source_spec: none
-  summary: Story 3.14 (numbered 3.13 until 2026-09-24), speak instantly with the Windows speech engine (`voice-me-tts-system-windows` over WinRT `SpeechSynthesizer`).
+  summary: Story 3.13, speak instantly with the Windows speech engine (`voice-me-tts-system-windows` over WinRT `SpeechSynthesizer`).
   evidence: Split from the 2026-09-23 "build all unimplemented Windows parts" intent; deferred until the Windows tray and hotkey let the app start on Windows, so it can be verified by hand.
 - source_spec: none
   summary: Story 2.8, the Windows Virtual Microphone control-surface spike (`voice-me-audio-windows` over the signed Virtual-Audio-Driver).
-  evidence: Split from the 2026-09-23 "build all unimplemented Windows parts" intent; it needs the kernel driver installed by hand on a Windows test machine, and it comes last in the agreed order (tray+hotkey, notifications, 3.14, 2.8).
+  evidence: Split from the 2026-09-23 "build all unimplemented Windows parts" intent; it needs the kernel driver installed by hand on a Windows test machine, and it comes last in the agreed order (tray+hotkey, notifications, 3.13, 2.8).
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-2-2-3-windows-tray-and-global-hotkey.md`
   summary: No test checks that the tray's "Settings…" action sends `AppEvent::SettingsRequested`, on Windows or Linux.
   evidence: `voice-me-tray-windows`'s tests cover only the menu labels and action names. `voice-me-tray-linux` has no tests. Dropping `cx.on_action(on_settings)` would pass CI. Closing the gap needs a GPUI `TestAppContext` harness that dispatches the action and reads the channel, for both adapters.
@@ -170,3 +170,9 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-3-12-speak-instantly-with-espeak-ng-on-linux.md`
   summary: Nothing tests the root's Speak Action state assembly (`refresh_system_voices` → `current_state(…, &system_voices)` → `speak`).
   evidence: It is built inline in `fn main`, so dropping the voice list from `current_state` would pass CI. The fix is to move the assembly into a testable function, alongside 3.11's `backend_actions` deferral.
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-14-generate-through-azure-neural-tts.md`
+  summary: Nothing tests the root's Azure closures: the `run_check` calls after a language or voice save, `drop_azure_voices`, and the stale-fetch generation guard.
+  evidence: They live inside `fn main` in `crates/voice-me-app/src/main.rs`. Deleting any of them passes CI. This goes with the existing `backend_actions` deferrals from 3.11 and 3.12: extract the dispatch, or a small voice-cache struct, into something testable.
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-14-generate-through-azure-neural-tts.md`
+  summary: Unverified: Azure's disclosure (an extra note and a long voice item) may not fit `OVERLAY_DISCLOSURE_HEIGHT` (medium if true).
+  evidence: No test renders `confirm_disclosure` with Azure's text. The manual check in the spec (confirm the disclosure with a real key) settles it. If it clips, raise the height in `crates/voice-me-app/src/main.rs`.

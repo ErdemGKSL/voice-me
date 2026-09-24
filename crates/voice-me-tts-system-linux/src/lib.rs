@@ -23,7 +23,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use voice_me_core::{AudioBuffer, SystemVoice, TtsPort, VoiceMeError};
+use voice_me_core::{AudioBuffer, StockVoice, TtsPort, VoiceMeError};
 
 pub use os_release::{GENERIC_INSTALL_STEP, install_command_for, install_step};
 pub use voices::parse_voices;
@@ -65,7 +65,7 @@ fn is_executable(path: &Path) -> bool {
 }
 
 /// The voices `espeak-ng --voices` lists, run the same bounded way.
-pub fn list_voices() -> Result<Vec<SystemVoice>, VoiceMeError> {
+pub fn list_voices() -> Result<Vec<StockVoice>, VoiceMeError> {
     SystemVoiceLinux::new().voices()
 }
 
@@ -102,7 +102,7 @@ impl SystemVoiceLinux {
     }
 
     /// The voices the program lists.
-    pub fn voices(&self) -> Result<Vec<SystemVoice>, VoiceMeError> {
+    pub fn voices(&self) -> Result<Vec<StockVoice>, VoiceMeError> {
         let output = process::run(
             &self.program,
             &[OsString::from("--voices")],

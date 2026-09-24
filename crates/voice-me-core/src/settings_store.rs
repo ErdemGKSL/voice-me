@@ -15,9 +15,10 @@ use serde::{Deserialize, Serialize};
 use crate::error::VoiceMeError;
 use crate::ports::SettingsStore;
 use crate::state::{
-    ActiveBackend, ApiKeys, AppState, BackendSelection, DEFAULT_SPEECH_LANGUAGE, DependencyOutcome,
-    LanguageBackend, LocalRuntime, RemoteProvider, RemoteSample, SpeechBackend,
-    SpeechExecutionTarget, SpeechLanguages, SpeechVoices,
+    ActiveBackend, ApiKeys, AppState, BackendSelection, DEFAULT_AZURE_LOCALE,
+    DEFAULT_SPEECH_LANGUAGE, DependencyOutcome, LanguageBackend, LocalRuntime, RemoteProvider,
+    RemoteSample, SpeechBackend, SpeechExecutionTarget, SpeechLanguages, SpeechVoices,
+    parse_azure_region,
 };
 
 const SETTINGS_FILE_NAME: &str = "settings.toml";
@@ -71,6 +72,15 @@ struct SettingsFile {
     /// the fields above: a malformed table loses the keys, not the file.
     #[serde(default, deserialize_with = "lenient_keys")]
     api_keys: ApiKeys,
+    /// Story 3.14: the Azure region, next to the key. Not a secret. Lenient:
+    /// an unreadable value is no region, and one that is not `[a-z0-9]+`
+    /// is dropped on load, so it can never change the host.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    azure_region: Option<String>,
     /// Story 3.6: the providers whose disclosure the user confirmed. An
     /// unreadable entry drops out — at worst the user is asked again.
     #[serde(
@@ -121,6 +131,13 @@ struct SpeechLanguagesFile {
         skip_serializing_if = "Option::is_none"
     )]
     system_voice: Option<String>,
+    /// Story 3.14: an Azure locale. Never seeded by the legacy key.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    azure: Option<String>,
 }
 
 impl SpeechLanguagesFile {
@@ -129,6 +146,7 @@ impl SpeechLanguagesFile {
             LanguageBackend::Local => Some(&mut self.local),
             LanguageBackend::Remote(RemoteProvider::DeepInfra) => Some(&mut self.deepinfra),
             LanguageBackend::Remote(RemoteProvider::FalAi) => None,
+            LanguageBackend::Remote(RemoteProvider::Azure) => Some(&mut self.azure),
             LanguageBackend::SystemVoice => Some(&mut self.system_voice),
         }
     }
@@ -140,6 +158,10 @@ impl SpeechLanguagesFile {
             local: or_default(&self.local),
             deepinfra: or_default(&self.deepinfra),
             system_voice: or_default(&self.system_voice),
+            azure: self
+                .azure
+                .clone()
+                .unwrap_or_else(|| DEFAULT_AZURE_LOCALE.to_string()),
         }
     }
 }
@@ -149,9 +171,11 @@ impl SpeechLanguagesFile {
 /// ```toml
 /// [speech_voices]
 /// system_voice = "sit/yue-Latn-jyutping"
+/// azure = "tr-TR-EmelNeural"
 /// ```
 ///
-/// An absent key is the language's top-priority voice.
+/// An absent key is the language's top-priority voice — for Azure, no
+/// voice at all (D4).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SpeechVoicesFile {
     #[serde(
@@ -160,12 +184,20 @@ struct SpeechVoicesFile {
         skip_serializing_if = "Option::is_none"
     )]
     system_voice: Option<String>,
+    /// Story 3.14.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    azure: Option<String>,
 }
 
 impl SpeechVoicesFile {
     fn entry(&mut self, backend: LanguageBackend) -> Option<&mut Option<String>> {
         match backend {
             LanguageBackend::SystemVoice => Some(&mut self.system_voice),
+            LanguageBackend::Remote(RemoteProvider::Azure) => Some(&mut self.azure),
             _ => None,
         }
     }
@@ -173,6 +205,7 @@ impl SpeechVoicesFile {
     fn to_state(&self) -> SpeechVoices {
         SpeechVoices {
             system_voice: self.system_voice.clone(),
+            azure: self.azure.clone(),
         }
     }
 }
@@ -296,12 +329,14 @@ impl Default for SettingsFile {
                 local: Some(DEFAULT_SPEECH_LANGUAGE.to_string()),
                 deepinfra: Some(DEFAULT_SPEECH_LANGUAGE.to_string()),
                 system_voice: Some(DEFAULT_SPEECH_LANGUAGE.to_string()),
+                azure: Some(DEFAULT_AZURE_LOCALE.to_string()),
             },
             speech_voices: SpeechVoicesFile::default(),
             selected_mic_device: None,
             backend_selection: None,
             local_runtimes: Vec::new(),
             api_keys: ApiKeys::default(),
+            azure_region: None,
             confirmed_disclosures: Vec::new(),
             remote_samples: Vec::new(),
         }
@@ -378,6 +413,18 @@ impl FileSettingsStore {
             .speech_languages
             .system_voice
             .get_or_insert_with(|| DEFAULT_SPEECH_LANGUAGE.to_string());
+        // Story 3.14: Azure starts at its default locale, whatever the
+        // legacy key said.
+        settings
+            .speech_languages
+            .azure
+            .get_or_insert_with(|| DEFAULT_AZURE_LOCALE.to_string());
+        // A hand-edited region that is not `[a-z0-9]+` is no region: it
+        // must never reach the host name.
+        settings.azure_region = settings
+            .azure_region
+            .as_deref()
+            .and_then(|region| parse_azure_region(region).ok().flatten());
         Ok(settings)
     }
 
@@ -427,6 +474,10 @@ impl FileSettingsStore {
             dependencies: DependencyOutcome::default(),
             // Read from the engine by the composition root, never a file.
             system_voices: Vec::new(),
+            azure_region: settings.azure_region,
+            // Fetched from Azure and cached by the composition root for
+            // the session, never a file.
+            azure_voices: Vec::new(),
         }
     }
 }
@@ -507,7 +558,11 @@ impl SettingsStore for FileSettingsStore {
                 backend.label()
             )));
         };
-        let changed = entry.as_deref() != Some(code);
+        // Story 3.14: Azure's locales compare case-insensitively, so
+        // `tr-tr` → `tr-TR` keeps the voice.
+        let changed = !entry
+            .as_deref()
+            .is_some_and(|saved| saved.eq_ignore_ascii_case(code));
         *entry = Some(code.to_string());
         // Story 3.12: a voice belongs to one language, so a new System
         // voice language clears the stored voice.
@@ -549,6 +604,17 @@ impl SettingsStore for FileSettingsStore {
     ) -> Result<AppState, VoiceMeError> {
         let mut settings = self.read_settings_file()?;
         settings.api_keys.set(provider, key.map(str::to_string));
+        self.write_settings_file(&settings)?;
+        Ok(self.build_state(settings))
+    }
+
+    fn save_azure_region(&self, region: Option<&str>) -> Result<AppState, VoiceMeError> {
+        let region = match region {
+            Some(region) => parse_azure_region(region).map_err(VoiceMeError::Other)?,
+            None => None,
+        };
+        let mut settings = self.read_settings_file()?;
+        settings.azure_region = region;
         self.write_settings_file(&settings)?;
         Ok(self.build_state(settings))
     }
@@ -1191,5 +1257,79 @@ mod tests {
 
         assert_eq!(state.api_keys, ApiKeys::default());
         assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
+    }
+
+    /// Story 3.14: the region, locale and voice round trip; a new locale
+    /// clears the voice; a bad region is refused and nothing is saved.
+    #[test]
+    fn azure_region_locale_and_voice_round_trip() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = store_in(config_dir.path(), data_dir.path());
+        let azure = LanguageBackend::Remote(RemoteProvider::Azure);
+        let state = store.load().unwrap();
+        assert_eq!(state.speech_languages.azure, "tr-TR");
+        assert_eq!(state.speech_voices.azure, None);
+        assert_eq!(state.azure_region, None);
+
+        let state = store.save_azure_region(Some("  WestEurope ")).unwrap();
+        assert_eq!(state.azure_region.as_deref(), Some("westeurope"));
+        assert!(store.save_azure_region(Some("west europe!")).is_err());
+        store
+            .save_api_key(RemoteProvider::Azure, Some("az-key"))
+            .unwrap();
+        store
+            .save_speech_voice(azure, Some("tr-TR-EmelNeural"))
+            .unwrap();
+
+        let reloaded = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+        assert_eq!(reloaded.azure_region.as_deref(), Some("westeurope"));
+        assert_eq!(reloaded.api_keys.get(RemoteProvider::Azure), Some("az-key"));
+        assert_eq!(
+            reloaded.speech_voices.azure.as_deref(),
+            Some("tr-TR-EmelNeural")
+        );
+        assert!(!format!("{reloaded:?}").contains("az-key"));
+        let written = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
+        assert!(
+            written.contains("azure_region = \"westeurope\""),
+            "{written}"
+        );
+
+        // A case-only change is the same locale, and keeps the voice.
+        let state = store.save_speech_language(azure, "tr-tr").unwrap();
+        assert_eq!(
+            state.speech_voices.azure.as_deref(),
+            Some("tr-TR-EmelNeural")
+        );
+
+        // The Change locale row: a new locale clears the voice.
+        let state = store.save_speech_language(azure, "en-US").unwrap();
+        assert_eq!(state.speech_languages.azure, "en-US");
+        assert_eq!(state.speech_voices.azure, None);
+        assert_eq!(state.speech_languages.system_voice, "tr", "untouched");
+
+        // `None` removes the region.
+        assert_eq!(store.save_azure_region(None).unwrap().azure_region, None);
+    }
+
+    #[test]
+    fn a_hand_edited_bad_region_loads_as_no_region() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_dir.path().join(SETTINGS_FILE_NAME),
+            "hotkey = \"Ctrl+Alt+KeyV\"\nazure_region = \"evil.example/\"\nspeech_language = \"en\"\n",
+        )
+        .unwrap();
+
+        let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+
+        assert_eq!(state.azure_region, None);
+        assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
+        assert_eq!(
+            state.speech_languages.azure, "tr-TR",
+            "the legacy key never seeds Azure"
+        );
     }
 }

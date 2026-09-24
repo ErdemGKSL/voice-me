@@ -1236,6 +1236,8 @@ mod tests {
             ),
             selection: panel.selection.clone(),
             has_api_key: false,
+            has_region: false,
+            has_voice: false,
         };
         let panel = BackendPanel {
             check_request: request.clone(),

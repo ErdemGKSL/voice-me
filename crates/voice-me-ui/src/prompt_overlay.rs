@@ -27,6 +27,10 @@
 //! becomes the ordinary text input; cancelling dismisses it and records
 //! nothing. Core's own gate stays the enforcement — this is only where the
 //! user sees and answers the question.
+//!
+//! Story 3.14: what is listed depends on the provider ([`DisclosureText`]):
+//! Azure is sent the text, the language and the voice name — never a
+//! sample — and speaks in a Microsoft voice, not the user's.
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -43,7 +47,7 @@ use gpui_kit::{
     MouseDownEvent, ParentElement as _, Render, SharedString, Styled as _, Subscription,
     TestSupportExt as _, Window, div, ease_out_quint, px,
 };
-use voice_me_core::{AppEvent, AppEventSender};
+use voice_me_core::{AppEvent, AppEventSender, RemoteProvider};
 
 /// Placeholder copy for the one and only field.
 const PLACEHOLDER: &str = "Type what you want to say…";
@@ -82,12 +86,55 @@ pub const DISCLOSURE_ITEMS: [&str; 3] = [
      in Settings → Backend or record a new sample)",
 ];
 
+/// What the confirm-first shape lists for one provider: exactly what
+/// leaves the machine, and — for a stock-voice provider — a closing line
+/// saying whose voice the speech will be in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisclosureText {
+    pub items: Vec<String>,
+    pub note: Option<String>,
+}
+
+impl DisclosureText {
+    /// The disclosure for `provider`, whose speech language is `language`
+    /// and, for a stock-voice provider, whose voice is `voice`.
+    ///
+    /// A cloning provider gets [`DISCLOSURE_ITEMS`]. Azure (Story 3.14, D2)
+    /// gets the typed text, the language and the voice name, and says the
+    /// speech will be in a Microsoft voice, not the user's.
+    pub fn for_provider(provider: RemoteProvider, language: &str, voice: Option<&str>) -> Self {
+        match provider {
+            RemoteProvider::Azure => Self {
+                items: vec![
+                    "the text you type".to_string(),
+                    format!("the speech language: {}", language.trim()),
+                    format!("the voice name: {}", voice.unwrap_or("none chosen")),
+                ],
+                note: Some(
+                    "Speech will be in this Microsoft voice, not yours. Your Reference Voice \
+                     Sample is never sent."
+                        .to_string(),
+                ),
+            },
+            RemoteProvider::DeepInfra | RemoteProvider::FalAi => Self {
+                items: DISCLOSURE_ITEMS
+                    .iter()
+                    .map(|item| item.to_string())
+                    .collect(),
+                note: None,
+            },
+        }
+    }
+}
+
 /// Called once when the user confirms the disclosure (Story 3.6).
 pub type ConfirmDisclosure = Rc<dyn Fn(&mut App)>;
 
-/// The confirm-first state: which provider, and who records the answer.
+/// The confirm-first state: which provider, what it is sent, and who
+/// records the answer.
 struct Disclosure {
     provider: SharedString,
+    text: DisclosureText,
     on_confirm: ConfirmDisclosure,
 }
 
@@ -131,12 +178,14 @@ impl PromptOverlayView {
     }
 
     /// Build the confirm-first shape (Story 3.6, Decision 1): name
-    /// `provider` and what would be sent to it. **Send to <provider>** /
-    /// `Enter` calls `on_confirm` once and turns this into the ordinary
-    /// overlay; **Cancel** / `Escape` dismisses it and records nothing.
+    /// `provider` and what would be sent to it (`text`, per provider since
+    /// Story 3.14). **Send to <provider>** / `Enter` calls `on_confirm`
+    /// once and turns this into the ordinary overlay; **Cancel** / `Escape`
+    /// dismisses it and records nothing.
     pub fn confirm_disclosure(
         events: AppEventSender,
         provider: impl Into<SharedString>,
+        text: DisclosureText,
         on_confirm: ConfirmDisclosure,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -144,6 +193,7 @@ impl PromptOverlayView {
         let mut view = Self::build(events, None, window, cx);
         view.disclosure = Some(Disclosure {
             provider: provider.into(),
+            text,
             on_confirm,
         });
         // As in the blocked shape: no `Input` is rendered yet, so the frame
@@ -274,7 +324,7 @@ impl PromptOverlayView {
     /// that replaces it (Story 3.4).
     fn body(&self, cx: &mut Context<Self>) -> AnyElement {
         if let Some(disclosure) = self.disclosure.as_ref() {
-            return self.disclosure_body(&disclosure.provider, cx);
+            return self.disclosure_body(&disclosure.provider, &disclosure.text, cx);
         }
         let Some(blocker) = self.blocker.clone() else {
             return Input::new(&self.input)
@@ -317,12 +367,25 @@ impl PromptOverlayView {
 
 impl PromptOverlayView {
     /// The confirm-first body: who, exactly what, and the two answers.
-    fn disclosure_body(&self, provider: &SharedString, cx: &mut Context<Self>) -> AnyElement {
-        let items = DISCLOSURE_ITEMS.map(|item| {
+    fn disclosure_body(
+        &self,
+        provider: &SharedString,
+        text: &DisclosureText,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let items = text.items.iter().map(|item| {
             div()
                 .text_size(px(12.))
                 .text_color(cx.theme().popover_foreground)
                 .child(format!("• {item}"))
+        });
+        let note = text.note.clone().map(|note| {
+            div()
+                .id("prompt-overlay-disclosure-note")
+                .test_support()
+                .text_size(px(12.))
+                .text_color(cx.theme().muted_foreground)
+                .child(note)
         });
         v_flex()
             .id("prompt-overlay-disclosure")
@@ -342,6 +405,7 @@ impl PromptOverlayView {
                     .child(format!("voice-me sends {provider} only:")),
             )
             .children(items)
+            .children(note)
             .child(
                 h_flex()
                     .pt_1()
@@ -561,6 +625,7 @@ mod tests {
                 PromptOverlayView::confirm_disclosure(
                     event_tx.clone(),
                     "DeepInfra",
+                    DisclosureText::for_provider(RemoteProvider::DeepInfra, "tr", None),
                     on_confirm.clone(),
                     window,
                     cx,
@@ -918,5 +983,36 @@ mod tests {
 
         settle(cx);
         assert!(harness.window_is_gone(cx));
+    }
+
+    /// Story 3.14 (D2): Azure's disclosure names the text, the language and
+    /// the voice, and says the speech is a Microsoft voice; DeepInfra's
+    /// still names the sample.
+    #[test]
+    fn the_disclosure_items_are_per_provider_and_name_azures_voice() {
+        let azure =
+            DisclosureText::for_provider(RemoteProvider::Azure, "tr-TR", Some("tr-TR-EmelNeural"));
+        assert_eq!(azure.items.len(), 3);
+        assert!(azure.items[0].contains("text you type"));
+        assert!(azure.items[1].contains("tr-TR"));
+        assert!(azure.items[2].contains("tr-TR-EmelNeural"));
+        assert!(
+            !azure.items.iter().any(|item| item.contains("Sample")),
+            "Azure is never sent the sample: {azure:?}"
+        );
+        assert!(
+            azure
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("Microsoft voice, not yours")
+        );
+
+        let deepinfra = DisclosureText::for_provider(RemoteProvider::DeepInfra, "tr", None);
+        assert_eq!(
+            deepinfra.items,
+            DISCLOSURE_ITEMS.map(str::to_string).to_vec()
+        );
+        assert_eq!(deepinfra.note, None);
     }
 }

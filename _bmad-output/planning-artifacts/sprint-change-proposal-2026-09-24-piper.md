@@ -6,6 +6,8 @@
 **Builds on:** `sprint-change-proposal-2026-09-23-instant-local.md` (eSpeak NG, Story 3.12 — now in review)
 **Status:** Approved by Erdem, 2026-09-24 — edits applied to PRD, architecture spine, EXPERIENCE.md, epics.md, sprint-status.yaml, epic-3-context.md and deferred-work.md
 
+**Revision (2026-09-24, on merging to `main`):** Azure was built as Story 3.14 on `main` while this proposal was open. The planned renumbering (Windows engine 3.13 → 3.14, Azure 3.14 → 3.15) is dropped. Piper on Linux becomes **3.15** and is still next up. Piper on Windows stays **3.16**.
+
 ---
 
 ## 1. Issue Summary
@@ -47,13 +49,13 @@ Piper is a neural stock voice that is nearly as fast as eSpeak NG and sounds nat
 |---|---|---|---|
 | 1.1–1.3 | Trigger and evidence | [x] | See §1 |
 | 2.1 | Current epic | [x] | Epic 3 can still be completed. It gains two stories |
-| 2.2 | Epic-level changes | [!] | New Story 3.13 (Piper on Linux, next up). The unbuilt Stories 3.13 (Windows speech engine) and 3.14 (Azure) become 3.14 and 3.15. New Story 3.16 (Piper on Windows) |
+| 2.2 | Epic-level changes | [!] | New Story 3.15 (Piper on Linux, next up) and Story 3.16 (Piper on Windows). No existing story is renumbered |
 | 2.3–2.4 | Other epics | [N/A] | Epic 1: Story 1.5's first-run voice-setup prompt already stays quiet for stock-voice backends (3.12). Epic 4 is unaffected |
-| 2.5 | Order | [!] | 3.12 → **3.13 Piper** → 3.14 Windows engine → 3.15 Azure → **3.16 Piper on Windows**, then 3.7 / 3.8 / 3.9 |
+| 2.5 | Order | [!] | **3.15 Piper** next (3.14 Azure is already built), then 3.13 Windows engine, **3.16 Piper on Windows**, then 3.7 / 3.8 / 3.9 |
 | 3.1 | PRD | [!] | FR-5, FR-7, FR-10 (**first-run default becomes Piper**), §6.1, §6.2, Glossary |
 | 3.2 | Architecture | [!] | AD-7 (backend table), AD-8, **AD-9 (the unset default)**, AD-12 (exception widened to phonemization, one shared runner), Stack, Structural seed, Capability map |
 | 3.3 | UX | [!] | The Backend selector gains "Piper — natural, instant"; the voice picker shows each voice's licence; new state rows |
-| 3.4 | Other | [!] | `sprint-status.yaml`, `epic-3-context.md` (story list and Piper decisions), `deferred-work.md` (a 3.13 → 3.14 reference). The `voice-me-tests` egress allowlist does not change |
+| 3.4 | Other | [!] | `sprint-status.yaml`, `epic-3-context.md` (story list and Piper decisions), `deferred-work.md` (unchanged). The `voice-me-tests` egress allowlist does not change |
 | 4.1 | Direct adjustment | Viable | Effort: Medium. Risk: Low on Linux (measured above) and Medium on Windows (cannot be verified here) |
 | 4.2–4.3 | Rollback / MVP review | Not needed | Additive. The only behaviour change is the first-run default |
 
@@ -84,8 +86,8 @@ Piper is a neural stock voice that is nearly as fast as eSpeak NG and sounds nat
 
 Decisions (P1–P3 by Erdem on 2026-09-24, P4–P7 recommended with this proposal):
 
-- **P1 — Linux now, Windows later.** Story 3.13 ships Piper on Linux. Story 3.16 adds Windows, where `voice-me-deps` provisions eSpeak NG (the official release, run as a separate program — see P5). That story is compile-and-unit-test on CI only, like 3.14.
-- **P2 — Piper is next (3.13).** Windows engine 3.13 → 3.14, Azure 3.14 → 3.15. Neither is built yet.
+- **P1 — Linux now, Windows later.** Story 3.15 ships Piper on Linux. Story 3.16 adds Windows, where `voice-me-deps` provisions eSpeak NG (the official release, run as a separate program — see P5). That story is compile-and-unit-test on CI only, like 3.13.
+- **P2 — Piper is next.** It is numbered **3.15** because Azure was built as 3.14 while this proposal was open (see the revision note), but it is the next story to build.
 - **P3 — Piper becomes the first-run default** where it is built. A new user hears a natural voice after a ~72 MB download (the 63 MB voice plus the 8.7 MB runtime), not a 1.56 GB one. Chatterbox, which is "your voice", is one selection away.
   - **Consequence:** a `settings.toml` with no backend selected now resolves to Piper, not CPU Chatterbox. An explicit selection is never rewritten.
   - The default voice matches the speech language: `tr_TR-dfki-medium` for Turkish.
@@ -186,21 +188,17 @@ NEW:
 
 ### 4.4 Epics — `epics.md`
 
-**Renumbering (both stories are unbuilt):**
-- "Story 3.13: Speak Instantly With the Windows Speech Engine" → **Story 3.14**
-- "Story 3.14: Generate Through Azure Neural TTS" → **Story 3.15**
-
-In Story 3.10, "System voice from Story 3.12/3.13" becomes "System voice from Story 3.12/3.14, and Piper from 3.13/3.16".
+**No renumbering.** In Story 3.10, "System voice from Story 3.12/3.13" becomes "System voice from Story 3.12/3.13, and Piper from 3.15/3.16".
 
 **Epic 3 scope note (both copies).** Append:
 > **2026-09-24 addendum:** Piper on-device neural voices are added — CPU-only on the shared ONNX Runtime, phonemes from the eSpeak NG program — and become the first-run default where available (Linux now, Windows in 3.16). See `sprint-change-proposal-2026-09-24-piper.md`.
 
 **FR5 / FR10 inventory lines.** Mirror the PRD edits in §4.1.
 
-**New story, inserted after 3.12:**
+**New story, appended after Azure (3.14):**
 
 ```
-### Story 3.13: Speak Naturally and Instantly With Piper on Linux
+### Story 3.15: Speak Naturally and Instantly With Piper on Linux
 
 As Erdem,
 I want a natural-sounding on-device voice that speaks as fast as eSpeak NG,
@@ -220,7 +218,7 @@ So that I get a usable voice from the first run without a 1.56 GB download or a 
 **And** a failure (phonemizer, unknown phoneme, inference) is one notification naming Piper and the reason
 ```
 
-**New story, appended after Azure:**
+**New story, appended after 3.15:**
 
 ```
 ### Story 3.16: Speak With Piper on Windows
@@ -241,17 +239,9 @@ So that Windows gets the same natural, instant default as Linux.
 
 ### 4.5 Sprint status — `sprint-status.yaml`
 
-OLD:
+After `3-14-generate-through-azure-neural-tts`, add:
 ```yaml
-  3-13-speak-instantly-with-the-windows-speech-engine: backlog
-  3-14-generate-through-azure-neural-tts: backlog
-```
-
-NEW:
-```yaml
-  3-13-speak-naturally-and-instantly-with-piper-on-linux: backlog
-  3-14-speak-instantly-with-the-windows-speech-engine: backlog
-  3-15-generate-through-azure-neural-tts: backlog
+  3-15-speak-naturally-and-instantly-with-piper-on-linux: backlog  # next up (sprint change 2026-09-24)
   3-16-speak-with-piper-on-windows: backlog
 ```
 
@@ -262,20 +252,19 @@ NEW:
   - Add the Piper decisions: P4 (graph on `ort`, no Piper engine), P5 (pinned origin, not mirrored, licence shown), P7 (curated voice table), and the `--ipa` / punctuation detail.
   - Change "If nothing is selected, the backend is CPU" to the AD-9 wording above.
   - "Stories 3.12, 3.13 and 3.14 add entries" becomes "3.12–3.16".
-- **`deferred-work.md`:** the entry "Story 3.13, speak instantly with the Windows speech engine" becomes Story 3.14. The agreed Windows order (tray+hotkey, notifications, 3.14, 2.8) is updated to match.
 - **Built specs are not rewritten.** Spec files for finished stories (3.10, 3.11, 3.12) keep their historical numbering.
 
 ---
 
 ## 5. Implementation Handoff
 
-**Scope: Moderate.** The change adds two stories, renumbers two unbuilt stories, widens one architecture exception (AD-12) and changes one default (AD-9).
+**Scope: Moderate.** The change adds two stories, widens one architecture exception (AD-12) and changes one default (AD-9).
 
 | Who | Responsibility |
 |---|---|
 | Erdem | Approve this proposal, including P4–P7 |
 | Developer (correct-course) | Apply §4.1–§4.6 |
-| Developer (`bmad-build`) | 3.13 (Piper on Linux) next, then 3.14 → 3.15 → 3.16 |
+| Developer (`bmad-build`) | 3.15 (Piper on Linux) next, then 3.13 and 3.16 on Windows |
 
 **Success criteria:**
 
