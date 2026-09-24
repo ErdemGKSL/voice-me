@@ -2,7 +2,7 @@
 name: voice-me
 status: final
 created: 2026-09-20
-updated: 2026-09-20
+updated: 2026-09-24
 description: Personal hotkey-triggered voice-cloning utility for Linux/Windows. GPUI Kit (gpui-kit/gpui-component) on GPUI; this DESIGN.md specifies the brand-layer delta only.
 colors:
   # gpui-kit / GPUI Component theme tokens inherited wholesale (background, foreground,
@@ -25,10 +25,21 @@ rounded:
   # buttons, inputs). The Prompt Overlay alone uses a rounder radius so it
   # reads as a floating command surface, not app chrome. [ASSUMPTION]
   overlay: 12px
+  # The prompt bar (the overlay ready to type) is a pill: the theme's
+  # radius_full, so a theme that squares its corners squares it too.
+  prompt-bar: full
 spacing:
   # gpui-kit semantic spacing scale (xxs 2px .. xxl 32px) inherited as-is; no overrides.
 components:
+  prompt-bar:
+    background: '{colors.overlay-background}'
+    border: '{colors.overlay-border}'
+    border-focused: '{focus-ring}'
+    radius: '{rounded.prompt-bar}'
+    height: 56px
+    shadow: none  # the bar fills its window; a shadow would be clipped
   prompt-overlay:
+    # The blocked and confirm-first shapes: a card, not the bar.
     background: '{colors.overlay-background}'
     border: '{colors.overlay-border}'
     radius: '{rounded.overlay}'
@@ -59,7 +70,7 @@ Inherits gpui-kit's platform UI font for all interface text — window titles, l
 
 ## Layout & Spacing
 
-gpui-kit's semantic spacing scale (`xxs` 2px through `xxl` 32px) inherited as-is; no product-specific scale. The Prompt Overlay uses `lg`/`xl` internal padding (generous breathing room around a single input, per the "utility window" shell — one focused task, short fixed action path) — Settings uses the ecosystem-default `md`/`lg` rhythm for grouped fields.
+gpui-kit's semantic spacing scale (`xxs` 2px through `xxl` 32px) inherited as-is; no product-specific scale. Ready to type, the Prompt Overlay *is* the prompt bar: no card or padding around the input, only the bar's own `xl` leading/trailing inset and a `md` gap between its icon, input and Enter hint. Its blocked and confirm-first shapes keep `lg`/`xl` card padding (per the "utility window" shell — one focused task, short fixed action path) — Settings uses the ecosystem-default `md`/`lg` rhythm for grouped fields.
 
 ## Elevation & Depth
 
@@ -67,7 +78,7 @@ The base app has almost no elevation: it's a tray icon and, occasionally, one wi
 
 ## Shapes
 
-Rounder than gpui-kit's default app-chrome radius for exactly one surface: the Prompt Overlay (`12px`, vs. gpui-kit's default control radius elsewhere). This is the single deliberate brand accent in the whole shape language — it's what makes the overlay read as "a floating command palette" the instant it appears, distinct from ordinary window chrome. Settings, dialogs, and every other surface use gpui-kit's theme radius unmodified.
+Rounder than gpui-kit's default app-chrome radius for exactly one surface: the Prompt Overlay. Ready to type, it is a pill-shaped prompt bar (the theme's `radius_full`); blocked or asking to confirm a provider, it is a card with `12px` corners. This is the single deliberate brand accent in the whole shape language — it's what makes the overlay read as "a prompt bar popping up" the instant it appears, distinct from ordinary window chrome. Settings, dialogs, and every other surface use gpui-kit's theme radius unmodified.
 
 ## Components
 
@@ -75,7 +86,7 @@ voice-me uses the following gpui-kit components as-is, unchanged: `Button`, `Inp
 
 Brand-layer components:
 
-- **Prompt Overlay** — custom composition, not a stock gpui-kit surface (its "borderless, always-on-top, single-line" contract doesn't match any existing component). Built from gpui-kit's popover-family surface treatment (elevation, `overlay-background`, `overlay-border`) plus `rounded.overlay`, holding one `Input` and nothing else. See EXPERIENCE.md for its behavior.
+- **Prompt Overlay** — custom composition, not a stock gpui-kit surface (its "borderless, always-on-top, single-line" contract doesn't match any existing component). Ready to type, it is the prompt bar: the window is exactly the bar, a pill in `overlay-background` with an `overlay-border` edge that takes the focus-ring colour while the input is focused. It holds a muted voice icon, one `Input`, and a `Kbd` Enter hint, and has no shadow, because the bar fills its window and a shadow would be clipped into the corners. Its blocked and confirm-first shapes are cards built from gpui-kit's popover-family surface (elevation, `overlay-background`, `overlay-border`) plus `rounded.overlay`. See EXPERIENCE.md for its behavior.
 - **Hotkey chip** — small `monospace`/`shortcut` typography badge, `muted` background, used wherever a configured or in-progress hotkey combination is displayed.
 - **Recording indicator** — a `primary`-colored dot/waveform accent shown only while capturing a Reference Voice Sample in Voice Setup; the one place `{colors.primary}` appears outside a button.
 
@@ -85,6 +96,6 @@ Brand-layer components:
 |---|---|
 | Inherit gpui-kit defaults for everything not named above | Introduce a second accent color |
 | Use Primary Violet only for the primary commit action, the recording indicator, and overlay focus emphasis | Use Primary Violet for chrome, hover states, or decoration |
-| Keep the Prompt Overlay to one `Input`, nothing else | Add extra controls, tabs, or a language switcher to the Overlay (out of scope for v1) |
+| Keep the Prompt Overlay to one `Input` (plus its icon and Enter hint), nothing else | Add extra controls, tabs, or a language switcher to the Overlay (out of scope for v1) |
 | Reserve the rounder `overlay` radius for the Prompt Overlay alone | Apply the overlay's rounder radius to Settings or dialogs |
 | Use the monospace shortcut style only for key combinations | Use monospace for any prose or labels |

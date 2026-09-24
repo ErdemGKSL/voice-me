@@ -190,3 +190,10 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-settings-window-title-bar.md`
   summary: The Settings window has no title, so with the native title bar gone nothing names it in the taskbar, Alt-Tab or the window list.
   evidence: `TitleBar::title_bar_options()` sets `title: None`, and the old `WindowOptions::default()` titlebar had no title either, so this predates the change. Setting `titlebar.title` in `SettingsView::window_options()` would fix it.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-prompt-overlay-pill-bar.md`
+  summary: DESIGN.md says the overlay's focus emphasis is Primary Violet (#7C6AFF), but no code sets the theme's `primary` or `ring`, so the prompt bar's focused edge shows gpui-kit's default ring colour.
+  evidence: nothing in `crates/` applies a theme override for `primary`/`ring`; the gap predates the pill bar, which is only the first surface to use the ring as emphasis.
+- source_spec: `_bmad-output/implementation-artifacts/spec-prompt-overlay-pill-bar.md`
+  summary: `epics.md` UX-DR4 ("one `Input` and nothing else, popover-family elevation/shadow") and UX-DR22 ("fade/scale-in"), and EXPERIENCE.md, still describe the boxed overlay rather than the pill bar with its icon and Enter hint.
+  evidence: the user asked for the pill bar (DESIGN.md was updated with it); the planning documents were left for a correct-course pass rather than edited from a review.

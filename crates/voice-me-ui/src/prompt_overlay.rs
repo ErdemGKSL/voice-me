@@ -1,7 +1,8 @@
 //! The Prompt Overlay (Story 2.4): the product's whole interaction surface
 //! — press the hotkey, type a line, press `Enter`.
 //!
-//! The view owns one `Input` and nothing else (UX-DR4). It never calls a
+//! Ready to type, the view is a pill-shaped prompt bar holding one `Input`,
+//! a voice icon and an Enter hint, and nothing else (UX-DR4). It never calls a
 //! port: confirming the line sends `AppEvent::SpeakRequested` on the shared
 //! channel (AD-3) and closes immediately, waiting on nothing (AD-10).
 //! Generation, playback and notifications belong to Stories 2.6/2.9,
@@ -35,19 +36,27 @@
 use std::rc::Rc;
 use std::time::Duration;
 
+use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _, ThemeStyled as _,
+    ActiveTheme as _, Icon, Sizable as _, ThemeStyled as _,
     button::{Button, ButtonVariants as _},
-    h_flex, v_flex,
+    h_flex,
+    kbd::Kbd,
+    v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     Animation, AnimationExt as _, AnyElement, App, AppContext as _, Context, Entity, FocusHandle,
-    Focusable, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, ParentElement as _, Render, SharedString, Styled as _, Subscription,
-    TestSupportExt as _, Window, div, ease_out_quint, px,
+    Focusable, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent, Keystroke,
+    MouseButton, MouseDownEvent, ParentElement as _, Render, SharedString, Styled as _,
+    Subscription, TestSupportExt as _, Window, div, ease_out_quint, px,
 };
 use voice_me_core::{AppEvent, AppEventSender, RemoteProvider};
+
+/// The prompt bar's height, which is also its window's: the bar fills the
+/// window, with nothing around it. A window geometry, so a pixel value.
+pub const PROMPT_BAR_HEIGHT: f32 = 56.;
 
 /// Placeholder copy for the one and only field.
 const PLACEHOLDER: &str = "Type what you want to say…";
@@ -227,6 +236,10 @@ impl PromptOverlayView {
             return;
         };
         (disclosure.on_confirm)(cx);
+        // The confirm-first card needed a taller window; the bar is its own
+        // height, and would otherwise stretch into a tall pill.
+        let width = window.viewport_size().width;
+        window.resize(gpui_kit::size(width, px(PROMPT_BAR_HEIGHT)));
         self.input.update(cx, |state, cx| state.focus(window, cx));
         cx.notify();
     }
@@ -334,21 +347,9 @@ impl PromptOverlayView {
         .detach();
     }
 
-    /// Everything inside the overlay surface: the one `Input`, or — when a
-    /// dependency the speech engine needs is missing — the inline notice
-    /// that replaces it (Story 3.4).
-    fn body(&self, cx: &mut Context<Self>) -> AnyElement {
-        if let Some(disclosure) = self.disclosure.as_ref() {
-            return self.disclosure_body(&disclosure.provider, &disclosure.text, cx);
-        }
-        let Some(blocker) = self.blocker.clone() else {
-            return Input::new(&self.input)
-                .appearance(false)
-                .text_size(px(16.))
-                .text_color(cx.theme().popover_foreground)
-                .into_any_element();
-        };
-
+    /// The inline notice that replaces the `Input` when a dependency the
+    /// speech engine needs is missing (Story 3.4).
+    fn blocked_body(&self, blocker: SharedString, cx: &mut Context<Self>) -> AnyElement {
         v_flex()
             .id("prompt-overlay-blocked")
             .test_support()
@@ -444,18 +445,11 @@ impl PromptOverlayView {
     }
 }
 
-impl Focusable for PromptOverlayView {
-    fn focus_handle(&self, _cx: &gpui_kit::App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
-impl Render for PromptOverlayView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let dismissing = self.dismissing;
-        let body = self.body(cx);
-
-        let surface = v_flex()
+impl PromptOverlayView {
+    /// The blocked and confirm-first shapes: a card with room for a few
+    /// lines of text and, for the disclosure, its two buttons.
+    fn card(&self, body: AnyElement, cx: &mut Context<Self>) -> AnyElement {
+        v_flex()
             .id("prompt-overlay-surface")
             .test_support()
             .size_full()
@@ -468,7 +462,85 @@ impl Render for PromptOverlayView {
             // The popover family's surface, edge and shadow — the elevation
             // every floating gpui-kit surface shares.
             .popover_style(cx)
-            .child(body);
+            .child(body)
+            .into_any_element()
+    }
+
+    /// Whether the overlay is ready to take a line: not blocked, and not
+    /// asking to confirm a provider first.
+    fn is_prompt(&self) -> bool {
+        self.blocker.is_none() && self.disclosure.is_none()
+    }
+
+    /// The prompt shape: the overlay is the bar itself — a pill holding a
+    /// voice icon, the one `Input`, and the Enter hint. Its edge takes the
+    /// focus-ring colour while the input has focus (DESIGN.md's overlay
+    /// focus emphasis). No shadow: the bar fills its window, which would
+    /// clip one into a haze in the corners around the rounded ends.
+    fn prompt_bar(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let focused = self.input.focus_handle(cx).is_focused(window);
+        h_flex()
+            .id("prompt-overlay-bar")
+            .test_support()
+            // Its own height, not the window's: the confirm-first window
+            // asks to shrink to the bar, and a compositor that is slow to
+            // (or never does) must still get a bar, not a tall pill.
+            .w_full()
+            .h(px(PROMPT_BAR_HEIGHT))
+            .flex_shrink_0()
+            .px_5()
+            .gap_3()
+            .bg(cx.theme().popover)
+            .text_color(cx.theme().popover_foreground)
+            .border_1()
+            .border_color(if focused {
+                cx.theme().ring
+            } else {
+                cx.theme().border
+            })
+            .rounded_full_style(cx)
+            .child(Icon::new(IconName::AudioLines).text_color(cx.theme().muted_foreground))
+            .child(
+                div().flex_1().min_w_0().child(
+                    Input::new(&self.input)
+                        .appearance(false)
+                        .text_size(px(16.))
+                        .text_color(cx.theme().popover_foreground),
+                ),
+            )
+            // What Enter does here is speak the line; the key is named in
+            // the platform's own notation.
+            .children(Keystroke::parse("enter").ok().map(|enter| {
+                Kbd::new(enter)
+                    .appearance(false)
+                    .text_color(cx.theme().muted_foreground)
+            }))
+            .into_any_element()
+    }
+}
+
+impl Focusable for PromptOverlayView {
+    fn focus_handle(&self, _cx: &gpui_kit::App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl Render for PromptOverlayView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let dismissing = self.dismissing;
+        let is_prompt = self.is_prompt();
+
+        let surface = match (self.disclosure.as_ref(), self.blocker.clone()) {
+            (Some(disclosure), _) => {
+                let body = self.disclosure_body(&disclosure.provider, &disclosure.text, cx);
+                self.card(body, cx)
+            }
+            (None, Some(blocker)) => {
+                let body = self.blocked_body(blocker, cx);
+                self.card(body, cx)
+            }
+            (None, None) => self.prompt_bar(window, cx),
+        };
 
         let frame = div()
             .id("prompt-overlay")
@@ -518,7 +590,7 @@ impl Render for PromptOverlayView {
             // a compositor.
             frame
                 .child(div().id("prompt-overlay-dismissing").test_support())
-                .p(px(SURFACE_INSET_END))
+                .when(!is_prompt, |el| el.p(px(SURFACE_INSET_END)))
                 .with_animation(
                     "prompt-out",
                     Animation::new(Duration::from_millis(DISMISS_MS)).with_easing(ease_out_quint()),
@@ -530,7 +602,12 @@ impl Render for PromptOverlayView {
                 .with_animation(
                     "prompt-in",
                     Animation::new(Duration::from_millis(SUMMON_MS)).with_easing(ease_out_quint()),
-                    |el, delta| {
+                    move |el, delta| {
+                        // The bar fills its window, so it only fades in; a
+                        // card closes its inset as it does.
+                        if is_prompt {
+                            return el.opacity(delta);
+                        }
                         let inset =
                             SURFACE_INSET_START + (SURFACE_INSET_END - SURFACE_INSET_START) * delta;
                         el.opacity(delta).p(px(inset))
@@ -597,7 +674,7 @@ mod tests {
     fn open(cx: &mut TestAppContext) -> Harness {
         cx.update(gpui_kit::init);
         let (event_tx, event_rx) = mpsc::unbounded::<AppEvent>();
-        let handle = cx.open_window(size(px(560.), px(84.)), |window, cx| {
+        let handle = cx.open_window(size(px(560.), px(PROMPT_BAR_HEIGHT)), |window, cx| {
             let view = cx.new(|cx| PromptOverlayView::new(event_tx.clone(), window, cx));
             Root::new(view, window, cx)
         });
@@ -623,6 +700,33 @@ mod tests {
             handle,
             events: event_rx,
         }
+    }
+
+    /// Ready to type, the overlay is the bar itself: it fills its window
+    /// once summoned, with no card or inset around it, and holds the input
+    /// and the Enter hint. A blocked overlay keeps its card instead.
+    #[gpui_kit::test]
+    fn the_prompt_shape_is_a_bar_filling_its_window(cx: &mut TestAppContext) {
+        let harness = open(cx);
+        // Let the summon fade finish.
+        cx.executor()
+            .advance_clock(Duration::from_millis(SUMMON_MS + 50));
+        cx.update_window(harness.handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let bar = window.find("prompt-overlay-bar").bounds();
+            assert_eq!(bar.origin, point(px(0.), px(0.)), "nothing around the bar");
+            assert_eq!(bar.size, size(px(560.), px(PROMPT_BAR_HEIGHT)));
+            assert!(window.try_find("prompt-overlay-surface").is_none());
+        })
+        .unwrap();
+
+        let blocked = open_blocked(cx, "ONNX Runtime is missing.");
+        cx.update_window(blocked.handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("prompt-overlay-surface").is_some());
+            assert!(window.try_find("prompt-overlay-bar").is_none());
+        })
+        .unwrap();
     }
 
     /// The Story 3.6 shape, with a counter standing in for the root's
@@ -671,8 +775,8 @@ mod tests {
         cx.update_window(harness.handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(
-                window.try_find("prompt-overlay-surface").is_some(),
-                "the overlay draws its one surface"
+                window.try_find("prompt-overlay-bar").is_some(),
+                "the overlay draws its one bar"
             );
             assert!(
                 window.try_find("prompt-overlay-dismissing").is_none(),
@@ -680,11 +784,15 @@ mod tests {
             );
             // No click anywhere: text goes straight to whatever holds focus.
             window.input("hello ", cx);
-            // A click on the overlay's padding (the frame's top-left corner,
-            // clear of the Input) must not steal focus from the Input —
+            // A click on the bar outside the Input (on its voice icon) must
+            // not steal focus from the Input —
             // GPUI transfers focus to any focusable element that is clicked,
             // and the frame is focusable.
-            window.click_at("prompt-overlay", point(px(2.), px(2.)), cx);
+            window.click_at(
+                "prompt-overlay-bar",
+                point(px(24.), px(PROMPT_BAR_HEIGHT / 2.)),
+                cx,
+            );
             window.input("there", cx);
             window.press("enter", cx);
         })
@@ -904,6 +1012,12 @@ mod tests {
         cx.update_window(harness.handle.into(), |_, window, cx| {
             window.render_frame(cx);
             assert!(window.try_find("prompt-overlay-disclosure").is_none());
+            // The card's taller window asks to shrink to the bar, and the
+            // bar is its own height either way: the same pill a fresh
+            // overlay shows, never a stretched one.
+            assert_eq!(window.bounds().size.height, px(PROMPT_BAR_HEIGHT));
+            let bar = window.find("prompt-overlay-bar").bounds();
+            assert_eq!(bar.size.height, px(PROMPT_BAR_HEIGHT), "{bar:?}");
             window.input("merhaba", cx);
             window.press("enter", cx);
         })

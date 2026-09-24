@@ -86,9 +86,9 @@ use voice_me_tts_remote::{
 };
 use voice_me_ui::{
     BackendAction, BackendActions, BackendArea, BackendPanel, ConfirmDisclosure, DependenciesTab,
-    DisclosureText, PiperCatalogState, PiperVoicesAction, PiperVoicesActions, PiperVoicesPanel,
-    PiperVoicesTab, PromptOverlayView, RowProvisioning, SettingsView, VoiceDownload,
-    blocker_notice,
+    DisclosureText, PROMPT_BAR_HEIGHT, PiperCatalogState, PiperVoicesAction, PiperVoicesActions,
+    PiperVoicesPanel, PiperVoicesTab, PromptOverlayView, RowProvisioning, SettingsView,
+    VoiceDownload, blocker_notice,
 };
 
 #[cfg(target_os = "linux")]
@@ -110,10 +110,33 @@ use voice_me_tray_windows::WindowsTrayAdapter;
 
 use voice_me_core::TrayPort as _;
 
-/// The overlay's fixed comfortable width, and a height sized to one line of
-/// input plus the surface's padding (spec-2-4 Design Notes).
+gpui_kit::assets::icon_assets!(PromptBarIcons, [AudioLines]);
+
+/// gpui-kit's component icons plus the one icon voice-me adds (the prompt
+/// bar's voice icon), rather than the whole Lucide catalog for one SVG.
+struct AppAssets;
+
+impl gpui_kit::AssetSource for AppAssets {
+    fn load(&self, path: &str) -> gpui_kit::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        match PromptBarIcons.load(path)? {
+            Some(bytes) => Ok(Some(bytes)),
+            None => gpui_kit::assets::Assets.load(path),
+        }
+    }
+
+    fn list(&self, path: &str) -> gpui_kit::Result<Vec<gpui_kit::SharedString>> {
+        let mut paths = gpui_kit::assets::Assets.list(path)?;
+        paths.extend(PromptBarIcons.list(path)?);
+        Ok(paths)
+    }
+}
+
+/// The overlay's fixed comfortable width. Ready to type, the overlay is
+/// the prompt bar and its window is the bar's own height
+/// ([`PROMPT_BAR_HEIGHT`]); blocked, it is a card sized to its three lines
+/// plus the card's padding (spec-2-4 Design Notes).
 const OVERLAY_WIDTH: f32 = 560.;
-const OVERLAY_HEIGHT: f32 = 84.;
+const OVERLAY_BLOCKED_HEIGHT: f32 = 84.;
 
 /// The confirm-first overlay's height (Story 3.6): the provider, the three
 /// things sent, and the two buttons. It keeps this height after confirming.
@@ -1027,6 +1050,17 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    /// The asset source serves the prompt bar's voice icon and still serves
+    /// gpui-kit's own component icons: a missing SVG draws nothing, silently.
+    #[test]
+    fn app_assets_serve_the_voice_icon_and_the_component_icons() {
+        use gpui_kit::AssetSource as _;
+        for path in ["icons/audio-lines.svg", "icons/window-close.svg"] {
+            let bytes = AppAssets.load(path).unwrap().expect(path);
+            assert!(bytes.starts_with(b"<svg"), "{path} is an SVG");
+        }
+    }
     use voice_me_core::{AppState, VoiceMeError};
     use voice_me_hotkey_linux::SessionKind;
 
@@ -2416,7 +2450,7 @@ fn main() {
     // `Escape`. The tray's "Quit" item already calls `cx.quit()` itself.
     let app = gpui_kit::application()
         .with_quit_mode(QuitMode::Explicit)
-        .with_assets(gpui_kit::assets::Assets);
+        .with_assets(AppAssets);
 
     app.run(move |cx| {
         gpui_kit::init(cx);
@@ -3548,8 +3582,10 @@ fn main() {
                             px(OVERLAY_WIDTH),
                             px(if disclosure.is_some() {
                                 OVERLAY_DISCLOSURE_HEIGHT
+                            } else if blocker.is_some() {
+                                OVERLAY_BLOCKED_HEIGHT
                             } else {
-                                OVERLAY_HEIGHT
+                                PROMPT_BAR_HEIGHT
                             }),
                         ),
                         cx,

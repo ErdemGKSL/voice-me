@@ -20,7 +20,9 @@ pub use piper_voices::{
     PiperCatalogState, PiperVoicesAction, PiperVoicesActions, PiperVoicesPanel, PiperVoicesView,
     VoiceDownload, VoiceRow, filter_rows, voice_rows,
 };
-pub use prompt_overlay::{ConfirmDisclosure, DISCLOSURE_ITEMS, DisclosureText, PromptOverlayView};
+pub use prompt_overlay::{
+    ConfirmDisclosure, DISCLOSURE_ITEMS, DisclosureText, PROMPT_BAR_HEIGHT, PromptOverlayView,
+};
 pub use settings::{DependenciesTab, PiperVoicesTab, SettingsView};
 pub use voice_setup::{
     MAX_RECORDING_SECS, MIN_RECORDING_SECS, VoiceSetupView, recording_meets_minimum_duration,
