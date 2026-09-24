@@ -1,0 +1,153 @@
+name: Development release
+
+# Every push builds voice-me for Linux and Windows and publishes the result
+# as a GitHub pre-release. Each branch has one rolling development release,
+# tagged `dev-<branch>`: a new push replaces it (tag, notes and assets), so
+# the Releases page holds one current build per branch, not one per commit.
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Two pushes to the same branch must not race to replace the same release;
+# the newer one wins.
+concurrency:
+  group: dev-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      tag: ${{ steps.meta.outputs.tag }}
+      suffix: ${{ steps.meta.outputs.suffix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/voice-me-app/Cargo.toml | head -n1)
+          short_sha=${GITHUB_SHA::7}
+          # Tags cannot hold every character a branch name can.
+          slug=$(printf '%s' "$GITHUB_REF_NAME" | tr -c 'A-Za-z0-9._-' '-' | sed 's/--*/-/g; s/^-//; s/-$//')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=dev-$slug" >> "$GITHUB_OUTPUT"
+          echo "suffix=$version-dev-$short_sha" >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    needs: meta
+    # The oldest supported runner, so the binary's glibc floor stays low and
+    # it runs on more distributions than the one it was built on.
+    runs-on: ubuntu-22.04
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dev-release
+      - name: Install native build dependencies (cpal/gpui-kit/rodio/libpulse)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libasound2-dev \
+            libpulse-dev \
+            libfontconfig1-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcb1-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libssl-dev
+      - run: cargo build --release --locked -p voice-me-app --target "$TARGET"
+      - name: Package
+        run: |
+          name="voice-me-${{ needs.meta.outputs.suffix }}-$TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/voice-me" README.md "dist/$name/"
+          strip "dist/$name/voice-me"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-me-linux
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  build-windows:
+    needs: meta
+    runs-on: windows-latest
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dev-release
+      - run: cargo build --release --locked -p voice-me-app --target $env:TARGET
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "voice-me-${{ needs.meta.outputs.suffix }}-$env:TARGET"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item "target/$env:TARGET/release/voice-me.exe", "README.md" "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-me-windows
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    needs: [meta, build-linux, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.meta.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Publish pre-release
+        run: |
+          cat > notes.md <<EOF
+          Development build of \`${GITHUB_REF_NAME}\` at ${GITHUB_SHA}.
+
+          Built automatically on push; replaced by the next push to this branch. Not a stable release.
+
+          | Platform | Asset |
+          | --- | --- |
+          | Linux x86_64 | \`voice-me-*-x86_64-unknown-linux-gnu.tar.gz\` |
+          | Windows x86_64 | \`voice-me-*-x86_64-pc-windows-msvc.zip\` |
+
+          Verify a download with \`sha256sum -c SHA256SUMS.txt --ignore-missing\`.
+          EOF
+          # Replace the branch's previous development release and move its tag.
+          gh release delete "$TAG" --cleanup-tag --yes || true
+          gh release create "$TAG" dist/* \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Development build: ${GITHUB_REF_NAME} (${{ needs.meta.outputs.short_sha }})" \
+            --notes-file notes.md
