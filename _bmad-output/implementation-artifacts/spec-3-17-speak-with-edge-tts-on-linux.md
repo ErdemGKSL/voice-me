@@ -2,7 +2,7 @@
 title: 'Speak with Edge TTS on Linux (Story 3.17)'
 type: 'feature'
 created: '2026-09-24'
-status: 'in-review'
+status: 'done'
 route: 'dispatch'
 review_loop_iteration: 0
 baseline_commit: 'a12c688e87f1eb7b0ef625382cfa15420bbc74d2'
@@ -138,6 +138,7 @@ context: ['{project-root}/_bmad-output/implementation-artifacts/epic-3-context.m
 - Fixed after the handoff: a missing line continuation left ~17 stray spaces in the "not listed yet" note; the test now asserts none.
 - Environment: Rust stable updated to 1.98.1 (`gpui-pre` needs `cold_path`); the stale 1.94.1 artifacts were removed from `target/` to free disk (no current artifact touched). `edge-tts` 7.2.8 is pipx-installed in `~/.local/bin` in this container.
 - Verified: the spec's `cargo test` list passes; `cargo check --workspace --all-targets`, clippy (no new warnings) and `cargo fmt --check` clean per the implementation run. Online synthesis blocked by the container's TLS proxy (the error path reported it correctly). Windows compile not verified locally (disk); CI's Windows job must confirm the cfg-gated paths, including the Other OS matrix row's tests.
+- Review patches (2026-09-24): generation-guarded voice-list refresh that respects unrelated errors; `apply_edge_tts_listing` and `edge_tts_rows_with` extracted and tested; real-program tests gated behind `VOICE_ME_EDGE_TTS_ONLINE`; relative PATH entries ignored; zero voices hints `pipx upgrade edge-tts`. Verified: the spec's full `cargo test` list passes and `cargo fmt --check` is clean.
 
 ## Spec Change Log
 
