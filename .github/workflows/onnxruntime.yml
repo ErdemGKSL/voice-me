@@ -25,6 +25,14 @@ on:
       build_number:
         description: voice-me build number of this runtime (the .N in the tag)
         default: "1"
+      targets:
+        description: Which builds to run (both, linux or windows)
+        default: both
+      reuse_run_id:
+        description: >-
+          Optional run id whose uploaded build artifacts the release reuses
+          (e.g. a finished Linux build when only Windows is re-run)
+        default: ""
 
 permissions:
   contents: read
@@ -43,6 +51,7 @@ env:
 
 jobs:
   build-linux:
+    if: inputs.targets != 'windows'
     # The same glibc floor as the app's Linux build (dev-release.yml).
     runs-on: ubuntu-22.04
     timeout-minutes: 355
@@ -127,6 +136,7 @@ jobs:
           path: dist/*
 
   build-windows:
+    if: inputs.targets != 'linux'
     # CUDA 12.8's nvcc supports Visual Studio 2022 as its host compiler;
     # windows-latest has moved past it.
     runs-on: windows-2022
@@ -158,26 +168,35 @@ jobs:
           EOF
           ls cudnn cudnn/bin | head -40
 
+      # The workspace drive (D:) has ~14 GB free, too little for a CUDA
+      # build tree; C: has far more. A short path also keeps MSBuild clear of
+      # the 260-character limit.
       - name: Fetch ONNX Runtime ${{ env.ORT_VERSION }}
         shell: bash
-        run: git clone --depth 1 --branch "v$ORT_VERSION" --recursive https://github.com/microsoft/onnxruntime.git ort
+        run: |
+          git clone --depth 1 --branch "v$ORT_VERSION" --recursive https://github.com/microsoft/onnxruntime.git /c/ort
+          df -h /c /d || true
 
       - name: Build
-        working-directory: ort
+        working-directory: C:\ort
         shell: pwsh
         run: |
-          .\build.bat --config Release --build_shared_lib --parallel --use_cuda `
+          # Two jobs and one nvcc thread each: the runner has 16 GB of memory,
+          # and an unbounded CUDA build runs it out.
+          .\build.bat --config Release --build_shared_lib --parallel 2 --nvcc_threads 1 --use_cuda `
             --cuda_home "$env:CUDA_PATH" --cudnn_home "$env:GITHUB_WORKSPACE\cudnn" `
             --use_webgpu --skip_tests --compile_no_warning_as_error `
             --cmake_generator "Visual Studio 17 2022" `
             --cmake_extra_defines "CMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS" onnxruntime_BUILD_UNIT_TESTS=OFF
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $code = $LASTEXITCODE
+          Get-PSDrive C, D | Format-Table Name, Used, Free
+          if ($code -ne 0) { exit $code }
 
       - name: Package
         shell: bash
         run: |
           set -euo pipefail
-          out="ort/build/Windows/Release/Release"
+          out="/c/ort/build/Windows/Release/Release"
           ls -la "$out" | grep -iE '\.dll' || true
           core="onnxruntime-voiceme-win-x64-$ORT_VERSION"
           cuda="onnxruntime-voiceme-win-x64-cuda12-$ORT_VERSION"
@@ -188,8 +207,8 @@ jobs:
             [ -e "$f" ] && cp "$f" "$core/lib/"
           done
           cp "$out/onnxruntime_providers_cuda.dll" "$cuda/lib/"
-          cp ort/LICENSE ort/ThirdPartyNotices.txt "$core/"
-          cp ort/LICENSE ort/ThirdPartyNotices.txt "$cuda/"
+          cp /c/ort/LICENSE /c/ort/ThirdPartyNotices.txt "$core/"
+          cp /c/ort/LICENSE /c/ort/ThirdPartyNotices.txt "$cuda/"
           7z a -tzip "dist/$core.zip" "$core" > /dev/null
           7z a -tzip "dist/$cuda.zip" "$cuda" > /dev/null
           (cd dist && 7z l "$core.zip"; 7z l "$cuda.zip") > dist/win-x64-contents.txt
@@ -202,14 +221,29 @@ jobs:
 
   release:
     needs: [build-linux, build-windows]
+    # Publishes whatever built; a later run with `targets` set to the missing
+    # OS (and `reuse_run_id` pointing here, if useful) adds the rest.
+    if: >-
+      !cancelled() &&
+      (needs.build-linux.result == 'success' || needs.build-windows.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
+      - name: Reuse the builds of run ${{ inputs.reuse_run_id }}
+        if: inputs.reuse_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+          run-id: ${{ inputs.reuse_run_id }}
+          github-token: ${{ github.token }}
 
       - name: Publish ${{ env.TAG }}
         env:
@@ -218,9 +252,16 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum *.tgz *.zip > SHA256SUMS.txt
-          stat -c '%s %n' *.tgz *.zip > SIZES.txt
-          cat SHA256SUMS.txt SIZES.txt
+          ls -la
+          # One checksum and size list per OS, so publishing one OS later
+          # never overwrites the other's.
+          for os in linux win; do
+            files=$(ls onnxruntime-voiceme-$os-* 2>/dev/null || true)
+            [ -n "$files" ] || continue
+            sha256sum $files > "SHA256SUMS-$os.txt"
+            stat -c '%s %n' $files > "SIZES-$os.txt"
+            cat "SHA256SUMS-$os.txt" "SIZES-$os.txt"
+          done
           notes="ONNX Runtime $ORT_VERSION built from source with the CPU, CUDA 12.8 and WebGPU execution providers (Story 3.8). Pinned by size and SHA-256 in voice-me-deps; never replaced under this tag."
           if gh release view "$TAG" > /dev/null 2>&1; then
             gh release upload "$TAG" * --clobber
