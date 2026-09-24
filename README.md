@@ -117,6 +117,27 @@ eSpeak NG is linked.
   `<cache>\espeak-ng\` by reading the package itself (no `msiexec`, no
   admin prompt, no registry or `PATH` change), and deletes the `.msi`. Delete that directory to remove it.
 
+### System voice
+
+Local → **System voice** speaks instantly through the operating system's
+own engine: nothing to download and no Reference Voice Sample.
+
+- **Linux** — eSpeak NG (`espeak-ng`, the same package Piper uses).
+- **Windows** — the Windows speech engine
+  (`Windows.Media.SpeechSynthesis`), with the voices Windows has installed,
+  for example Microsoft Tolga for Turkish. Speech is rendered into memory
+  and played through voice-me's own audio path (the Virtual Microphone),
+  never to the speakers directly. The speech language list is the
+  installed voices' languages; the default `tr` matches `tr-TR`.
+
+  To add a voice for a language: open Windows **Settings → Time & language
+  → Speech**, under **Manage voices** choose **Add voices**, install the
+  language's voice, then press **Check again** in Settings → Dependencies.
+  When the selected speech language has no installed voice, Settings →
+  Backend says so beside the speech language; when Windows speech lists no
+  voices at all, the Dependencies tab shows a blocking row with the same
+  steps.
+
 For reference, the weights come from
 `onnx-community/chatterbox-multilingual-ONNX` (MIT), pinned to revision
 `452d3f434aa592098f1eedac9099f33642ab2da5` — the tokenizer and the graphs

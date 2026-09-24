@@ -354,10 +354,12 @@ pub fn capability_row(request: &CheckRequest, probe: &dyn GpuProbe) -> Option<De
             }
         }
         // Story 3.12: on Linux the System voice's readiness is the eSpeak
-        // NG row ([`system_voice_engine_row`]), not a capability row.
-        // Elsewhere it has no engine yet (Windows is Story 3.13).
+        // NG row ([`system_voice_engine_row`]), not a capability row; on
+        // Windows (Story 3.13) it is Windows speech's row
+        // ([`windows_system_voice_row`]), reported with the engine rows.
+        // Elsewhere it has no engine yet.
         BackendSelection::SystemVoice => {
-            if cfg!(target_os = "linux") {
+            if cfg!(any(target_os = "linux", target_os = "windows")) {
                 None
             } else {
                 Some(cannot_run(
@@ -436,6 +438,72 @@ pub fn windows_espeak_row(found: Option<&Path>, installable: bool) -> Dependency
             "Install eSpeak NG from the espeak-ng project's releases on GitHub.",
             "Press Check again.",
         ])
+    }
+}
+
+/// What Windows' speech engine answered when asked for its voices (Story
+/// 3.13): how many it lists, or why it could not be reached, in words
+/// naming Windows speech. Injected into
+/// `DepsAdapter` by the composition root, which asks the System voice's
+/// own crate — `voice-me-deps` never calls a TTS adapter.
+pub type SystemVoiceProbe = dyn Fn() -> Result<usize, String> + Send + Sync;
+
+/// Windows' speech engine, as the user reads its name.
+pub const WINDOWS_SPEECH_LABEL: &str = "Windows speech";
+
+/// What the default probe answers when the composition root injected none:
+/// the Windows System voice row then says this rather than guessing.
+pub const NO_SYSTEM_VOICE_PROBE: &str = "voice-me could not ask Windows speech for its voices";
+
+/// Where a user adds a Windows voice, as the manual steps say it — the one
+/// place these steps are written (the app's Backend-tab note uses them too).
+pub const WINDOWS_ADD_VOICES_STEPS: [&str; 3] = [
+    "Open Windows Settings → Time & language → Speech.",
+    "Under Manage voices, choose Add voices and install a voice for your language.",
+    "Press Check again.",
+];
+
+/// The System voice's row on Windows (Story 3.13, decision 3): ready when
+/// Windows speech lists at least one voice, otherwise a manual,
+/// speech-blocking capability row — voice-me cannot install a Windows
+/// voice, so there is no Install. With no voice installed the row names
+/// Windows' own Add-voices steps; when Windows speech could not be asked
+/// at all (a WinRT failure, a timeout) it names the reason instead. Never
+/// [`DependencyKind::SystemVoiceEngine`]: that kind's Install downloads
+/// eSpeak NG on Windows.
+pub fn windows_system_voice_row(answer: Result<usize, String>) -> Dependency {
+    let selection = BackendSelection::SystemVoice;
+    match answer {
+        Ok(0) => {
+            let steps = WINDOWS_ADD_VOICES_STEPS.join(" ");
+            let mut row = cannot_run(
+                &selection,
+                &format!(
+                    "{WINDOWS_SPEECH_LABEL} lists no installed voices. To add a voice: {steps}"
+                ),
+            );
+            row.manual_steps = WINDOWS_ADD_VOICES_STEPS.map(String::from).to_vec();
+            row
+        }
+        Ok(count) => Dependency::ready(
+            DependencyKind::BackendCapability,
+            CAPABILITY_LABEL,
+            format!(
+                "{} can run here: {WINDOWS_SPEECH_LABEL} lists {count} installed voice{}.",
+                selection.label(),
+                if count == 1 { "" } else { "s" }
+            ),
+        ),
+        Err(error) => {
+            let error = error.trim().trim_end_matches('.');
+            // The probe's reason usually names Windows speech already.
+            let reason = if error.contains(WINDOWS_SPEECH_LABEL) {
+                format!("{error}.")
+            } else {
+                format!("{WINDOWS_SPEECH_LABEL} could not be reached: {error}.")
+            };
+            cannot_run(&selection, &reason)
+        }
     }
 }
 
@@ -892,12 +960,77 @@ mod tests {
         assert_eq!(probe.asked.load(Ordering::SeqCst), 0);
     }
 
+    /// On Windows (Story 3.13) its readiness is Windows speech's row,
+    /// reported with the engine rows, so there is no capability row here.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn the_system_voice_on_windows_has_no_capability_row() {
+        let probe = good_gpu();
+        assert_eq!(capability_row(&system_voice(), &probe), None);
+        assert_eq!(probe.asked.load(Ordering::SeqCst), 0);
+    }
+
     /// Elsewhere it cannot run yet, and says so.
     #[test]
-    #[cfg(not(target_os = "linux"))]
-    fn the_system_voice_off_linux_cannot_run_yet() {
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    fn the_system_voice_elsewhere_cannot_run_yet() {
         let row = capability_row(&system_voice(), &good_gpu()).unwrap();
         assert_blocks(&row, "arrives in a later voice-me release");
+    }
+
+    /// Decision 3: Windows speech with voices is ready.
+    #[test]
+    fn windows_speech_with_voices_is_ready() {
+        let row = windows_system_voice_row(Ok(3));
+        assert_eq!(row.kind, DependencyKind::BackendCapability);
+        assert_eq!(row.status, DependencyStatus::Ready);
+        assert!(row.detail.contains("3 installed voices"), "{}", row.detail);
+        assert!(
+            windows_system_voice_row(Ok(1))
+                .detail
+                .contains("1 installed voice.")
+        );
+    }
+
+    /// Decision 3: no installed voice is a manual, speech-blocking
+    /// capability row naming Windows' Add-voices steps — no Install, and
+    /// never the eSpeak NG kind.
+    #[test]
+    fn windows_speech_with_no_voice_blocks_with_windows_steps() {
+        let row = windows_system_voice_row(Ok(0));
+        assert_blocks(&row, "Windows speech lists no installed voices.");
+        assert_ne!(row.kind, DependencyKind::SystemVoiceEngine);
+        assert!(
+            row.detail.contains("Settings → Time & language → Speech"),
+            "{}",
+            row.detail
+        );
+        assert!(row.detail.contains("Add voices"), "{}", row.detail);
+        assert_eq!(row.manual_steps, WINDOWS_ADD_VOICES_STEPS.map(String::from));
+    }
+
+    /// Decision 3: Windows speech that cannot be asked at all blocks with
+    /// the reason, naming Windows speech — and no Add-voices steps, which
+    /// would not help.
+    #[test]
+    fn windows_speech_that_cannot_be_reached_blocks_with_the_reason_only() {
+        for (answer, reason) in [
+            (
+                "Windows speech did not finish listing its voices within 15 seconds",
+                "Windows speech did not finish listing its voices within 15 seconds.",
+            ),
+            (
+                "Class not registered (0x80040154)",
+                "Windows speech could not be reached: Class not registered (0x80040154).",
+            ),
+            (NO_SYSTEM_VOICE_PROBE, NO_SYSTEM_VOICE_PROBE),
+        ] {
+            let row = windows_system_voice_row(Err(answer.to_string()));
+            assert_blocks(&row, reason);
+            assert_ne!(row.kind, DependencyKind::SystemVoiceEngine);
+            assert!(!row.detail.contains("Add voices"), "{}", row.detail);
+            assert!(row.manual_steps.is_empty(), "{:?}", row.manual_steps);
+        }
     }
 
     #[test]

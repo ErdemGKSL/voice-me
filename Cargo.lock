@@ -8742,6 +8742,7 @@ dependencies = [
  "voice-me-tts-piper",
  "voice-me-tts-remote",
  "voice-me-tts-system-linux",
+ "voice-me-tts-system-windows",
  "voice-me-ui",
  "windows 0.62.2",
 ]
@@ -8958,6 +8959,15 @@ dependencies = [
  "tempfile",
  "voice-me-core",
  "voice-me-espeak",
+]
+
+[[package]]
+name = "voice-me-tts-system-windows"
+version = "0.1.0"
+dependencies = [
+ "rubato",
+ "voice-me-core",
+ "windows 0.62.2",
 ]
 
 [[package]]

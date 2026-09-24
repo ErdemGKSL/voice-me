@@ -43,7 +43,7 @@ use voice_me_core::{
     VoiceMeError, assets,
 };
 
-use crate::capability::{GpuProbe, SystemGpuProbe};
+use crate::capability::{GpuProbe, SystemGpuProbe, SystemVoiceProbe};
 
 use crate::piper::{CatalogVoice, PiperSources};
 use crate::provision::{ProgressReporter, ProgressTarget};
@@ -80,6 +80,10 @@ pub struct DepsAdapter {
     piper_in_flight: Arc<Mutex<HashSet<String>>>,
     /// What unpacks eSpeak NG's MSI (Story 3.16).
     espeak_unpacker: Arc<EspeakUnpacker>,
+    /// Whether Windows' speech engine answers, and with how many voices
+    /// (Story 3.13): what the Windows System voice row reports. Injected
+    /// by the composition root, which asks the System voice's own crate.
+    system_voice_probe: Arc<SystemVoiceProbe>,
 }
 
 /// Install on the Virtual Microphone row. Given the directory the driver
@@ -127,6 +131,7 @@ impl DepsAdapter {
             piper_catalog: Arc::default(),
             piper_in_flight: Arc::default(),
             espeak_unpacker: Arc::new(msi_unpack::unpack),
+            system_voice_probe: Arc::new(|| Err(capability::NO_SYSTEM_VOICE_PROBE.to_string())),
         }
     }
 
@@ -184,6 +189,17 @@ impl DepsAdapter {
         unpacker: impl Fn(&Path, &Path) -> Result<(), VoiceMeError> + Send + Sync + 'static,
     ) -> Self {
         self.espeak_unpacker = Arc::new(unpacker);
+        self
+    }
+
+    /// Replace what the Windows System voice row asks Windows' speech
+    /// engine (Story 3.13): how many voices it lists, or why it cannot be
+    /// reached. Only Windows asks it.
+    pub fn with_system_voice_probe(
+        mut self,
+        probe: impl Fn() -> Result<usize, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.system_voice_probe = Arc::new(probe);
         self
     }
 
@@ -437,9 +453,7 @@ impl DependencyProvisioningPort for DepsAdapter {
             ),
             // Story 3.12: the System voice's one engine row. It is not an
             // ONNX target, so it has no runtime or model rows.
-            None if request.selection.is_system_voice() => {
-                system_voice_rows("The System voice speaks through it.")
-            }
+            None if request.selection.is_system_voice() => self.system_voice_engine_rows(),
             // Story 3.15: Piper's shared CPU runtime, its voice, and the
             // eSpeak NG it reads text through.
             None if request.selection.is_piper() => self.piper_rows(&root, &request),
@@ -492,6 +506,22 @@ impl DependencyProvisioningPort for DepsAdapter {
 }
 
 impl DepsAdapter {
+    /// The System voice's one row: eSpeak NG on Linux (Story 3.12).
+    #[cfg(not(target_os = "windows"))]
+    fn system_voice_engine_rows(&self) -> Vec<Dependency> {
+        system_voice_rows("The System voice speaks through it.")
+    }
+
+    /// The System voice's one row on Windows (Story 3.13): Windows speech,
+    /// asked through the injected probe — ready, or decision 3's manual,
+    /// blocking capability row. Never the eSpeak NG row.
+    #[cfg(target_os = "windows")]
+    fn system_voice_engine_rows(&self) -> Vec<Dependency> {
+        vec![capability::windows_system_voice_row((self
+            .system_voice_probe)(
+        ))]
+    }
+
     /// Story 3.15: Piper's rows — the shared CPU runtime (the one the
     /// bundled CPU backend uses; Piper never downloads its own), the voice,
     /// and eSpeak NG. Linux and (Story 3.16) Windows only: elsewhere the
@@ -1010,9 +1040,11 @@ fn system_voice_rows(used_by: &str) -> Vec<Dependency> {
     )]
 }
 
-/// Off Linux the capability row says the System voice cannot run yet; there
-/// is no engine to report on.
+/// Off Linux there is no eSpeak NG row for the System voice: Windows has
+/// its own ([`DepsAdapter::system_voice_engine_rows`]), and elsewhere the
+/// capability row says it cannot run yet.
 #[cfg(not(target_os = "linux"))]
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn system_voice_rows(_used_by: &str) -> Vec<Dependency> {
     Vec::new()
 }
@@ -1693,6 +1725,55 @@ mod tests {
             report.dependencies[0].kind,
             DependencyKind::BackendCapability
         );
+        // Story 3.13: Windows never reports the eSpeak NG row for the
+        // System voice — that kind's Install downloads eSpeak NG.
+        #[cfg(target_os = "windows")]
+        assert!(
+            !report
+                .dependencies
+                .iter()
+                .any(|row| row.kind == DependencyKind::SystemVoiceEngine),
+            "{:?}",
+            report.dependencies
+        );
+    }
+
+    /// Story 3.13: on Windows the System voice's row is what the injected
+    /// probe says — ready with voices, blocking with Windows' steps without.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn the_windows_system_voice_row_follows_the_injected_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::new()
+            .unset(assets::RUNTIME_DYLIB_ENV)
+            .set(assets::CACHE_ROOT_ENV, dir.path());
+        let request = CheckRequest {
+            backend: SpeechBackend::CPU,
+            selection: voice_me_core::BackendSelection::SystemVoice,
+            has_api_key: false,
+            has_region: false,
+            has_voice: false,
+            piper_voice: None,
+        };
+        let check = |probe: fn() -> Result<usize, String>| {
+            let (tx, mut rx) = futures::channel::mpsc::unbounded();
+            DepsAdapter::new()
+                .with_gpu_probe(NoGpu)
+                .with_system_voice_probe(probe)
+                .check(request.clone(), tx)
+                .unwrap();
+            let AppEvent::DependencyCheckCompleted { report } = rx.try_recv().unwrap() else {
+                panic!("the check sends exactly one kind of event");
+            };
+            row(&report.dependencies, DependencyKind::BackendCapability).clone()
+        };
+
+        assert!(!check(|| Ok(3)).status.is_missing());
+        let blocked = check(|| Ok(0));
+        assert!(blocked.status.is_missing());
+        assert!(!blocked.automatable);
+        assert!(blocked.detail.contains("Add voices"), "{}", blocked.detail);
+        assert!(check(|| Err("no engine".to_string())).status.is_missing());
     }
 
     #[test]

@@ -310,6 +310,14 @@ impl LanguageBackend {
     /// backend with a voice list the listed language it matches (trimmed,
     /// compared without regard to ASCII case). `None` outside the set,
     /// never a default.
+    ///
+    /// Story 3.13 (decision 1): with no exact match, the fallback treats
+    /// `_` and `-` alike (`tr_TR` finds `tr-TR`), then a bare primary subtag
+    /// matches a listed tag with that primary subtag, and the other way
+    /// round — the saved `tr` finds Windows' `tr-TR`, the first listed one
+    /// when several share it. Two tags that both carry a region never
+    /// match each other (`en-gb` never finds `en-us`), so every code that
+    /// resolved before still resolves to the same language.
     pub fn resolve_language(self, saved: &str, voices: &[StockVoice]) -> Option<String> {
         match self {
             backend if backend.has_voice_list() => {
@@ -317,6 +325,16 @@ impl LanguageBackend {
                 voices
                     .iter()
                     .find(|voice| voice.language.eq_ignore_ascii_case(saved))
+                    .or_else(|| {
+                        voices
+                            .iter()
+                            .find(|voice| same_tag_any_separator(saved, &voice.language))
+                    })
+                    .or_else(|| {
+                        voices
+                            .iter()
+                            .find(|voice| same_primary_language(saved, &voice.language))
+                    })
                     .map(|voice| voice.language.clone())
             }
             _ => self
@@ -365,6 +383,33 @@ pub struct StockVoice {
     pub name: String,
     /// The priority within the language: lower is preferred.
     pub priority: u32,
+}
+
+/// Whether `a` and `b` are the same tag once `_` and `-` are read alike,
+/// without regard to ASCII case: `tr_TR` and `tr-TR` (decision 1's
+/// fallback, Story 3.13).
+fn same_tag_any_separator(a: &str, b: &str) -> bool {
+    let separator = |byte: u8| if byte == b'_' { b'-' } else { byte };
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .all(|(x, y)| separator(x).eq_ignore_ascii_case(&separator(y)))
+}
+
+/// A language tag's primary subtag: `tr` of `tr-TR`, `en` of `en_gb` (the
+/// fallback reads `_` and `-` alike).
+fn primary_subtag(tag: &str) -> &str {
+    tag.split(['-', '_']).next().unwrap_or(tag)
+}
+
+/// Decision 1's fallback (Story 3.13): `a` and `b` share a primary subtag
+/// (without regard to ASCII case) and at least one of them is nothing but
+/// that subtag — `tr` ↔ `tr-TR`, never `en-gb` ↔ `en-us`.
+fn same_primary_language(a: &str, b: &str) -> bool {
+    let (primary_a, primary_b) = (primary_subtag(a), primary_subtag(b));
+    !primary_a.is_empty()
+        && primary_a.eq_ignore_ascii_case(primary_b)
+        && (primary_a.len() == a.len() || primary_b.len() == b.len())
 }
 
 /// The distinct languages `voices` speak (compared without regard to ASCII
@@ -1561,6 +1606,116 @@ mod tests {
                 5,
             ),
         ]
+    }
+
+    /// Windows' voices report BCP-47 tags (Story 3.13).
+    fn windows_voices() -> Vec<StockVoice> {
+        vec![
+            voice("tolga", "tr-TR", "Microsoft Tolga", 0),
+            voice("david", "en-US", "Microsoft David", 1),
+            voice("zira", "en-US", "Microsoft Zira", 2),
+            voice("hazel", "en-GB", "Microsoft Hazel", 3),
+        ]
+    }
+
+    /// Decision 1: the saved `tr` finds `tr-TR` — and `tr-TR` finds a bare
+    /// `tr` the other way round.
+    #[test]
+    fn a_bare_primary_subtag_falls_back_to_a_listed_regional_tag() {
+        let backend = LanguageBackend::SystemVoice;
+        assert_eq!(
+            backend.resolve_language("tr", &windows_voices()).as_deref(),
+            Some("tr-TR")
+        );
+        assert_eq!(
+            backend
+                .resolve_language(" TR ", &windows_voices())
+                .as_deref(),
+            Some("tr-TR")
+        );
+        // Several share the subtag: the first listed.
+        assert_eq!(
+            backend.resolve_language("en", &windows_voices()).as_deref(),
+            Some("en-US")
+        );
+        assert_eq!(
+            resolve_stock_voice(backend, &windows_voices(), "tr", None)
+                .unwrap()
+                .id,
+            "tolga"
+        );
+        assert_eq!(
+            backend.resolve_language("tr-TR", &some_voices()).as_deref(),
+            Some("tr")
+        );
+        // No language with that subtag at all.
+        assert_eq!(backend.resolve_language("de", &windows_voices()), None);
+        assert_eq!(backend.resolve_language("", &windows_voices()), None);
+        // Azure's and Edge TTS's lists get the same fallback.
+        assert_eq!(
+            LanguageBackend::Remote(RemoteProvider::Azure)
+                .resolve_language("tr", &windows_voices())
+                .as_deref(),
+            Some("tr-TR")
+        );
+    }
+
+    /// Decision 1's fallback reads `_` and `-` alike.
+    #[test]
+    fn an_underscore_tag_finds_the_same_tag_with_a_hyphen() {
+        let backend = LanguageBackend::SystemVoice;
+        assert_eq!(
+            backend
+                .resolve_language("tr_TR", &windows_voices())
+                .as_deref(),
+            Some("tr-TR")
+        );
+        assert_eq!(
+            backend
+                .resolve_language("en_gb", &windows_voices())
+                .as_deref(),
+            Some("en-GB")
+        );
+        // Still never another region.
+        assert_eq!(backend.resolve_language("en_AU", &windows_voices()), None);
+    }
+
+    #[test]
+    fn an_exact_match_wins_over_the_primary_subtag() {
+        let mut voices = windows_voices();
+        voices.push(voice("bare", "en", "Bare English", 9));
+        assert_eq!(
+            LanguageBackend::SystemVoice
+                .resolve_language("en", &voices)
+                .as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            LanguageBackend::SystemVoice
+                .resolve_language("en-gb", &voices)
+                .as_deref(),
+            Some("en-GB")
+        );
+    }
+
+    /// eSpeak's codes resolve exactly as before: `en-gb` stays `en-gb`,
+    /// and two regional tags never match each other.
+    #[test]
+    fn espeak_regional_codes_are_unchanged() {
+        let backend = LanguageBackend::SystemVoice;
+        assert_eq!(
+            backend.resolve_language("en-gb", &some_voices()).as_deref(),
+            Some("en-gb")
+        );
+        assert_eq!(
+            backend.resolve_language("en-us", &some_voices()).as_deref(),
+            Some("en-us")
+        );
+        assert_eq!(backend.resolve_language("en-029", &some_voices()), None);
+        assert_eq!(
+            backend.resolve_language("yue", &some_voices()).as_deref(),
+            Some("yue")
+        );
     }
 
     #[test]

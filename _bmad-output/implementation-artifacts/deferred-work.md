@@ -231,3 +231,6 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-native-gnome-kde-hotkey.md`
   summary: Unverified (high): Plasma 6's kglobalacceld may no longer expose the KF5-era `setShortcut`/`shortcut` (`ai`) methods that `kde.rs` calls. KDE would then always fall back to the portal.
   evidence: Settle it on Plasma 6 with `qdbus6 org.kde.kglobalaccel /kglobalaccel` or `busctl --user introspect org.kde.kglobalaccel /kglobalaccel`. The fix, if needed: `setShortcutKeys`/`shortcutKeys` with `a(ai)`.
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-13-speak-instantly-with-the-windows-speech-engine.md`
+  summary: `voice-me-tts-system-windows/src/wav.rs` is an extended copy of `voice-me-tts-system-linux/src/wav.rs`, so fixes and formats can diverge between the two System voices.
+  evidence: The Windows copy reads 24/32-bit PCM, float and extensible headers; the Linux one reads 16-bit PCM only. A small shared audio-decode crate (not an adapter, so AD-2 allows it) would hold one decoder.

@@ -539,6 +539,18 @@ fn relaunch() -> Result<(), String> {
         .map_err(|error| format!("Could not restart voice-me: {error}"))
 }
 
+/// The process's one Dependency Check and provisioning adapter.
+///
+/// Story 3.13: on Windows the System voice row asks Windows' speech engine
+/// for its voices through the System voice's own crate — `voice-me-deps`
+/// never calls a TTS adapter.
+fn deps_adapter() -> DepsAdapter {
+    let adapter = DepsAdapter::new();
+    #[cfg(target_os = "windows")]
+    let adapter = adapter.with_system_voice_probe(voice_me_tts_system_windows::count_voices);
+    adapter
+}
+
 /// The speech engine for the current selection, or why there is none.
 struct Engine {
     port: Option<Arc<dyn TtsPort>>,
@@ -594,7 +606,8 @@ fn build_engine(
         };
     }
     // Story 3.12: the System voice is eSpeak NG as a child process on
-    // Linux, and has no engine elsewhere yet.
+    // Linux; Story 3.13: Windows' own speech engine through WinRT. It has
+    // no engine elsewhere yet.
     if let BackendSelection::SystemVoice = &state.backend_selection {
         #[cfg(target_os = "linux")]
         return Engine {
@@ -602,7 +615,15 @@ fn build_engine(
             unavailable: None,
             generation,
         };
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "windows")]
+        return Engine {
+            port: Some(Arc::new(
+                voice_me_tts_system_windows::SystemVoiceWindows::new(),
+            )),
+            unavailable: None,
+            generation,
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         return unavailable(
             "The System voice on this system arrives in a later voice-me release. Choose \
              another backend under Settings → Backend."
@@ -921,6 +942,90 @@ fn apply_edge_tts_listing(
                 );
             }
         }
+    }
+}
+
+/// How decision 2's note starts beside the speech language (Story 3.13).
+// Only the Windows listing (and the tests) use it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const WINDOWS_VOICE_MISSING: &str = "No installed Windows voice speaks ";
+
+/// How a failed listing of Windows' voices starts its message beside the
+/// speech language (Story 3.13).
+// Only the Windows listing (and the tests) use it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const WINDOWS_VOICE_LIST_ERROR: &str = "Couldn't list the System voice's voices: ";
+
+/// Story 3.13 (decision 2): what the Backend tab says beside the speech
+/// language when no installed Windows voice speaks the saved `language`
+/// (matched as Speak matches it, `tr` ↔ `tr-TR`) — with Windows' own steps
+/// to add one. Speak stays blocked by the stock-voice resolution itself.
+/// `None` when a voice speaks it, when the language is blank, or when
+/// there is no list to judge by.
+// Only the Windows listing (and the tests) use it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_voice_missing_note(language: &str, voices: &[StockVoice]) -> Option<String> {
+    let language = language.trim();
+    if language.is_empty()
+        || voices.is_empty()
+        || LanguageBackend::SystemVoice
+            .resolve_language(language, voices)
+            .is_some()
+    {
+        return None;
+    }
+    Some(format!(
+        "{WINDOWS_VOICE_MISSING}{language:?}. To add one: {} Or choose another speech language.",
+        voice_me_deps::capability::WINDOWS_ADD_VOICES_STEPS.join(" ")
+    ))
+}
+
+/// Remove the speech-language message only if a listing of Windows' voices
+/// set it (decision 2's note or a failed listing), so a failed language
+/// save is never cleared by a listing.
+// Only the Windows listing (and the tests) use it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn clear_windows_listing_error(errors: &mut HashMap<BackendArea, String>) {
+    clear_list_error(errors, WINDOWS_VOICE_MISSING);
+    clear_list_error(errors, WINDOWS_VOICE_LIST_ERROR);
+}
+
+/// Story 3.13: apply one finished listing of Windows' voices. The list
+/// replaces the held one (a failed listing is an empty list), and the slot
+/// beside the speech language says that no installed voice speaks the saved
+/// `language` (decision 2) or why the listing failed — clearing only what a
+/// listing set itself, and never replacing another error there (a failed
+/// language save). The Dependencies tab's System voice row covers a missing
+/// engine (decision 3).
+// Only the Windows listing (and the tests) use it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn apply_windows_voice_listing(
+    result: Result<Vec<StockVoice>, VoiceMeError>,
+    language: &str,
+    voices: &mut Vec<StockVoice>,
+    errors: &mut HashMap<BackendArea, String>,
+) {
+    clear_windows_listing_error(errors);
+    let message = match result {
+        Ok(listed) => {
+            let note = windows_voice_missing_note(language, &listed);
+            *voices = listed;
+            note
+        }
+        Err(error) => {
+            eprintln!("could not list the System voice's voices: {error}");
+            voices.clear();
+            let reason = match error {
+                VoiceMeError::SpeechEngine(reason) => reason,
+                other => other.to_string(),
+            };
+            Some(format!("{WINDOWS_VOICE_LIST_ERROR}{reason}"))
+        }
+    };
+    if let Some(message) = message
+        && !errors.contains_key(&BackendArea::SpeechLanguage)
+    {
+        errors.insert(BackendArea::SpeechLanguage, message);
     }
 }
 
@@ -2261,6 +2366,154 @@ mod tests {
             }
         }
 
+        /// Story 3.13 (decision 2): the saved `tr` is spoken by a listed
+        /// `tr-TR` voice, so nothing is said; a saved `de` with no German
+        /// voice names Windows' Add voices steps beside the speech
+        /// language, and Speak stays refused by the stock-voice resolution.
+        #[test]
+        fn a_windows_language_with_no_installed_voice_names_windows_steps() {
+            let listing = || Ok(vec![listed("tolga")]);
+            let mut voices = Vec::new();
+            let mut errors = HashMap::new();
+
+            apply_windows_voice_listing(listing(), "tr", &mut voices, &mut errors);
+            assert_eq!(voices, vec![listed("tolga")]);
+            assert!(errors.is_empty(), "{errors:?}");
+
+            apply_windows_voice_listing(listing(), "de", &mut voices, &mut errors);
+            let note = &errors[&BackendArea::SpeechLanguage];
+            assert!(
+                note.contains("No installed Windows voice speaks \"de\""),
+                "{note}"
+            );
+            assert!(
+                note.contains("Settings → Time & language → Speech") && note.contains("Add voices"),
+                "{note}"
+            );
+            assert!(
+                voice_me_core::resolve_stock_voice(
+                    LanguageBackend::SystemVoice,
+                    &voices,
+                    "de",
+                    None
+                )
+                .is_err()
+            );
+
+            // Picking a spoken language clears the note on the next listing.
+            apply_windows_voice_listing(listing(), "tr-TR", &mut voices, &mut errors);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(windows_voice_missing_note("de", &[]), None);
+        }
+
+        /// A blank or unset language gets no note naming `""`.
+        #[test]
+        fn a_blank_language_gets_no_windows_voice_note() {
+            let voices = vec![listed("tolga")];
+            assert_eq!(windows_voice_missing_note("", &voices), None);
+            assert_eq!(windows_voice_missing_note("  \n", &voices), None);
+            let mut errors = HashMap::new();
+            let mut held = Vec::new();
+            apply_windows_voice_listing(Ok(voices), "", &mut held, &mut errors);
+            assert!(errors.is_empty(), "{errors:?}");
+        }
+
+        /// A failed language save beside the speech language survives
+        /// every listing, whatever it finds; a listing clears only what a
+        /// listing set.
+        #[test]
+        fn a_windows_listing_never_touches_a_failed_language_save() {
+            let save_error = "Couldn't save the speech language: disk full".to_string();
+            let failure = || {
+                Err(VoiceMeError::SpeechEngine(
+                    "Windows speech did not finish listing its voices within 15 seconds"
+                        .to_string(),
+                ))
+            };
+            let mut voices = Vec::new();
+            let mut errors = HashMap::new();
+            errors.insert(BackendArea::SpeechLanguage, save_error.clone());
+
+            for language in ["tr", "de"] {
+                apply_windows_voice_listing(
+                    Ok(vec![listed("tolga")]),
+                    language,
+                    &mut voices,
+                    &mut errors,
+                );
+                assert_eq!(errors[&BackendArea::SpeechLanguage], save_error);
+            }
+            apply_windows_voice_listing(failure(), "tr", &mut voices, &mut errors);
+            assert_eq!(errors[&BackendArea::SpeechLanguage], save_error);
+            assert!(voices.is_empty());
+
+            // Its own failure is replaced by the next listing's note, then
+            // cleared.
+            errors.clear();
+            apply_windows_voice_listing(failure(), "de", &mut voices, &mut errors);
+            assert!(errors[&BackendArea::SpeechLanguage].starts_with(WINDOWS_VOICE_LIST_ERROR));
+            apply_windows_voice_listing(Ok(vec![listed("tolga")]), "de", &mut voices, &mut errors);
+            assert!(errors[&BackendArea::SpeechLanguage].starts_with(WINDOWS_VOICE_MISSING));
+            apply_windows_voice_listing(Ok(vec![listed("tolga")]), "tr", &mut voices, &mut errors);
+            assert!(errors.is_empty(), "{errors:?}");
+        }
+
+        /// Story 3.13: the adapter `main()` builds asks Windows speech
+        /// itself for the System voice row, never the default probe.
+        #[test]
+        #[cfg(target_os = "windows")]
+        fn the_windows_system_voice_row_asks_windows_speech() {
+            let (tx, mut rx) = mpsc::unbounded();
+            deps_adapter()
+                .check(
+                    CheckRequest {
+                        backend: SpeechBackend::CPU,
+                        selection: BackendSelection::SystemVoice,
+                        has_api_key: false,
+                        has_region: false,
+                        has_voice: false,
+                        piper_voice: None,
+                    },
+                    tx,
+                )
+                .unwrap();
+            let AppEvent::DependencyCheckCompleted { report } = rx.try_recv().unwrap() else {
+                panic!("the check sends exactly one kind of event");
+            };
+            let row = report
+                .dependencies
+                .iter()
+                .find(|row| row.kind == DependencyKind::BackendCapability)
+                .expect("the System voice row");
+            assert!(
+                !row.detail
+                    .contains(voice_me_deps::capability::NO_SYSTEM_VOICE_PROBE),
+                "{}",
+                row.detail
+            );
+        }
+
+        /// Story 3.13: a listing that fails is an empty list, and says why
+        /// without the "speech engine failure" frame.
+        #[test]
+        fn a_failed_windows_listing_empties_the_list_and_says_why() {
+            let mut voices = vec![listed("tolga")];
+            let mut errors = HashMap::new();
+            apply_windows_voice_listing(
+                Err(VoiceMeError::SpeechEngine(
+                    "Windows speech lists no installed voices".to_string(),
+                )),
+                "tr",
+                &mut voices,
+                &mut errors,
+            );
+            assert!(voices.is_empty());
+            assert_eq!(
+                errors[&BackendArea::SpeechLanguage],
+                "Couldn't list the System voice's voices: Windows speech lists no installed voices"
+            );
+        }
+
         /// Story 3.17: a listing replaces the held list and clears only
         /// its own error.
         #[test]
@@ -2311,7 +2564,8 @@ mod tests {
 
         /// Story 3.12: the System voice is never an ONNX target — it
         /// resolves to the CPU placeholder, needs no key, no library and no
-        /// restart — and on Linux gets the eSpeak NG engine.
+        /// restart — and on Linux gets the eSpeak NG engine; on Windows
+        /// (Story 3.13) Windows speech's, built without calling WinRT.
         #[test]
         fn the_system_voice_gets_its_own_engine_and_no_onnx_runtime() {
             let selection = BackendSelection::SystemVoice;
@@ -2328,12 +2582,12 @@ mod tests {
 
             let (tx, _rx) = mpsc::unbounded();
             let engine = build_engine(&state, None, &tx, &unused_store());
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             {
                 assert!(engine.unavailable.is_none());
                 assert!(engine.port.expect("an engine in the slot").is_ready());
             }
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
             {
                 assert!(engine.port.is_none());
                 assert!(
@@ -2648,7 +2902,7 @@ fn main() {
         // adapter for the whole process — it remembers which rows are
         // installing, so a second Install on the same row is refused
         // rather than racing the first on one `.part` file.
-        let deps_adapter = Arc::new(DepsAdapter::new());
+        let deps_adapter = Arc::new(deps_adapter());
         let deps_port: Arc<dyn DependencyProvisioningPort> = deps_adapter.clone();
         // Story 3.15: the same adapter serves the Piper voices tab, so a
         // voice its catalog listed is one the voice row can install too.
@@ -2786,6 +3040,9 @@ fn main() {
         // the System voice selected. Held here, never persisted, and merged
         // into `AppState` and the panel like the dependency outcome.
         let system_voices: Rc<RefCell<Vec<StockVoice>>> = Rc::new(RefCell::new(Vec::new()));
+        // Story 3.13: bumped by every Windows listing, so one that finishes
+        // late — overtaken by a newer one — is discarded.
+        let system_voice_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         // Story 3.14 (D1): Azure's voice list, fetched at every check run
         // with Azure selected and a key and region saved. Cached for the
         // session, never persisted; saving a new key or region drops it.
@@ -2906,17 +3163,20 @@ fn main() {
         let refresh_system_voices: Rc<dyn Fn(&mut App)> = Rc::new({
             let settings_store = settings_store.clone();
             let system_voices = system_voices.clone();
+            let system_voice_generation = system_voice_generation.clone();
             let backend_errors = backend_errors.clone();
             let push_panel = push_panel.clone();
             move |cx: &mut App| {
-                let selected = settings_store
-                    .load()
-                    .is_ok_and(|state| state.backend_selection.is_system_voice());
-                if !selected {
+                let Ok(state) = settings_store.load() else {
+                    return;
+                };
+                if !state.backend_selection.is_system_voice() {
                     return;
                 }
                 #[cfg(target_os = "linux")]
                 {
+                    // Only the Windows listing counts generations.
+                    let _ = &system_voice_generation;
                     let list = cx
                         .background_spawn(async move { voice_me_tts_system_linux::list_voices() });
                     let system_voices = system_voices.clone();
@@ -2944,8 +3204,55 @@ fn main() {
                     })
                     .detach();
                 }
-                #[cfg(not(target_os = "linux"))]
-                let _ = (&system_voices, &backend_errors, &push_panel, cx);
+                // Story 3.13: Windows' installed voices, listed on the
+                // System voice's own worker thread, off GPUI's. A saved
+                // language no installed voice speaks is said beside the
+                // speech language, with Windows' steps (decision 2).
+                #[cfg(target_os = "windows")]
+                {
+                    let language = state.speech_language().unwrap_or_default().to_string();
+                    let generation = system_voice_generation.get() + 1;
+                    system_voice_generation.set(generation);
+                    let list =
+                        cx.background_spawn(
+                            async move { voice_me_tts_system_windows::list_voices() },
+                        );
+                    let settings_store = settings_store.clone();
+                    let system_voices = system_voices.clone();
+                    let system_voice_generation = system_voice_generation.clone();
+                    let backend_errors = backend_errors.clone();
+                    let push_panel = push_panel.clone();
+                    cx.spawn(async move |cx| {
+                        let result = list.await;
+                        // Overtaken by a newer listing, or the System voice
+                        // or its language is no longer what is saved: not
+                        // this list's to set.
+                        let current = settings_store.load().is_ok_and(|state| {
+                            state.backend_selection.is_system_voice()
+                                && state.speech_language().unwrap_or_default() == language
+                        });
+                        if system_voice_generation.get() != generation || !current {
+                            return;
+                        }
+                        apply_windows_voice_listing(
+                            result,
+                            &language,
+                            &mut system_voices.borrow_mut(),
+                            &mut backend_errors.borrow_mut(),
+                        );
+                        cx.update(|cx| (*push_panel)(cx));
+                    })
+                    .detach();
+                }
+                #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+                let _ = (
+                    &state,
+                    &system_voices,
+                    &system_voice_generation,
+                    &backend_errors,
+                    &push_panel,
+                    cx,
+                );
             }
         });
 

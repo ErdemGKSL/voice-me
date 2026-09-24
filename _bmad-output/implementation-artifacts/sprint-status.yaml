@@ -68,7 +68,7 @@ development_status:
   3-10-give-backends-their-own-settings-tab: review
   3-11-choose-the-speech-language-per-backend: review
   3-12-speak-instantly-with-espeak-ng-on-linux: review
-  3-13-speak-instantly-with-the-windows-speech-engine: backlog
+  3-13-speak-instantly-with-the-windows-speech-engine: review
   3-14-generate-through-azure-neural-tts: review
   3-15-speak-naturally-and-instantly-with-piper-on-linux: review
   3-16-speak-with-piper-on-windows: review
