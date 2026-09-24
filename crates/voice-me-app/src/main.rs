@@ -718,6 +718,38 @@ fn clear_list_error(errors: &mut HashMap<BackendArea, String>, prefix: &str) {
     }
 }
 
+/// Apply one finished Edge TTS listing (Story 3.17): a list replaces the
+/// held one and clears only the listing's own error; a failure keeps the
+/// held list and says why beside the speech language — unless that slot
+/// already holds another error (a failed language save), which it never
+/// replaces.
+// Only the Linux listing (and the tests) use it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn apply_edge_tts_listing(
+    result: Result<Vec<StockVoice>, VoiceMeError>,
+    voices: &mut Vec<StockVoice>,
+    errors: &mut HashMap<BackendArea, String>,
+) {
+    match result {
+        Ok(listed) => {
+            clear_edge_tts_list_error(errors);
+            *voices = listed;
+        }
+        Err(error) => {
+            eprintln!("could not list Edge TTS voices: {error}");
+            let unrelated = errors
+                .get(&BackendArea::SpeechLanguage)
+                .is_some_and(|message| !message.starts_with(EDGE_TTS_LIST_ERROR));
+            if !unrelated {
+                errors.insert(
+                    BackendArea::SpeechLanguage,
+                    format!("{EDGE_TTS_LIST_ERROR}{}", edge_tts_list_reason(&error)),
+                );
+            }
+        }
+    }
+}
+
 /// The reason a failed Edge TTS listing gives, without the "speech engine
 /// failure" frame: the adapter's message already names Edge TTS.
 // Only the Linux listing (and the tests) use it.
@@ -1788,7 +1820,7 @@ mod tests {
             assert!(errors.contains_key(&BackendArea::SpeechLanguage));
 
             let reason = edge_tts_list_reason(&VoiceMeError::SpeechEngine(
-                "Edge TTS listed no voices".to_string(),
+                "Edge TTS listed no voices — update it: pipx upgrade edge-tts".to_string(),
             ));
             errors.insert(
                 BackendArea::SpeechLanguage,
@@ -1796,12 +1828,70 @@ mod tests {
             );
             assert_eq!(
                 errors[&BackendArea::SpeechLanguage],
-                "Couldn't list Edge TTS voices: Edge TTS listed no voices"
+                "Couldn't list Edge TTS voices: Edge TTS listed no voices — update it: pipx upgrade edge-tts"
             );
             clear_azure_list_error(&mut errors);
             assert!(errors.contains_key(&BackendArea::SpeechLanguage));
             clear_edge_tts_list_error(&mut errors);
             assert!(errors.is_empty());
+        }
+
+        fn listed(id: &str) -> StockVoice {
+            StockVoice {
+                id: id.to_string(),
+                language: "tr-TR".to_string(),
+                language_label: "tr-TR".to_string(),
+                name: id.to_string(),
+                priority: 0,
+            }
+        }
+
+        /// Story 3.17: a listing replaces the held list and clears only
+        /// its own error.
+        #[test]
+        fn an_edge_tts_listing_replaces_the_list_and_clears_only_its_own_error() {
+            let mut voices = vec![listed("tr-TR-OldNeural")];
+            let mut errors = HashMap::new();
+            errors.insert(
+                BackendArea::SpeechLanguage,
+                format!("{EDGE_TTS_LIST_ERROR}Edge TTS took longer than 15 s"),
+            );
+            apply_edge_tts_listing(
+                Ok(vec![listed("tr-TR-AhmetNeural")]),
+                &mut voices,
+                &mut errors,
+            );
+            assert_eq!(voices, vec![listed("tr-TR-AhmetNeural")]);
+            assert!(errors.is_empty());
+
+            let save_error = "Couldn't save the speech language: disk full".to_string();
+            errors.insert(BackendArea::SpeechLanguage, save_error.clone());
+            apply_edge_tts_listing(Ok(Vec::new()), &mut voices, &mut errors);
+            assert_eq!(errors[&BackendArea::SpeechLanguage], save_error);
+        }
+
+        /// Story 3.17: a failed listing keeps the held list and says why —
+        /// but never over an unrelated speech-language error.
+        #[test]
+        fn a_failed_edge_tts_listing_keeps_the_list_and_never_hides_another_error() {
+            let failure = || {
+                Err(VoiceMeError::SpeechEngine(
+                    "Edge TTS took longer than 15 s".to_string(),
+                ))
+            };
+            let mut voices = vec![listed("tr-TR-AhmetNeural")];
+            let mut errors = HashMap::new();
+            apply_edge_tts_listing(failure(), &mut voices, &mut errors);
+            assert_eq!(voices, vec![listed("tr-TR-AhmetNeural")]);
+            assert_eq!(
+                errors[&BackendArea::SpeechLanguage],
+                "Couldn't list Edge TTS voices: Edge TTS took longer than 15 s"
+            );
+
+            let save_error = "Couldn't save the speech language: disk full".to_string();
+            errors.insert(BackendArea::SpeechLanguage, save_error.clone());
+            apply_edge_tts_listing(failure(), &mut voices, &mut errors);
+            assert_eq!(errors[&BackendArea::SpeechLanguage], save_error);
         }
 
         /// Story 3.12: the System voice is never an ONNX target — it
@@ -2228,6 +2318,10 @@ fn main() {
         // check run with Edge TTS selected and the program found. Held here,
         // never persisted, and merged into `AppState` and the panel.
         let edge_tts_voices: Rc<RefCell<Vec<StockVoice>>> = Rc::new(RefCell::new(Vec::new()));
+        // Bumped by every new listing and every selection change, so a
+        // listing that finishes late — overtaken, or for a backend no
+        // longer selected — is discarded.
+        let edge_tts_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
 
         // What the backend section shows, from the settings file and the
         // state above.
@@ -2412,6 +2506,7 @@ fn main() {
         let refresh_edge_tts_voices: Rc<dyn Fn(&mut App)> = Rc::new({
             let settings_store = settings_store.clone();
             let edge_tts_voices = edge_tts_voices.clone();
+            let edge_tts_generation = edge_tts_generation.clone();
             let backend_errors = backend_errors.clone();
             let push_panel = push_panel.clone();
             move |cx: &mut App| {
@@ -2427,33 +2522,42 @@ fn main() {
                         clear_edge_tts_list_error(&mut backend_errors.borrow_mut());
                         return;
                     }
+                    let generation = edge_tts_generation.get() + 1;
+                    edge_tts_generation.set(generation);
                     let list = cx.background_spawn(async move { voice_me_tts_edge::list_voices() });
+                    let settings_store = settings_store.clone();
                     let edge_tts_voices = edge_tts_voices.clone();
+                    let edge_tts_generation = edge_tts_generation.clone();
                     let backend_errors = backend_errors.clone();
                     let push_panel = push_panel.clone();
                     cx.spawn(async move |cx| {
-                        match list.await {
-                            Ok(voices) => {
-                                clear_edge_tts_list_error(&mut backend_errors.borrow_mut());
-                                *edge_tts_voices.borrow_mut() = voices;
-                            }
-                            Err(error) => {
-                                eprintln!("could not list Edge TTS voices: {error}");
-                                backend_errors.borrow_mut().insert(
-                                    BackendArea::SpeechLanguage,
-                                    format!(
-                                        "{EDGE_TTS_LIST_ERROR}{}",
-                                        edge_tts_list_reason(&error)
-                                    ),
-                                );
-                            }
+                        let result = list.await;
+                        // Overtaken by a newer listing, or Edge TTS is no
+                        // longer the saved selection: not this list's to set.
+                        let still_selected = settings_store.load().is_ok_and(|state| {
+                            state.backend_selection
+                                == BackendSelection::Remote(RemoteProvider::EdgeTts)
+                        });
+                        if edge_tts_generation.get() != generation || !still_selected {
+                            return;
                         }
+                        apply_edge_tts_listing(
+                            result,
+                            &mut edge_tts_voices.borrow_mut(),
+                            &mut backend_errors.borrow_mut(),
+                        );
                         cx.update(|cx| (*push_panel)(cx));
                     })
                     .detach();
                 }
                 #[cfg(not(target_os = "linux"))]
-                let _ = (&edge_tts_voices, &backend_errors, &push_panel, cx);
+                let _ = (
+                    &edge_tts_voices,
+                    &edge_tts_generation,
+                    &backend_errors,
+                    &push_panel,
+                    cx,
+                );
             }
         });
 
@@ -2537,7 +2641,11 @@ fn main() {
             let runtime_error = runtime_error.clone();
             let warmed_up = warmed_up.clone();
             let remote_store = remote_store.clone();
+            let edge_tts_generation = edge_tts_generation.clone();
             move |selection: BackendSelection, area: BackendArea, cx: &mut App| {
+                // Story 3.17: an Edge TTS listing in flight is for the old
+                // selection.
+                edge_tts_generation.set(edge_tts_generation.get() + 1);
                 match settings_store.save_backend_selection(&selection) {
                     Err(error) => {
                         backend_errors

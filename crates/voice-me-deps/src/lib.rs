@@ -611,11 +611,20 @@ fn system_voice_rows() -> Vec<Dependency> {
 /// pipx command when it is not found.
 #[cfg(target_os = "linux")]
 fn edge_tts_rows() -> Vec<Dependency> {
-    let found = voice_me_tts_edge::find_program();
+    edge_tts_rows_with(
+        voice_me_tts_edge::find_program(),
+        &voice_me_tts_system_linux::read_os_release(),
+    )
+}
+
+/// [`edge_tts_rows`] with where the program was found and the contents of
+/// `/etc/os-release` given, so both branches are testable on any host.
+#[cfg(target_os = "linux")]
+fn edge_tts_rows_with(found: Option<std::path::PathBuf>, os_release: &str) -> Vec<Dependency> {
     let steps = if found.is_some() {
         Vec::new()
     } else {
-        voice_me_tts_edge::install_steps()
+        voice_me_tts_edge::install_steps_for(os_release)
     };
     vec![capability::edge_tts_program_row(found.as_deref(), steps)]
 }
@@ -1291,6 +1300,38 @@ mod tests {
                 report.dependencies[0].detail
             );
         }
+    }
+
+    /// Story 3.17: both branches of the program row, whatever this host
+    /// has installed.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_edge_tts_row_is_blocking_with_pipx_steps_or_ready() {
+        let rows = edge_tts_rows_with(None, "ID=ubuntu\nID_LIKE=debian\n");
+        assert_eq!(rows.len(), 1);
+        let missing = &rows[0];
+        assert_eq!(missing.kind, DependencyKind::EdgeTtsProgram);
+        assert!(missing.status.is_missing());
+        assert!(missing.kind.blocks_speech());
+        assert!(!missing.automatable);
+        assert_eq!(
+            missing.detail,
+            "edge-tts is not installed. Please install it: pipx install edge-tts"
+        );
+        assert_eq!(
+            missing.manual_steps,
+            vec![
+                "If you don't have pipx: sudo apt install pipx".to_string(),
+                "Press Check again.".to_string(),
+            ]
+        );
+
+        let path = std::path::PathBuf::from("/home/erdem/.local/bin/edge-tts");
+        let rows = edge_tts_rows_with(Some(path), "ID=ubuntu\n");
+        let ready = &rows[0];
+        assert!(!ready.status.is_missing());
+        assert_eq!(ready.detail, "Found at /home/erdem/.local/bin/edge-tts.");
+        assert!(ready.manual_steps.is_empty());
     }
 
     /// Story 3.17: there is no Install for `edge-tts`.

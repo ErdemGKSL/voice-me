@@ -75,8 +75,9 @@ pub fn find_program_in(path: Option<&OsStr>, home: Option<&Path>) -> Option<Path
     let on_path = path
         .into_iter()
         .flat_map(std::env::split_paths)
-        // An empty entry is not "the current directory" here.
-        .filter(|dir| !dir.as_os_str().is_empty())
+        // An empty or relative entry ("", ".", "bin") would resolve against
+        // the app's working directory: only absolute directories count.
+        .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(PROGRAM));
     let local_bin = home
         .filter(|home| !home.as_os_str().is_empty())
@@ -153,7 +154,10 @@ impl EdgeTts {
         .map_err(run_failure)?;
         let voices = parse_voices(&String::from_utf8_lossy(&output));
         if voices.is_empty() {
-            return Err(failure("listed no voices".to_string()));
+            // An older edge-tts prints a list this parser cannot read.
+            return Err(failure(
+                "listed no voices — update it: pipx upgrade edge-tts".to_string(),
+            ));
         }
         Ok(voices)
     }
@@ -483,7 +487,10 @@ mod tests {
             .unwrap_err()
             .to_string();
 
-        assert!(error.contains("Edge TTS listed no voices"), "{error}");
+        assert!(
+            error.contains("Edge TTS listed no voices — update it: pipx upgrade edge-tts"),
+            "{error}"
+        );
     }
 
     /// The pipx install row: with an empty `PATH`, the program is found in
@@ -515,6 +522,17 @@ mod tests {
         );
         assert_eq!(find_program_in(None, Some(home.path())), Some(program));
         assert_eq!(find_program_in(Some(OsStr::new("")), None), None);
+
+        // Relative entries never resolve against the working directory.
+        let cwd = std::env::current_dir().unwrap();
+        let relative = tempfile::tempdir_in(&cwd).unwrap();
+        write_executable(&relative.path().join(PROGRAM), "#!/bin/sh\n");
+        let name = relative.path().file_name().unwrap().to_os_string();
+        let mut dot = OsString::from("./");
+        dot.push(&name);
+        for entry in [name.as_os_str(), dot.as_os_str()] {
+            assert_eq!(find_program_in(Some(entry), None), None, "{entry:?}");
+        }
     }
 
     #[test]

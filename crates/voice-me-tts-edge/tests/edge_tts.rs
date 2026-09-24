@@ -1,7 +1,9 @@
-//! Against the real `edge-tts`, when this machine has it. Skips itself
-//! (passing) when it does not, so it needs no `#[ignore]`. Synthesis needs
-//! Microsoft's unofficial service, so it runs only with
-//! `VOICE_ME_EDGE_TTS_ONLINE=1`: CI never depends on it.
+//! Against the real `edge-tts`. Both `--list-voices` and synthesis reach
+//! Microsoft's unofficial service, so every test here runs only when the
+//! program is found *and* `VOICE_ME_EDGE_TTS_ONLINE=1` is set; otherwise it
+//! skips itself (passing), so it needs no `#[ignore]`. CI never depends on
+//! the service: its pinned install only makes `find_program` and the
+//! Dependencies row see a real program.
 
 // The library is Linux-only, so on any other target this compiles to
 // nothing.
@@ -10,10 +12,15 @@
 use voice_me_core::{SAMPLE_RATE, TtsPort as _};
 use voice_me_tts_edge::{EdgeTts, find_program, list_voices};
 
+/// Whether the online tests may run here.
+fn online() -> bool {
+    find_program().is_some() && std::env::var("VOICE_ME_EDGE_TTS_ONLINE").as_deref() == Ok("1")
+}
+
 #[test]
 fn the_real_program_lists_the_turkish_voices() {
-    if find_program().is_none() {
-        eprintln!("skipped: edge-tts is not on PATH or in ~/.local/bin");
+    if !online() {
+        eprintln!("skipped: needs edge-tts and VOICE_ME_EDGE_TTS_ONLINE=1");
         return;
     }
 
@@ -28,7 +35,7 @@ fn the_real_program_lists_the_turkish_voices() {
 
 #[test]
 fn merhaba_is_spoken_at_24_khz_when_online() {
-    if find_program().is_none() || std::env::var("VOICE_ME_EDGE_TTS_ONLINE").as_deref() != Ok("1") {
+    if !online() {
         eprintln!("skipped: needs edge-tts and VOICE_ME_EDGE_TTS_ONLINE=1");
         return;
     }

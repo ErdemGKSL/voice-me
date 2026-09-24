@@ -29,8 +29,9 @@ jobs:
             libxrandr-dev \
             libssl-dev \
             espeak-ng
-      # Story 3.17: the pinned `edge-tts` the `--list-voices` smoke test
-      # runs against. Online synthesis stays off (VOICE_ME_EDGE_TTS_ONLINE).
+      # Story 3.17: a pinned `edge-tts`, so `find_program` and the
+      # Dependencies row see a real program. Every test that reaches
+      # Microsoft's service stays off (VOICE_ME_EDGE_TTS_ONLINE unset).
       - name: Install edge-tts
         run: pipx install edge-tts==7.2.8
       - run: cargo build --workspace
