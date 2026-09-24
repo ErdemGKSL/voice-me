@@ -4,7 +4,7 @@
 **Author:** Developer (implementation plan), for Erdem (product owner)
 **Mode:** Batch
 **Builds on:** Story 3.12 (eSpeak NG, the child-process pattern), Story 3.14 (Azure, the stock-voice list and disclosure), `sprint-change-proposal-2026-09-24-piper.md` (the shared runner)
-**Status:** Proposed — awaiting Erdem's approval of E1–E7. No PRD, architecture, epics or sprint-status edits are applied yet.
+**Status:** E4 (Remote + one-time disclosure) and the order (after 3.15 Piper) approved by Erdem, 2026-09-24. The PRD, architecture, epics and sprint-status edits in §5 are not applied yet.
 
 ---
 
@@ -44,7 +44,7 @@
 | 2.1 | Current epic | [x] | Epic 3 can still be completed. It gains one story |
 | 2.2 | Epic-level changes | [!] | New **Story 3.17** (Edge TTS on Linux). No story is renumbered |
 | 2.3–2.4 | Other epics | [N/A] | Epic 1: stock-voice backends already skip the first-run voice-setup prompt (3.12). Epic 4 adds the Turkish copy of the new strings |
-| 2.5 | Order | [?] | Proposed: after 3.15 Piper (E7), because both touch the shared process runner |
+| 2.5 | Order | [x] | After 3.15 Piper (approved 2026-09-24), because both touch the shared process runner (E7) |
 | 3.1 | PRD | [!] | FR-5 (stock-voice list), FR-7 (checked components), FR-10 (remote backends), §6.1, Glossary |
 | 3.2 | Architecture | [!] | AD-7 (backend table), **AD-8 (egress: a child process that talks to the network)**, AD-12 (a second fixed program), Structural seed, Capability map |
 | 3.3 | UX | [!] | A Remote entry "Edge TTS — free, online (stock voice)", its disclosure, and a missing-program state row |
