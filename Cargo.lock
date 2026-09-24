@@ -8817,10 +8817,12 @@ dependencies = [
 name = "voice-me-hotkey-linux"
 version = "0.1.0"
 dependencies = [
+ "ashpd",
  "evdev",
  "futures",
  "global-hotkey",
  "voice-me-core",
+ "zbus",
 ]
 
 [[package]]

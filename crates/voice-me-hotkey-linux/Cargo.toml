@@ -17,8 +17,15 @@ global-hotkey = "0.8"
 # `Device`/`fetch_events` API, so the optional `tokio`/`stream-trait` async
 # stack stays out of the build.
 evdev = { version = "0.13", default-features = false }
-
-[dev-dependencies]
-# For the spike example's `AppEventSender` channel — already resolved to
-# 0.3.34 in Cargo.lock via gpui's own dependency graph.
+# GNOME/KDE native path (spec-native-gnome-kde-hotkey): the D-Bus summon
+# service the GNOME shortcut's `gdbus call` reaches, and the kglobalaccel
+# client. The locked 5.x with exactly the features gpui-tray already
+# enables (async-io + blocking API), so no second zbus build is added.
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
+# The xdg-desktop-portal GlobalShortcuts path for other Wayland compositors.
+# The 0.13 gpui already locks, on async-io like gpui's own use of it.
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "global_shortcuts"] }
+# `block_on` for ashpd's futures on this crate's own threads, and the
+# spike example's `AppEventSender` channel — already resolved to 0.3.34 in
+# Cargo.lock via gpui's own dependency graph.
 futures = "0.3"

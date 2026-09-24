@@ -88,9 +88,9 @@ use voice_me_tts_remote::{
 };
 use voice_me_ui::{
     BackendAction, BackendActions, BackendArea, BackendPanel, ConfirmDisclosure, DependenciesTab,
-    DisclosureText, PROMPT_BAR_HEIGHT, PiperCatalogState, PiperVoicesAction, PiperVoicesActions,
-    PiperVoicesPanel, PiperVoicesTab, PromptOverlayView, RowProvisioning, SettingsView,
-    VoiceDownload, blocker_notice,
+    DisclosureText, HotkeyDesktop, PROMPT_BAR_HEIGHT, PiperCatalogState, PiperVoicesAction,
+    PiperVoicesActions, PiperVoicesPanel, PiperVoicesTab, PromptOverlayView, RowProvisioning,
+    SettingsView, VoiceDownload, blocker_notice,
 };
 
 #[cfg(target_os = "linux")]
@@ -132,6 +132,11 @@ impl gpui_kit::AssetSource for AppAssets {
         Ok(paths)
     }
 }
+
+/// The Settings window's initial size, centred; still resizable down to
+/// `SettingsView::window_options`' minimum.
+const SETTINGS_WIDTH: f32 = 900.;
+const SETTINGS_HEIGHT: f32 = 640.;
 
 /// The overlay's fixed comfortable width. Ready to type, the overlay is
 /// the prompt bar and its window is the bar's own height
@@ -1055,6 +1060,46 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    /// The Hotkey tab's note follows the backend that actually bound
+    /// (spec-native-gnome-kde-hotkey, review pass 1).
+    #[test]
+    fn the_hotkey_note_follows_the_bound_backend() {
+        use voice_me_hotkey_linux::{ActiveBackend, Desktop};
+
+        // GNOME/KDE with the native backend bound, or nothing bound yet.
+        assert_eq!(
+            hotkey_note(Desktop::Gnome, None),
+            HotkeyNote::Native("GNOME")
+        );
+        assert_eq!(
+            hotkey_note(Desktop::Gnome, Some(ActiveBackend::Gnome)),
+            HotkeyNote::Native("GNOME")
+        );
+        assert_eq!(hotkey_note(Desktop::Kde, None), HotkeyNote::Native("KDE"));
+        assert_eq!(
+            hotkey_note(Desktop::Kde, Some(ActiveBackend::Kde)),
+            HotkeyNote::Native("KDE")
+        );
+        // GNOME/KDE on a fallback: no note pointing at a missing entry.
+        for fallback in [
+            ActiveBackend::Portal,
+            ActiveBackend::X11,
+            ActiveBackend::Evdev,
+        ] {
+            assert_eq!(
+                hotkey_note(Desktop::Gnome, Some(fallback)),
+                HotkeyNote::Plain
+            );
+            assert_eq!(hotkey_note(Desktop::Kde, Some(fallback)), HotkeyNote::Plain);
+        }
+        // Other desktops: the compositor steps, whatever bound.
+        assert_eq!(hotkey_note(Desktop::Other, None), HotkeyNote::Manual);
+        assert_eq!(
+            hotkey_note(Desktop::Other, Some(ActiveBackend::Evdev)),
+            HotkeyNote::Manual
+        );
+    }
 
     /// The asset source serves the prompt bar's voice icon and still serves
     /// gpui-kit's own component icons: a missing SVG draws nothing, silently.
@@ -2414,6 +2459,54 @@ mod tests {
     }
 }
 
+/// What the Hotkey tab shows for this desktop (spec-native-gnome-kde-hotkey).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotkeyNote {
+    /// The GNOME/KDE note and settings button, naming the desktop.
+    Native(&'static str),
+    /// The `gdbus call` steps for a compositor binding.
+    Manual,
+    /// Nothing extra.
+    Plain,
+}
+
+/// Pure choice of [`HotkeyNote`]: the GNOME/KDE note only when that
+/// desktop's native backend is the one bound, or nothing has bound yet on
+/// GNOME/KDE (a Save will try it first). A fallback bound on GNOME/KDE gets
+/// no note — the desktop's settings hold no voice-me entry to point at.
+/// Other desktops always get the compositor steps.
+#[cfg(target_os = "linux")]
+fn hotkey_note(
+    desktop: voice_me_hotkey_linux::Desktop,
+    active: Option<voice_me_hotkey_linux::ActiveBackend>,
+) -> HotkeyNote {
+    use voice_me_hotkey_linux::{ActiveBackend, Desktop};
+    match (desktop, active) {
+        (Desktop::Other, _) => HotkeyNote::Manual,
+        (Desktop::Gnome, None | Some(ActiveBackend::Gnome)) => HotkeyNote::Native("GNOME"),
+        (Desktop::Kde, None | Some(ActiveBackend::Kde)) => HotkeyNote::Native("KDE"),
+        _ => HotkeyNote::Plain,
+    }
+}
+
+/// The Hotkey tab's [`HotkeyDesktop`] for the adapter's current state.
+#[cfg(target_os = "linux")]
+fn hotkey_desktop(adapter: &LinuxHotkeyAdapter) -> HotkeyDesktop {
+    match hotkey_note(voice_me_hotkey_linux::desktop(), adapter.active_backend()) {
+        HotkeyNote::Native(name) => HotkeyDesktop::Native {
+            name: name.into(),
+            open_settings: Rc::new(|| {
+                voice_me_hotkey_linux::open_shortcut_settings().map_err(|error| error.to_string())
+            }),
+        },
+        HotkeyNote::Manual => HotkeyDesktop::Manual {
+            summon_command: voice_me_hotkey_linux::SUMMON_COMMAND.into(),
+        },
+        HotkeyNote::Plain => HotkeyDesktop::Plain,
+    }
+}
+
 fn main() {
     // Decision 1's helper mode: probe one runtime library and exit, before
     // anything else in this process exists.
@@ -2564,7 +2657,14 @@ fn main() {
         // hotkey active and no error (including on a Wayland session with
         // no `input`-group membership).
         #[cfg(target_os = "linux")]
-        let hotkey_port: Arc<dyn HotkeyPort> = Arc::new(LinuxHotkeyAdapter::new(event_tx.clone()));
+        let hotkey_adapter = Arc::new(LinuxHotkeyAdapter::new(event_tx.clone()));
+        #[cfg(target_os = "linux")]
+        let hotkey_port: Arc<dyn HotkeyPort> = hotkey_adapter.clone();
+        // What the Hotkey tab adds for this desktop, read from the adapter
+        // each time Settings opens so it follows whichever backend bound.
+        #[cfg(target_os = "linux")]
+        let current_hotkey_desktop: Rc<dyn Fn() -> HotkeyDesktop> =
+            Rc::new(move || hotkey_desktop(&hotkey_adapter));
         // Not `Send`: the Windows manager owns a window handle, and must
         // stay on GPUI's main thread, whose message loop delivers
         // `WM_HOTKEY`. `Arc<dyn HotkeyPort>` is never sent across threads.
@@ -2572,6 +2672,9 @@ fn main() {
         #[allow(clippy::arc_with_non_send_sync)]
         let hotkey_port: Arc<dyn HotkeyPort> =
             Arc::new(WindowsHotkeyAdapter::new(event_tx.clone()));
+        #[cfg(target_os = "windows")]
+        let current_hotkey_desktop: Rc<dyn Fn() -> HotkeyDesktop> =
+            Rc::new(|| HotkeyDesktop::Plain);
 
         // A failed `start_listening` (most importantly: no read access to
         // `/dev/input` on Wayland) must not stop the app — it starts
@@ -3413,6 +3516,7 @@ fn main() {
             let hotkey_port = hotkey_port.clone();
             let hotkey_startup_error = hotkey_startup_error.clone();
             let window_slot = window_slot.clone();
+            let current_hotkey_desktop = current_hotkey_desktop.clone();
             let settings_view_slot = settings_view_slot.clone();
             let deps_port = deps_port.clone();
             let event_tx = event_tx.clone();
@@ -3441,6 +3545,7 @@ fn main() {
 
                 let settings_store = settings_store.clone();
                 let hotkey_port = hotkey_port.clone();
+                let current_hotkey_desktop = current_hotkey_desktop.clone();
                 let window_slot_on_close = window_slot.clone();
                 let view_slot_on_close = settings_view_slot.clone();
                 let dependencies = DependenciesTab {
@@ -3456,48 +3561,60 @@ fn main() {
                     },
                 };
                 let view_slot = settings_view_slot.clone();
-                let handle =
-                    match cx.open_window(SettingsView::window_options(), move |window, cx| {
-                        let view = cx.new(|cx| {
-                            SettingsView::new(
-                                settings_store.clone(),
-                                hotkey_port.clone(),
-                                has_active_sample,
-                                selected_mic_device,
-                                saved_hotkey,
-                                hotkey_startup_error,
-                                dependencies,
-                                window,
-                                cx,
-                            )
-                        });
-                        *view_slot.borrow_mut() = Some(view.clone());
-                        // However the window closes, the slots are emptied, or
-                        // the next "Open Settings" would activate a window that
-                        // is gone and open nothing.
-                        let forget_window: Rc<dyn Fn()> = Rc::new(move || {
-                            *window_slot_on_close.borrow_mut() = None;
-                            *view_slot_on_close.borrow_mut() = None;
-                        });
-                        view.update(cx, |view, _| {
-                            let forget_window = forget_window.clone();
-                            view.set_on_close(move |window, _| {
-                                forget_window();
-                                window.remove_window();
-                            });
-                        });
-                        window.on_window_should_close(cx, move |_window, _cx| {
+                // A modest centred window: with no bounds of its own it
+                // opened at the platform default, which filled the screen.
+                let options = WindowOptions {
+                    window_bounds: Some(WindowBounds::centered(
+                        size(px(SETTINGS_WIDTH), px(SETTINGS_HEIGHT)),
+                        cx,
+                    )),
+                    ..SettingsView::window_options()
+                };
+                let handle = match cx.open_window(options, move |window, cx| {
+                    let view = cx.new(|cx| {
+                        SettingsView::new(
+                            settings_store.clone(),
+                            hotkey_port.clone(),
+                            has_active_sample,
+                            selected_mic_device,
+                            saved_hotkey,
+                            hotkey_startup_error,
+                            dependencies,
+                            window,
+                            cx,
+                        )
+                    });
+                    *view_slot.borrow_mut() = Some(view.clone());
+                    // The GNOME/KDE settings button, or the compositor
+                    // steps (spec-native-gnome-kde-hotkey).
+                    let hotkey_desktop = current_hotkey_desktop();
+                    view.update(cx, |view, cx| view.set_hotkey_desktop(hotkey_desktop, cx));
+                    // However the window closes, the slots are emptied, or
+                    // the next "Open Settings" would activate a window that
+                    // is gone and open nothing.
+                    let forget_window: Rc<dyn Fn()> = Rc::new(move || {
+                        *window_slot_on_close.borrow_mut() = None;
+                        *view_slot_on_close.borrow_mut() = None;
+                    });
+                    view.update(cx, |view, _| {
+                        let forget_window = forget_window.clone();
+                        view.set_on_close(move |window, _| {
                             forget_window();
-                            true
+                            window.remove_window();
                         });
-                        cx.new(|cx| Root::new(view, window, cx))
-                    }) {
-                        Ok(handle) => handle,
-                        Err(error) => {
-                            eprintln!("failed to open window: {error}");
-                            return;
-                        }
-                    };
+                    });
+                    window.on_window_should_close(cx, move |_window, _cx| {
+                        forget_window();
+                        true
+                    });
+                    cx.new(|cx| Root::new(view, window, cx))
+                }) {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        eprintln!("failed to open window: {error}");
+                        return;
+                    }
+                };
 
                 *window_slot.borrow_mut() = Some(handle);
             }

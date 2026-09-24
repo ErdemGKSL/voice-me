@@ -15,7 +15,7 @@ pub use backend::{
     PIPER_NO_VOICE_NOTE,
 };
 pub use dependencies::{DependenciesView, OpenBackendTab, RowProvisioning, blocker_notice};
-pub use hotkey::{CaptureOutcome, HotkeyView, capture_keystroke, display_hotkey};
+pub use hotkey::{CaptureOutcome, HotkeyDesktop, HotkeyView, capture_keystroke, display_hotkey};
 pub use piper_voices::{
     PiperCatalogState, PiperVoicesAction, PiperVoicesActions, PiperVoicesPanel, PiperVoicesView,
     VoiceDownload, VoiceRow, filter_rows, voice_rows,

@@ -9,7 +9,15 @@
 //! `voice_setup.rs` injects `CaptureSource`: tests drive the whole flow —
 //! conflicts, permission failures, saves — against a fake, with no real
 //! X11/evdev backend in the loop.
+//!
+//! On GNOME and KDE the combination is a desktop shortcut
+//! (spec-native-gnome-kde-hotkey), so the tab says so and offers a button
+//! that opens the desktop's own shortcut settings. On other Linux desktops
+//! it offers the `gdbus call` summon command, under "Show steps", for the
+//! user to bind in their compositor. Which of the two applies is injected
+//! as [`HotkeyDesktop`] — this crate never depends on the hotkey adapter.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::component::{
@@ -306,6 +314,26 @@ impl HotkeyIssue {
     }
 }
 
+/// What the desktop adds to the Hotkey tab, decided by the composition
+/// root from the Linux hotkey adapter.
+#[derive(Clone, Default)]
+pub enum HotkeyDesktop {
+    /// Nothing extra (Windows, or a platform with no desktop shortcut
+    /// system to point at).
+    #[default]
+    Plain,
+    /// GNOME or KDE: the desktop owns the binding. `name` is how the note
+    /// refers to it ("GNOME", "KDE"); `open_settings` opens its
+    /// keyboard-shortcut settings, returning why it could not.
+    Native {
+        name: SharedString,
+        open_settings: Rc<dyn Fn() -> Result<(), String>>,
+    },
+    /// Another Linux desktop: the command that summons the running app,
+    /// for the user to bind in their compositor.
+    Manual { summon_command: SharedString },
+}
+
 /// The Hotkey tab.
 pub struct HotkeyView {
     settings_store: Arc<dyn SettingsStore>,
@@ -320,6 +348,12 @@ pub struct HotkeyView {
     /// swallows modifier keysyms), so the "you pressed only a modifier" case
     /// is detected from the modifiers going back to none instead.
     modifiers_held: bool,
+    desktop: HotkeyDesktop,
+    /// Whether the "Show steps" row is expanded (Manual desktops only).
+    steps_shown: bool,
+    /// Why "Open keyboard settings" could not open them. Kept apart from
+    /// `hotkey_error` so it never replaces a conflict or permission message.
+    open_settings_error: Option<SharedString>,
 }
 
 impl HotkeyView {
@@ -344,7 +378,30 @@ impl HotkeyView {
             hotkey_error: startup_error
                 .map(|message| HotkeyIssue::new(HotkeyIssueKind::Permission, message)),
             modifiers_held: false,
+            desktop: HotkeyDesktop::Plain,
+            steps_shown: false,
+            open_settings_error: None,
         }
+    }
+
+    /// Set what the desktop adds to this tab (see [`HotkeyDesktop`]).
+    pub fn set_desktop(&mut self, desktop: HotkeyDesktop, cx: &mut Context<Self>) {
+        self.desktop = desktop;
+        self.steps_shown = false;
+        cx.notify();
+    }
+
+    fn open_desktop_settings(&mut self, cx: &mut Context<Self>) {
+        let HotkeyDesktop::Native { open_settings, .. } = &self.desktop else {
+            return;
+        };
+        self.open_settings_error = open_settings().err().map(SharedString::from);
+        cx.notify();
+    }
+
+    fn toggle_steps(&mut self, cx: &mut Context<Self>) {
+        self.steps_shown = !self.steps_shown;
+        cx.notify();
     }
 
     fn start_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -567,6 +624,104 @@ impl Render for HotkeyView {
                             .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
                     ),
             )
+            .map(|el| match self.desktop.clone() {
+                HotkeyDesktop::Plain => el,
+                HotkeyDesktop::Native { name, .. } => el.child(
+                    v_flex()
+                        .id("hotkey-desktop-note")
+                        .test_support()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(
+                                    "This shortcut lives in {name}'s keyboard settings, listed as voice-me. \
+                                     Saving here updates it there."
+                                )),
+                        )
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Button::new("hotkey-open-settings")
+                                        .ghost()
+                                        .label("Open keyboard settings")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.open_desktop_settings(cx)
+                                        })),
+                                )
+                                .when_some(self.open_settings_error.clone(), |el, reason| {
+                                    el.child(
+                                        div()
+                                            .id("hotkey-open-settings-error")
+                                            .test_support()
+                                            .text_size(px(12.))
+                                            .text_color(cx.theme().danger)
+                                            .child(format!("Couldn't open them: {reason}")),
+                                    )
+                                }),
+                        ),
+                ),
+                HotkeyDesktop::Manual { summon_command } => el.child(
+                    v_flex()
+                        .id("hotkey-manual")
+                        .test_support()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(cx.theme().muted_foreground)
+                                .child(
+                                    "You can also bind the shortcut in your compositor's own settings.",
+                                ),
+                        )
+                        .child(
+                            h_flex().child(
+                                Button::new("hotkey-steps-toggle")
+                                    .ghost()
+                                    .label(if self.steps_shown {
+                                        "Hide steps"
+                                    } else {
+                                        "Show steps"
+                                    })
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.toggle_steps(cx)),
+                                    ),
+                            ),
+                        )
+                        .when(self.steps_shown, |el| {
+                            el.child(
+                                v_flex()
+                                    .id("hotkey-steps")
+                                    .test_support()
+                                    .gap_1()
+                                    .pl_2()
+                                    .text_size(px(12.))
+                                    .child(div().child(
+                                        "1. In your compositor's config, bind a key combination to this command. \
+                                         Use a different combination from the one saved above — \
+                                         voice-me already listens for that one, and it would fire twice.",
+                                    ))
+                                    .child(
+                                        div()
+                                            .id("hotkey-summon-command")
+                                            .test_support()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .bg(cx.theme().muted)
+                                            .font_family("monospace")
+                                            .child(summon_command),
+                                    )
+                                    .child(div().child(
+                                        "2. Reload the compositor's config. The command reaches voice-me only while it is running.",
+                                    )),
+                            )
+                        }),
+                ),
+            })
     }
 }
 
@@ -1061,6 +1216,190 @@ mod tests {
             "the new binding is rolled back to the saved one when the file write fails"
         );
         assert!(harness.settings_store.saved_hotkeys().is_empty());
+    }
+
+    /// Open the tab with `desktop` set, as the composition root does
+    /// through `set_desktop`.
+    fn open_with_desktop(cx: &mut TestAppContext, desktop: HotkeyDesktop) -> Harness {
+        cx.update(gpui_kit::init);
+        let settings_store = Arc::new(FakeSettingsStore::default());
+        let hotkey_port = Arc::new(FakeHotkeyPort::default());
+        let store_dyn: Arc<dyn SettingsStore> = settings_store.clone();
+        let port_dyn: Arc<dyn HotkeyPort> = hotkey_port.clone();
+        let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = HotkeyView::new(
+                    store_dyn.clone(),
+                    port_dyn.clone(),
+                    Some("Ctrl+Alt+KeyV".to_string()),
+                    None,
+                    cx,
+                );
+                view.set_desktop(desktop.clone(), cx);
+                view
+            });
+            Root::new(view, window, cx)
+        });
+        Harness {
+            settings_store,
+            hotkey_port,
+            handle,
+        }
+    }
+
+    #[gpui_kit::test]
+    fn on_gnome_or_kde_the_button_opens_the_desktop_settings(cx: &mut TestAppContext) {
+        let opened = Rc::new(std::cell::Cell::new(0));
+        let desktop = HotkeyDesktop::Native {
+            name: "GNOME".into(),
+            open_settings: Rc::new({
+                let opened = opened.clone();
+                move || {
+                    opened.set(opened.get() + 1);
+                    Ok(())
+                }
+            }),
+        };
+        let harness = open_with_desktop(cx, desktop);
+
+        cx.update_window(harness.handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("hotkey-desktop-note").is_some(),
+                "the tab says the shortcut lives in the desktop's settings"
+            );
+            assert!(
+                window.try_find("hotkey-steps-toggle").is_none(),
+                "the compositor steps are for other desktops only"
+            );
+            window.click("hotkey-open-settings", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("hotkey-open-settings-error").is_none());
+        })
+        .unwrap();
+
+        assert_eq!(opened.get(), 1, "one click opens the settings once");
+    }
+
+    #[gpui_kit::test]
+    fn a_settings_page_that_cannot_open_says_why(cx: &mut TestAppContext) {
+        let desktop = HotkeyDesktop::Native {
+            name: "KDE".into(),
+            open_settings: Rc::new(|| Err("systemsettings: not found".to_string())),
+        };
+        let harness = open_with_desktop(cx, desktop);
+
+        cx.update_window(harness.handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("hotkey-open-settings", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("hotkey-open-settings-error").is_some());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn an_open_failure_leaves_the_hotkey_message_alone_and_clears_on_success(
+        cx: &mut TestAppContext,
+    ) {
+        let fail = Rc::new(std::cell::Cell::new(true));
+        let desktop = HotkeyDesktop::Native {
+            name: "GNOME".into(),
+            open_settings: Rc::new({
+                let fail = fail.clone();
+                move || {
+                    if fail.get() {
+                        Err("gnome-control-center: not found".to_string())
+                    } else {
+                        Ok(())
+                    }
+                }
+            }),
+        };
+        cx.update(gpui_kit::init);
+        let store_dyn: Arc<dyn SettingsStore> = Arc::new(FakeSettingsStore::default());
+        let port_dyn: Arc<dyn HotkeyPort> = Arc::new(FakeHotkeyPort::default());
+        let handle = cx.open_window(size(px(640.), px(480.)), |window, cx| {
+            let view = cx.new(|cx| {
+                // A conflict already on screen when the button is pressed.
+                let mut view = HotkeyView::new(
+                    store_dyn.clone(),
+                    port_dyn.clone(),
+                    Some("Ctrl+Alt+KeyV".to_string()),
+                    None,
+                    cx,
+                );
+                view.hotkey_error =
+                    Some(HotkeyIssue::from_error(&VoiceMeError::HotkeyAlreadyInUse));
+                view.set_desktop(desktop.clone(), cx);
+                view
+            });
+            Root::new(view, window, cx)
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("hotkey-open-settings", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("hotkey-open-settings-error").is_some());
+            assert!(
+                window.try_find("hotkey-error-conflict").is_some(),
+                "the conflict message is still shown"
+            );
+
+            fail.set(false);
+            window.click("hotkey-open-settings", cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("hotkey-open-settings-error").is_none(),
+                "a later successful open clears the failure"
+            );
+            assert!(window.try_find("hotkey-error-conflict").is_some());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn on_other_desktops_show_steps_reveals_the_summon_command(cx: &mut TestAppContext) {
+        let desktop = HotkeyDesktop::Manual {
+            summon_command: "gdbus call --session --dest dev.voice_me.VoiceMe".into(),
+        };
+        let harness = open_with_desktop(cx, desktop);
+
+        cx.update_window(harness.handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("hotkey-manual").is_some());
+            assert!(window.try_find("hotkey-open-settings").is_none());
+            assert!(
+                window.try_find("hotkey-steps").is_none(),
+                "the steps start collapsed"
+            );
+
+            window.click("hotkey-steps-toggle", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("hotkey-steps").is_some());
+            assert!(window.try_find("hotkey-summon-command").is_some());
+
+            window.click("hotkey-steps-toggle", cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("hotkey-steps").is_none(),
+                "and collapse again"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn a_plain_desktop_adds_nothing(cx: &mut TestAppContext) {
+        let harness = open_with_desktop(cx, HotkeyDesktop::Plain);
+
+        cx.update_window(harness.handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("hotkey-desktop-note").is_none());
+            assert!(window.try_find("hotkey-manual").is_none());
+        })
+        .unwrap();
     }
 
     #[test]

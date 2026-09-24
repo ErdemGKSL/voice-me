@@ -28,7 +28,7 @@ use voice_me_core::{
 
 use crate::backend::{BackendActions, BackendPanel, BackendView, OpenPiperVoicesTab};
 use crate::dependencies::{DependenciesView, OpenBackendTab, RowProvisioning};
-use crate::hotkey::HotkeyView;
+use crate::hotkey::{HotkeyDesktop, HotkeyView};
 use crate::piper_voices::{PiperVoicesActions, PiperVoicesPanel, PiperVoicesView};
 use crate::voice_setup::VoiceSetupView;
 
@@ -109,6 +109,13 @@ impl SettingsView {
             window_min_size: Some(size(px(720.), px(480.))),
             ..TitleBar::window_options()
         }
+    }
+
+    /// What the desktop adds to the Hotkey tab — the GNOME/KDE settings
+    /// button, or the compositor steps (spec-native-gnome-kde-hotkey).
+    pub fn set_hotkey_desktop(&mut self, desktop: HotkeyDesktop, cx: &mut Context<Self>) {
+        self.hotkey
+            .update(cx, |hotkey, cx| hotkey.set_desktop(desktop, cx));
     }
 
     /// What the title bar's close button runs on Linux, where the button is

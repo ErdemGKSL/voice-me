@@ -219,3 +219,15 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-fix-espeak-ng-install-without-msiexec.md`
   summary: The eSpeak NG MSI unpacker's end-to-end test runs only when `VOICE_ME_ESPEAK_MSI` points at the real package, so CI never exercises the table join, cabinet read and write path.
   evidence: `the_real_espeak_ng_package_unpacks_into_its_install_layout` returns early without the variable. Settle it with a test that builds a small MSI (`msi::Package::create`) holding an embedded cabinet (`cab::CabinetBuilder`), or by caching the pinned MSI in CI.
+- source_spec: `_bmad-output/implementation-artifacts/spec-native-gnome-kde-hotkey.md`
+  summary: voice-me's GNOME custom keybinding (`custom-keybindings/voice-me/`) and its KDE kglobalaccel component are never removed — not on uninstall, and not when a later run falls back to another backend.
+  evidence: No unbind exists in `HotkeyPort` (a spec 2.3 deferral). A stale GNOME grab keeps eating the combination while a fallback is bound.
+- source_spec: `_bmad-output/implementation-artifacts/spec-native-gnome-kde-hotkey.md`
+  summary: The GlobalShortcuts portal backend has no integration test (session creation, the bind response check, forwarding `Activated`, rebinding in the same session).
+  evidence: Only `to_portal_trigger` is tested. It needs a fake `org.freedesktop.portal.GlobalShortcuts` with Request/Response objects on a test bus.
+- source_spec: `_bmad-output/implementation-artifacts/spec-native-gnome-kde-hotkey.md`
+  summary: Unverified (medium): on KDE, Shift plus a digit or symbol key (e.g. Shift+1) may never fire, because `to_qt_key` sends SHIFT|Key_1 while Qt/KWin may match the shifted keysym.
+  evidence: Settle it on a real Plasma session by binding Shift+Digit1 and pressing it.
+- source_spec: `_bmad-output/implementation-artifacts/spec-native-gnome-kde-hotkey.md`
+  summary: Unverified (high): Plasma 6's kglobalacceld may no longer expose the KF5-era `setShortcut`/`shortcut` (`ai`) methods that `kde.rs` calls. KDE would then always fall back to the portal.
+  evidence: Settle it on Plasma 6 with `qdbus6 org.kde.kglobalaccel /kglobalaccel` or `busctl --user introspect org.kde.kglobalaccel /kglobalaccel`. The fix, if needed: `setShortcutKeys`/`shortcutKeys` with `a(ai)`.

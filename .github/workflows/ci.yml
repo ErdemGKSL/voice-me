@@ -39,6 +39,29 @@ jobs:
       # need one are `#[ignore]`d. Without this step nothing automated ever
       # executes them.
       - run: cargo test --workspace
+      # spec-native-gnome-kde-hotkey: the hotkey crate's live tests — the
+      # D-Bus summon service reached by the real `gdbus call`, the
+      # kglobalaccel exchange against a fake, and the GNOME keybinding
+      # written through a real `gsettings` — on a private session bus with
+      # a throwaway keyfile backend and a minimal test copy of the
+      # media-keys schemas. Opt-in only, so they never touch a developer's
+      # real bus or dconf.
+      - name: Install D-Bus and gsettings for the hotkey tests
+        run: |
+          sudo apt-get install -y \
+            dbus \
+            libglib2.0-bin
+      - name: Test the hotkey backends on a private session bus
+        run: |
+          schemas="$(mktemp -d)"
+          cp crates/voice-me-hotkey-linux/tests/schemas/*.gschema.xml "$schemas"
+          glib-compile-schemas "$schemas"
+          VOICE_ME_TEST_DBUS=1 \
+          VOICE_ME_TEST_GSETTINGS=1 \
+          GSETTINGS_BACKEND=keyfile \
+          XDG_CONFIG_HOME="$(mktemp -d)" \
+          GSETTINGS_SCHEMA_DIR="$schemas" \
+            dbus-run-session -- cargo test -p voice-me-hotkey-linux
 
   build-windows:
     runs-on: windows-latest

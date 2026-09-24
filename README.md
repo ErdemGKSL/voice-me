@@ -212,19 +212,71 @@ fullscreen game instead of over it.
 
 ## Linux: global hotkey setup
 
-The global hotkey uses one of two backends, chosen at runtime from the
-session:
+The saved hotkey (always stored in `settings.toml` as e.g. `Ctrl+Alt+KeyV`)
+is bound through the first of these backends that works, chosen at runtime:
 
-| Session | Backend | Setup needed |
-|---------|---------|--------------|
-| X11 | `global-hotkey` (`XGrabKey`) | none |
-| Wayland | raw `evdev` read of `/dev/input/event*` | `input`-group membership |
+| Order | When | Backend | Setup needed |
+|-------|------|---------|--------------|
+| 1 | GNOME (an entry of `XDG_CURRENT_DESKTOP` is `GNOME`), any session | a custom keybinding named **voice-me** | none |
+| 1 | KDE Plasma (an entry of `XDG_CURRENT_DESKTOP` is `KDE`), any session | a `kglobalaccel` component named **voice-me** | none |
+| 2 | other Wayland compositors | xdg-desktop-portal `GlobalShortcuts` | a portal that implements it (e.g. Hyprland's) |
+| 3 | other X11 sessions | `global-hotkey` (`XGrabKey`) | none |
+| 4 | last resort, everywhere | raw `evdev` read of `/dev/input/event*` | `input`-group membership |
 
-`global-hotkey` is X11-only, and GNOME does not implement the desktop
-portal's GlobalShortcuts interface, so on Wayland the hotkey is matched by
-reading the keyboard devices directly. That needs read access to the input
-devices, which is granted by joining the `input` group — a **one-time**
-setup step:
+`XDG_CURRENT_DESKTOP` is a colon-separated list (`ubuntu:GNOME`), and a
+whole entry must match, in any case: `GNOME-Flashback` is not `GNOME`.
+
+A backend that is missing (no `gsettings`, no kglobalaccel on the session
+bus, no GlobalShortcuts portal) or fails is skipped, and the reason is
+printed on stderr. A combination that is already in use is the exception:
+it is reported on the Hotkey tab and no later backend is tried, since that
+would bind the same combination twice.
+
+**GNOME and KDE.** Save on the Hotkey tab writes the desktop's own shortcut,
+so the desktop grabs the combination exclusively (it does not reach the
+focused window) and you can see or change it in the desktop's settings:
+Settings → Keyboard → Keyboard Shortcuts → Custom Shortcuts on GNOME, System
+Settings → Shortcuts on KDE. The Hotkey tab's **Open keyboard settings**
+button opens that page. **Change the combination from voice-me's Hotkey
+tab, not there:** voice-me writes its saved combination to the desktop at
+every start and every Save, so a change made in the desktop's settings is
+replaced the next time either happens. On GNOME the entry lives at
+`/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/voice-me/`;
+voice-me updates only that entry and only appends its path to the list,
+never touching your other custom shortcuts. Its command is not a path to the
+voice-me binary but a D-Bus call to the running app, so moving the binary
+never breaks the shortcut:
+
+```bash
+gdbus call --session --dest dev.voice_me.VoiceMe --object-path /dev/voice_me/VoiceMe --method dev.voice_me.VoiceMe.Summon
+```
+
+If voice-me is not running, the call fails and nothing happens. KDE needs no
+command: kglobalaccel signals voice-me directly. On KDE a combination another
+application already holds is refused and the previous one stays; GNOME does
+not report such conflicts.
+
+**Other desktops (Sway, Hyprland, …).** The same D-Bus service runs as soon
+as voice-me starts, so you can also bind the command above in your
+compositor's own config — the Hotkey tab shows it under **Show steps**. Use
+a **different** combination from the one saved on the Hotkey tab: voice-me
+already listens for that one (through the portal or evdev), so binding it
+again in the compositor would summon twice. For example, in Sway:
+
+```text
+bindsym Ctrl+Alt+Shift+v exec gdbus call --session --dest dev.voice_me.VoiceMe --object-path /dev/voice_me/VoiceMe --method dev.voice_me.VoiceMe.Summon
+```
+
+On Wayland, a compositor with a GlobalShortcuts portal gets a shortcut
+called `summon` with your combination as its *preferred* trigger; the
+compositor has the final say (some ask you, some expect you to assign it in
+their config).
+
+### The evdev fallback
+
+When nothing above works, the hotkey is matched by reading the keyboard
+devices directly. That needs read access to the input devices, which is
+granted by joining the `input` group — a **one-time** setup step:
 
 ```bash
 sudo usermod -aG input $USER
@@ -233,16 +285,16 @@ sudo usermod -aG input $USER
 **Understand what this grants before running it.** `input`-group membership
 lets *any* process running as your user read every keystroke you type,
 system-wide — including passwords typed into other applications, on any
-desktop or login screen. It is not scoped to voice-me. The Wayland backend
+desktop or login screen. It is not scoped to voice-me. The evdev backend
 does exactly that: it reads the raw keyboard stream and matches your
-combination against it. On X11 nothing of the sort is needed, and voice-me
-does not ask for it.
+combination against it. On GNOME, KDE, a GlobalShortcuts portal or X11
+nothing of the sort is needed, and voice-me does not ask for it.
 
 Log out and back in (a new shell is not enough — group membership is
 established at login). Until then the Hotkey tab reports the missing access
 instead of binding anything; the rest of the app runs normally.
 
-Two properties of the Wayland backend are consequences of the platform, not
+Two properties of the evdev backend are consequences of the platform, not
 bugs:
 
 - The combination **also reaches the focused application** — it is a passive
@@ -250,7 +302,7 @@ bugs:
   keyboard input from every other application.)
 - **Conflicts cannot be detected.** Nothing is registered with any server, so
   there is no way to learn that another application already uses the
-  combination. Inline conflict reporting exists only on X11.
+  combination. Inline conflict reporting exists only on X11 and KDE.
 
 To verify the backend on its own, without the app:
 
