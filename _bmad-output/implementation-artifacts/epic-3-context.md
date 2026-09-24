@@ -20,8 +20,10 @@ The app finds its own missing runtime dependencies and fixes them with one click
 - Story 3.10: Give Backends Their Own Settings Tab
 - Story 3.11: Choose the Speech Language per Backend
 - Story 3.12: Speak Instantly With eSpeak NG on Linux
-- Story 3.13: Speak Instantly With the Windows Speech Engine
-- Story 3.14: Generate Through Azure Neural TTS
+- Story 3.13: Speak Naturally and Instantly With Piper on Linux
+- Story 3.14: Speak Instantly With the Windows Speech Engine
+- Story 3.15: Generate Through Azure Neural TTS
+- Story 3.16: Speak With Piper on Windows
 
 ## Requirements & Constraints
 
@@ -39,10 +41,11 @@ The app finds its own missing runtime dependencies and fixes them with one click
 - **Current sources, until the mirror exists:** weights come from `onnx-community/chatterbox-multilingual-ONNX` at a pinned Hugging Face revision. The runtime comes from Microsoft's official ONNX Runtime 1.28.2 release asset. All sources live in one table in `voice-me-deps`, with URL, size and **SHA-256 pinned in code** for each asset, so a later mirror only changes URLs. Each file downloads to `.part`, is checked against its SHA-256, and gets its final name only by an atomic rename. From an archive, only the real shared library is extracted, into the deps-owned cache path the core asset vocabulary resolves.
 - **Network egress is limited to two crates (AD-8):** `voice-me-deps` (asset fetches from trusted sources) and `voice-me-tts-remote` (the provider the user selected). A CI allowlist enforces this. It uses plain HTTPS GETs through `reqwest` with rustls, and no Hugging Face Hub client. `voice-me-tts-onnx`, and both system-voice crates, open no sockets. `ort` uses `load-dynamic`: the runtime is provisioned locally and resolved at run time (for example through `ORT_DYLIB_PATH` or the bundled cache path). It is never downloaded at build or run time.
 - **One runtime carries every provider (AD-7, Story 3.8).** `ort` loads exactly one ONNX Runtime library per process. So the GPU path is a single CI build from source (`--use_cuda --use_webgpu --build_shared_lib`), matched to the pinned `ort` rc (2.0.0-rc.13) and mirrored as a versioned, resumable release asset. With that runtime installed, switching between CPU, CUDA and WebGPU rebuilds the session without restarting the process. Until 3.8 lands, a GPU backend's runtime row is manual and says its runtime is not available yet. Windows GPU (DirectML/D3D12) is still unresolved.
-- **Backend resolution happens in core (AD-9).** It combines the user's persisted selection with the capability `voice-me-deps` detects. Deps reports only through `AppEvent` and never calls a TTS adapter. Adapters read the resolved backend, device and weight variant (FP16 on GPU, Q4 on CPU) from `AppState`. The UI shows what the session **actually acquired** when it was built, not what was requested. If nothing is selected, the backend is CPU.
+- **Backend resolution happens in core (AD-9).** It combines the user's persisted selection with the capability `voice-me-deps` detects. Deps reports only through `AppEvent` and never calls a TTS adapter. Adapters read the resolved backend, device and weight variant (FP16 on GPU, Q4 on CPU) from `AppState`. The UI shows what the session **actually acquired** when it was built, not what was requested. If nothing is selected, the backend is Piper where this OS's build has it (Linux; Windows from 3.16), otherwise CPU. An explicit selection is never rewritten.
 - Settings and the key go through `SettingsStore`, in one TOML file. Runtime and weight files live in a separate OS cache directory that only `voice-me-deps` writes (AD-6).
 - `voice-me-tts-remote` holds one `SpeechProvider` per vendor. Cloning providers upload the sample once and cache its id by (provider, sample hash). Stock-voice providers such as Azure take a voice name instead (AD-13). All backends return the shared 24 kHz mono f32 buffer (AD-11).
 - eSpeak NG runs as a child process: found by fixed name on PATH, text passed on stdin, no shell, 10 s deadline. This is the only exception to the no-child-process rule. The Windows system voice uses WinRT `SpeechSynthesizer` writing to a stream, never to the speaker.
+- **Piper (2026-09-24, `sprint-change-proposal-2026-09-24-piper.md`).** `voice-me-tts-piper` runs each voice's VITS ONNX graph on the existing `ort` with the CPU execution provider only; no Piper engine code (`piper1-gpl`, GPL-3.0; `piper-phonemize`) is linked. Phonemes come from the eSpeak NG program via `--ipa` (never `--ipa=3`: its U+200D ties are not in `phoneme_id_map`). The CLI drops clause punctuation, so split the text at `, . ! ? ; :`, phonemize each clause, and put the mark's id back after it. Ids are BOS `^`, a pad `_` after each id, EOS `$`; scales come from the voice JSON. Output is 22 050 Hz and is resampled to 24 kHz. The espeak-ng runner moves into one shared crate, `voice-me-espeak`, used by both system-linux and piper. Voices come from a curated, SHA-256-pinned table in `voice-me-deps`, fetched from `rhasspy/piper-voices` at a pinned revision and not mirrored, because licences vary (Turkish `tr_TR-dfki-medium` is CC BY-NC-SA 4.0); each voice's licence is shown in the picker.
 - Never run a clean build. Build incrementally.
 
 ## UX & Interaction Patterns
@@ -54,5 +57,5 @@ The app finds its own missing runtime dependencies and fixes them with one click
 
 - Stories 3.1, 3.2, 3.3 and 3.4 share one asset vocabulary in core, used by the check, the provisioning plan and the engine. Do not fork it.
 - Story 3.8 blocks the GPU backends (3.9, and CUDA/WebGPU provisioning in 3.2). It does not block CPU. When 3.8 lands, it should only swap URLs in the pinned source table.
-- Stories 3.10 and 3.11 depend on 3.5, 3.6 and 3.7. Stories 3.12, 3.13 and 3.14 add entries to the Backend tab.
+- Stories 3.10 and 3.11 depend on 3.5, 3.6 and 3.7. Stories 3.12–3.16 add entries to the Backend tab. 3.13 (Piper) extracts `voice-me-espeak` from 3.12's crate.
 - Windows items depend on Epic 2's Windows tray and hotkey work and on Story 2.8 (Windows virtual mic control surface, still unresolved) before they can be verified by hand.

@@ -7,7 +7,7 @@ paradigm: 'Hexagonal / Ports-and-Adapters'
 scope: 'voice-me v1 - the whole product per prd.md: Voice Setup, background/tray operation, global hotkey + Prompt Overlay, TTS via in-process Chatterbox-Multilingual V3 ONNX inference, Virtual Microphone output on Linux and Windows, in-app dependency management, TR/EN UI, gpui-kit look & feel'
 status: final
 created: '2026-09-20'
-updated: '2026-09-21'
+updated: '2026-09-24'
 binds: ['FR-1', 'FR-2', 'FR-3', 'FR-4', 'FR-5', 'FR-6', 'FR-7', 'FR-8', 'FR-9']
 sources: ['_bmad-output/planning-artifacts/prds/prd-voice-me-2026-09-20/prd.md', '_bmad-output/planning-artifacts/prds/prd-voice-me-2026-09-20/addendum.md']
 companions: []
@@ -98,6 +98,7 @@ graph TD
   | CPU | `onnxruntime-linux-x64-1.28.2.tgz` core library, 8.7 MB, no provider libs | `language_model_q4` (354 MB) | The floor; always buildable, always shipped, the only variant Story 2.5 verified |
   | CUDA | `onnxruntime-linux-x64-gpu_cuda12` (404 MB) or `gpu_cuda13` (230 MB), incl. `libonnxruntime_providers_cuda.so` | `language_model_fp16` (1.04 GB) | Needs an sm_60-or-newer NVIDIA GPU; unverified — no such hardware on the dev machine |
   | WebGPU | **No Microsoft release asset exists** — requires ONNX Runtime built from source with `--use_webgpu --build_shared_lib`, mirrored here per this AD | `language_model_q4` or `_fp16` per device `shaderFloat16` | Vendor-neutral GPU path over Vulkan/D3D12; the build is CI's job, not the user's |
+  | Piper | the same core CPU library, no provider libs | one voice, ~63 MB (`<voice>.onnx` + `.onnx.json`) from `rhasspy/piper-voices` at a pinned revision, not mirrored (per-voice licences) | `voice-me-tts-piper`; CPU execution provider only (added 2026-09-24) |
   | Remote | none | none | `voice-me-tts-remote` — a `TtsPort` adapter, not an `ort` configuration. Granted 2026-09-22 by PRD Open Question 7; governed by AD-13 |
 
   **Variant names leave release artefact names entirely**; a binary is self-describing by reporting which backends it carries, which one is selected, and what that selection actually acquired at session build (AD-9). 
@@ -108,7 +109,7 @@ graph TD
 
 - **Binds:** all crates
 - **Prevents:** any crate silently phoning home — a cloud fallback added to a local backend, telemetry slipped into `voice-me-ui`, or any other undeclared network call — which would put data on the wire that nobody decided to send
-- **Rule:** exactly two crates may open a socket. `voice-me-deps`, fetching versioned assets from its trusted sources (AD-7), and `voice-me-tts-remote`, calling the speech provider the user selected with the key the user supplied (AD-13). Every other crate is offline: `voice-me-tts-onnx` performs no IPC and opens no socket at all — it reads model files from the cache directory `voice-me-deps` owns — and the `ort` crate must be configured to load a locally provisioned ONNX Runtime (no download-at-build-or-run behaviour). `voice-me-tts-system-linux` and `voice-me-tts-system-windows` open no socket either.
+- **Rule:** exactly two crates may open a socket. `voice-me-deps`, fetching versioned assets from its trusted sources (AD-7), and `voice-me-tts-remote`, calling the speech provider the user selected with the key the user supplied (AD-13). Every other crate is offline: `voice-me-tts-onnx` performs no IPC and opens no socket at all — it reads model files from the cache directory `voice-me-deps` owns — and the `ort` crate must be configured to load a locally provisioned ONNX Runtime (no download-at-build-or-run behaviour). `voice-me-tts-system-linux` and `voice-me-tts-system-windows` open no socket either, and neither do `voice-me-tts-piper` and `voice-me-espeak`.
 - **The CI check is re-scoped, not relaxed.** The `cargo-deny` ban list (or the workspace-wide grep for HTTP-client crates) becomes an allowlist of exactly those two crate manifests and fails the build on a third. Hugging Face Hub clients (`hf-hub` and friends) remain banned outside `voice-me-deps`. Solo development is exactly the setting where a silent violation goes unnoticed without an automated check, so the check is what has teeth here — not review discipline. Adding network access to any other crate is an architectural change, not a local one — it revisits this AD.
 - **What the remote adapter may send is bounded by the PRD, not by this AD:** the typed text, the language tag, and the Reference Voice Sample — uploaded once per provider and referenced by id afterwards (PRD FR-10). It sends no telemetry, no usage statistics, and nothing about the user's machine. The provider's own retention of the uploaded sample is outside voice-me's control and is **disclosed** to the user rather than managed by it.
 - **Granted 2026-09-22 by PRD Open Question 7.** The 2026-09-21 record of this as "the one declared exception, and it is not yet granted" is superseded: the product decision was taken — which backends may reach the network, what is sent, what is disclosed, and that the local-only claim is dropped as a headline claim rather than quietly narrowed (PRD §5). The permission belongs to the named `voice-me-tts-remote` adapter, never to a local backend.
@@ -118,7 +119,7 @@ graph TD
 - **Binds:** FR-5 (TTS generation), FR-7 (dependency check), FR-10 (backend selection)
 - **Prevents:** a TTS adapter querying `voice-me-deps` directly for GPU availability, which would violate AD-1's no-adapter-to-adapter rule; and the selection and the machine's actual capability silently disagreeing, so a user who selected a GPU backend this machine cannot drive gets an inference-engine error instead of a sentence telling them so
 - **Rule:** two inputs decide which backend runs inference, and `voice-me-core` is where they are reconciled — no adapter resolves this on its own.
-  1. **The user's selection**, persisted through `SettingsStore` (AD-6) like any other setting: which backend (CPU / CUDA / WebGPU / a named remote provider) and, on a GPU backend, which device. Unset means the CPU backend with no device preference — the safe floor, not a guess. It also holds, **per backend**, the speech language (and for a stock-voice backend, the voice); each backend keeps its own, and switching backends never rewrites another backend's language (added 2026-09-23).
+  1. **The user's selection**, persisted through `SettingsStore` (AD-6) like any other setting: which backend (CPU / CUDA / WebGPU / a named remote provider) and, on a GPU backend, which device. Unset means **Piper** where this OS's build has it, otherwise the CPU backend with no device preference (revised 2026-09-24, product-owner decision). An explicit selection is never rewritten. It also holds, **per backend**, the speech language (and for a stock-voice backend, the voice); each backend keeps its own, and switching backends never rewrites another backend's language (added 2026-09-23).
   2. **Detected capability** is `voice-me-deps`' job: what this machine and this install actually offer — which execution providers the provisioned ONNX Runtime carries, the **list of candidate devices** each can drive rather than a single verdict (Story 2.5 found `ort::ep::WebGPU::with_device_id` does not choose an adapter on its own), which local assets are present, and whether a configured remote provider has a key. It reports **only** by emitting on the shared `AppEvent` channel (AD-3), never by calling a `voice-me-core` use-case directly.
 
   **The compile-time outer bound is gone** (2026-09-22): since AD-7 ships every backend in one binary, the outer bound is what the provisioned runtime actually carries, which is a detected fact rather than a build fact.
@@ -156,7 +157,7 @@ graph TD
 
   The generation loop (prepend the `[<lang>]` tag, tokenize, encode the reference clip once, run the KV-cached decode loop with repetition penalty 1.2 and greedy argmax until `STOP_SPEECH_TOKEN` 6562 or `max_new_tokens`, then decode to waveform) is ported to Rust from the reference implementation in the model card — it is arithmetic over tensors, not model code, and no part of it requires Python.
 - **Language scope consequence:** v1 speech languages are limited to those needing **no** Python-only text normalization. Turkish and English — the languages this product exists for — need only the language tag. Chinese (`pkuseg` + Cangjie), Japanese (`pykakasi`), Hebrew (`dicta-onnx`) and Korean (Jamo decomposition; the only one that is trivially portable) are **excluded from v1** rather than dragging a Python runtime back in for four locales. This narrows the SPEC's "speech languages Chatterbox supports natively" non-goal boundary; enabling one of them later is additive work inside `voice-me-tts`, not an architectural change. **This limit binds the local backend only** (2026-09-23): a remote backend's language set is whatever its provider serves — normalization runs on the provider's side — and core validates the selected language against the selected backend's set rather than a global list.
-- **One bounded child-process exception (2026-09-23):** `voice-me-tts-system-linux` runs the system's `espeak-ng` program — resolved by fixed name on `PATH`, text on stdin never argv, no shell, a 10 s deadline — because eSpeak NG is GPL-3.0 and a separate process keeps voice-me's own licence undecided. This rule's "no child process" still binds Chatterbox.
+- **One bounded child-process exception (2026-09-23):** `voice-me-tts-system-linux` runs the system's `espeak-ng` program — resolved by fixed name on `PATH`, text on stdin never argv, no shell, a 10 s deadline — because eSpeak NG is GPL-3.0 and a separate process keeps voice-me's own licence undecided. This rule's "no child process" still binds Chatterbox. Piper (2026-09-24) uses the same program for **phonemization** (`--ipa`, never `--ipa=3`, whose tie characters are not in Piper's phoneme map). The runner lives in exactly one crate, `voice-me-espeak`, which both `voice-me-tts-system-linux` and `voice-me-tts-piper` call; no other crate spawns a process. Piper's VITS graph runs in-process on `ort` like Chatterbox; no Piper engine code (`piper1-gpl`, GPL-3.0; `piper-phonemize`) is linked.
 - **Watermarking consequence:** Resemble's optional Perth watermarker is a Python library with no ONNX/Rust equivalent, so v1 emits un-watermarked audio. Recorded as a deliberate decision, not an oversight — see Deferred.
 
 ### AD-13 — The remote backend is one port, many providers, with credentials and disclosure owned by core
@@ -196,6 +197,7 @@ graph TD
 | reqwest | latest stable — HTTP client with `rustls`; permitted only in `voice-me-deps` and `voice-me-tts-remote` (AD-8) |
 | serde_json | latest stable — remote provider request/response bodies (AD-13) |
 | eSpeak NG | system package, run as a process — Linux instant backend (GPL-3.0, not linked; AD-12) |
+| Piper voices (external) | `rhasspy/piper-voices` at a pinned revision — VITS ONNX, 22 050 Hz, per-voice licence; run on the pinned `ort`/ONNX Runtime CPU |
 | `windows` crate, `Media_SpeechSynthesis` | WinRT `SpeechSynthesizer` — Windows instant backend |
 | Speech providers (external) | DeepInfra `ResembleAI/chatterbox-multilingual` (default), fal.ai — voice cloning; Azure Neural TTS (REST, SSML, `riff-24khz-16bit-mono-pcm`) — stock voices; all user-supplied keys, AD-13 |
 | tokenizers (HF) | latest stable — pin at implementation time; loads the model's `tokenizer.json` |
@@ -223,6 +225,8 @@ voice-me/
     voice-me-tts-remote/        # lib: TtsPort adapter - remote speech providers behind one SpeechProvider trait (AD-13)
     voice-me-tts-system-linux/  # lib: TtsPort adapter - instant stock voice via the espeak-ng program (AD-2, AD-12 exception)
     voice-me-tts-system-windows/ # lib: TtsPort adapter - instant stock voice via WinRT SpeechSynthesizer (AD-2)
+    voice-me-tts-piper/         # lib: TtsPort adapter - Piper VITS voices on ort (CPU), phonemes via voice-me-espeak
+    voice-me-espeak/            # lib: the one espeak-ng process runner (AD-12 exception) - audio for system-linux, IPA for piper
     voice-me-deps/              # lib: dependency detection/provisioning (ONNX Runtime lib + EPs, model weights, virtual-mic driver), pulls from this repo's GitHub Releases
     voice-me-i18n/              # lib: TR/EN string catalogs
     voice-me-tests/             # test-only: black-box integration tests against the lib crates
@@ -238,7 +242,7 @@ voice-me/
 | FR-2 Background/tray operation | voice-me-app, voice-me-tray-linux, voice-me-tray-windows | AD-1, AD-2, AD-3 |
 | FR-3 Global hotkey configuration | voice-me-hotkey-linux, voice-me-hotkey-windows | AD-1, AD-2 |
 | FR-4 Prompt Overlay summon/type/dismiss | voice-me-ui | AD-1, AD-3, AD-10 |
-| FR-5 TTS generation (local ONNX, local system voice, or remote API) | voice-me-tts-onnx, voice-me-tts-system-linux, voice-me-tts-system-windows, voice-me-tts-remote | AD-1, AD-2, AD-4, AD-5, AD-8, AD-9, AD-10, AD-11, AD-12, AD-13 |
+| FR-5 TTS generation (local ONNX, Piper, local system voice, or remote API) | voice-me-tts-onnx, voice-me-tts-piper, voice-me-espeak, voice-me-tts-system-linux, voice-me-tts-system-windows, voice-me-tts-remote | AD-1, AD-2, AD-4, AD-5, AD-8, AD-9, AD-10, AD-11, AD-12, AD-13 |
 | FR-6 Playback through the Virtual Microphone | voice-me-audio-linux, voice-me-audio-windows | AD-1, AD-2, AD-11 |
 | FR-7 Dependency Check and provisioning | voice-me-deps | AD-4, AD-5, AD-7, AD-8, AD-9, AD-12, AD-13 |
 | FR-10 Backend selection, per-backend options and language, remote disclosure | voice-me-ui (Settings → Backend), voice-me-core, voice-me-tts-remote | AD-3, AD-6, AD-8, AD-9, AD-12, AD-13 |

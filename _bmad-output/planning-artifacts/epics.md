@@ -27,7 +27,7 @@ FR3: User can assign and change a single global hotkey combination that summons 
 
 FR4: Pressing the configured hotkey opens a minimal, borderless, always-on-top single-line Prompt Overlay; pressing Enter closes it immediately and triggers the Speak Action with the typed text (generation happens after the UI is gone); pressing Escape or losing focus closes it without speaking and discards the text.
 
-FR5: On a Speak Action, the typed text plus the selected backend's speech language are handed to the selected speech backend — the local Inference Engine (Chatterbox-Multilingual V3's ONNX export, run in-process on ONNX Runtime — Architecture Spine AD-12) or a remote speech API (FR10). A voice-cloning backend also receives the active Reference Voice Sample and produces audio in the user's cloned voice; a stock-voice backend — the local instant system voice (eSpeak NG on Linux, the Windows speech engine on Windows) or Azure Neural TTS — produces audio in the stock voice the user selected and never receives the sample. A generation failure surfaces a clear failure indication rather than silence. The local backend's speech languages are limited to those needing no Python-only text normalization (Turkish and English included; Chinese, Japanese, Hebrew and Korean excluded); a remote backend offers its provider's own set (revised 2026-09-23).
+FR5: On a Speak Action, the typed text plus the selected backend's speech language are handed to the selected speech backend — the local Inference Engine (Chatterbox-Multilingual V3's ONNX export, run in-process on ONNX Runtime — Architecture Spine AD-12) or a remote speech API (FR10). A voice-cloning backend also receives the active Reference Voice Sample and produces audio in the user's cloned voice; a stock-voice backend — Piper (local neural voices), the local instant system voice (eSpeak NG on Linux, the Windows speech engine on Windows) or Azure Neural TTS — produces audio in the stock voice the user selected and never receives the sample. A generation failure surfaces a clear failure indication rather than silence. The local backend's speech languages are limited to those needing no Python-only text normalization (Turkish and English included; Chinese, Japanese, Hebrew and Korean excluded); a remote backend offers its provider's own set (revised 2026-09-23; Piper added 2026-09-24).
 
 FR6: Generated audio plays out through the Virtual Microphone device (not the default speaker) on both Linux and Windows, timed to the Speak Action, so any application selecting it as input receives the audio; the user's real physical microphone is unaffected.
 
@@ -37,7 +37,7 @@ FR8: The application interface (menus, settings, Prompt Overlay chrome, error me
 
 FR9: The UI is implemented using gpui-kit components rather than hand-rolled GPUI primitives wherever a suitable component exists, and follows the gpui-kit Design Guides for spacing, typography, color, density, and interaction states, checked before being considered done.
 
-FR10: The user selects which speech backend generates their voice from Settings → Backend — first Local or Remote, then the backend — and sets that backend's options there, including its own speech language. Local backends run on the machine — Chatterbox in the user's cloned voice (CPU, CUDA, WebGPU) and an instant system voice (eSpeak NG on Linux, the Windows speech engine on Windows); remote backends use a user-supplied key: voice-cloning providers (DeepInfra `ResembleAI/chatterbox-multilingual`, fal.ai) and one stock-voice provider (Azure Neural TTS, standard voices). Before any text leaves the machine, the app states what is sent to that provider and the user confirms it once per provider (revised 2026-09-23).
+FR10: The user selects which speech backend generates their voice from Settings → Backend — first Local or Remote, then the backend — and sets that backend's options there, including its own speech language. Local backends run on the machine — Chatterbox in the user's cloned voice (CPU, CUDA, WebGPU), Piper natural neural stock voices on the CPU (the first-run default where available), and an instant system voice (eSpeak NG on Linux, the Windows speech engine on Windows); remote backends use a user-supplied key: voice-cloning providers (DeepInfra `ResembleAI/chatterbox-multilingual`, fal.ai) and one stock-voice provider (Azure Neural TTS, standard voices). Before any text leaves the machine, the app states what is sent to that provider and the user confirms it once per provider (revised 2026-09-23; Piper added 2026-09-24).
 
 ### NonFunctional Requirements
 
@@ -155,7 +155,7 @@ Users press a global hotkey from anywhere — including inside a fullscreen game
 ### Epic 3: Never Get Stuck on Setup
 The app detects missing runtime dependencies itself and offers one-click provisioning from inside its own UI, naming anything it can't fix automatically with clear manual steps; it lets the user choose which backend generates their speech — local or remote — and set, per backend, its speech language and options in a dedicated Settings → Backend tab, including Azure Neural TTS as a stock-voice remote backend; and it is honest about whether the selected backend can actually run on this machine.
 
-**Scope note (2026-09-22, replacing 2026-09-21):** one artefact per OS carries every backend, and the user selects one inside the app (AD-7). Every story in this epic is therefore *backend-aware* rather than variant-aware: what counts as a required dependency depends on the **selected** backend, and a remote backend's readiness is a key and a reachable provider rather than a file list. Selecting the CPU backend is what "no GPU" resolves to — never a silent substitution (AD-9). See `sprint-change-proposal-2026-09-22.md`. **2026-09-23 addendum:** backend choice and per-backend options move to Settings → Backend; speech language becomes per-backend; Azure Neural TTS (standard voices) is added. See `sprint-change-proposal-2026-09-23.md`. Instant local system voices are added too — eSpeak NG on Linux, the Windows speech engine on Windows; macOS later. See `sprint-change-proposal-2026-09-23-instant-local.md`.
+**Scope note (2026-09-22, replacing 2026-09-21):** one artefact per OS carries every backend, and the user selects one inside the app (AD-7). Every story in this epic is therefore *backend-aware* rather than variant-aware: what counts as a required dependency depends on the **selected** backend, and a remote backend's readiness is a key and a reachable provider rather than a file list. Selecting the CPU backend is what "no GPU" resolves to — never a silent substitution (AD-9). See `sprint-change-proposal-2026-09-22.md`. **2026-09-23 addendum:** backend choice and per-backend options move to Settings → Backend; speech language becomes per-backend; Azure Neural TTS (standard voices) is added. See `sprint-change-proposal-2026-09-23.md`. Instant local system voices are added too — eSpeak NG on Linux, the Windows speech engine on Windows; macOS later. See `sprint-change-proposal-2026-09-23-instant-local.md`. **2026-09-24 addendum:** Piper on-device neural voices are added — CPU-only on the shared ONNX Runtime, phonemes from the eSpeak NG program — and become the first-run default where available (Linux now, Windows in 3.16). See `sprint-change-proposal-2026-09-24-piper.md`.
 **FRs covered:** FR7, FR10
 
 ### Epic 4: Use It In Your Language
@@ -378,7 +378,7 @@ So that my teammates in voice chat hear it as if I'd spoken.
 
 The app detects missing runtime dependencies itself and offers one-click provisioning from inside its own UI, naming anything it can't fix automatically with clear manual steps; it lets the user choose which backend generates their speech — local or remote — and set, per backend, its speech language and options in a dedicated Settings → Backend tab, including Azure Neural TTS as a stock-voice remote backend; and it is honest about whether the selected backend can actually run on this machine.
 
-**Scope note (2026-09-22, replacing 2026-09-21):** one artefact per OS carries every backend, and the user selects one inside the app (AD-7). Every story in this epic is therefore *backend-aware* rather than variant-aware: what counts as a required dependency depends on the **selected** backend, and a remote backend's readiness is a key and a reachable provider rather than a file list. Selecting the CPU backend is what "no GPU" resolves to — never a silent substitution (AD-9). See `sprint-change-proposal-2026-09-22.md`. **2026-09-23 addendum:** backend choice and per-backend options move to Settings → Backend; speech language becomes per-backend; Azure Neural TTS (standard voices) is added. See `sprint-change-proposal-2026-09-23.md`. Instant local system voices are added too — eSpeak NG on Linux, the Windows speech engine on Windows; macOS later. See `sprint-change-proposal-2026-09-23-instant-local.md`.
+**Scope note (2026-09-22, replacing 2026-09-21):** one artefact per OS carries every backend, and the user selects one inside the app (AD-7). Every story in this epic is therefore *backend-aware* rather than variant-aware: what counts as a required dependency depends on the **selected** backend, and a remote backend's readiness is a key and a reachable provider rather than a file list. Selecting the CPU backend is what "no GPU" resolves to — never a silent substitution (AD-9). See `sprint-change-proposal-2026-09-22.md`. **2026-09-23 addendum:** backend choice and per-backend options move to Settings → Backend; speech language becomes per-backend; Azure Neural TTS (standard voices) is added. See `sprint-change-proposal-2026-09-23.md`. Instant local system voices are added too — eSpeak NG on Linux, the Windows speech engine on Windows; macOS later. See `sprint-change-proposal-2026-09-23-instant-local.md`. **2026-09-24 addendum:** Piper on-device neural voices are added — CPU-only on the shared ONNX Runtime, phonemes from the eSpeak NG program — and become the first-run default where available (Linux now, Windows in 3.16). See `sprint-change-proposal-2026-09-24-piper.md`.
 
 ### Story 3.1: Detect Missing Dependencies
 
@@ -529,7 +529,7 @@ So that I pick a kind of backend, then one backend, and see only what that one n
 
 **Given** Settings is open
 **When** I open the Backend tab
-**Then** I choose Local or Remote first, then a backend of that kind (Local: Chatterbox — the bundled CPU runtime and each added runtime's targets — and the instant System voice from Story 3.12/3.13 once built; Remote: DeepInfra, fal.ai, Azure)
+**Then** I choose Local or Remote first, then a backend of that kind (Local: Chatterbox — the bundled CPU runtime and each added runtime's targets — and the instant System voice from Story 3.12/3.14, and Piper from 3.13/3.16, once built; Remote: DeepInfra, fal.ai, Azure)
 **And** only the selected backend's options appear — added runtimes for Local; API key with its plaintext notice, and remote sample state for a cloning provider
 **And** the Selected / Active lines and the "CPU mode" badge move here unchanged (AD-9, UX-DR18)
 **And** Settings → Dependencies keeps only dependency rows and the speech-blocking capability row, which links to the Backend tab (UX-DR23)
@@ -567,7 +567,26 @@ So that a line is spoken the moment I press Enter, even without the model downlo
 **And** `espeak-ng` missing from PATH is a dependency row with the distro's install command as manual steps, and blocks speech while this backend is selected (Story 3.4)
 **And** a failure (non-zero exit, timeout, unreadable output) is one notification naming eSpeak NG and the reason
 
-### Story 3.13: Speak Instantly With the Windows Speech Engine
+### Story 3.13: Speak Naturally and Instantly With Piper on Linux
+
+As Erdem,
+I want a natural-sounding on-device voice that speaks as fast as eSpeak NG,
+So that I get a usable voice from the first run without a 1.56 GB download or a 20-second wait.
+
+**Acceptance Criteria:**
+
+**Given** I select Local → Piper in Settings → Backend on Linux, or no backend was ever selected (first run)
+**When** I perform a Speak Action
+**Then** `voice-me-tts-piper` phonemizes the text through `voice-me-espeak` (the one eSpeak NG runner: fixed name on PATH, `--ipa`, text on stdin, no shell, 10 s deadline), maps the phonemes through the voice's `phoneme_id_map` with clause punctuation kept, runs the voice's VITS graph in-process on `ort` with the CPU execution provider, and returns 24 kHz mono f32 played through the Virtual Microphone unchanged (AD-11, AD-12)
+**And** the `ort` session is built once per selected voice and held; a line of ~3 s is ready in well under a second on the dev machine (measured reference: 0.08–0.12 s on 4 vCPU)
+**And** the speech languages are the locales in `voice-me-deps`' pinned voice table (Turkish `tr_TR-dfki-medium` first), with a voice picker when a locale has more than one voice; each voice shows its size and licence
+**And** the selected voice missing is a one-click dependency row (pinned Hugging Face revision, SHA-256-checked, resumable, not mirrored); the ONNX Runtime CPU library row is shared with Chatterbox; `espeak-ng` missing is the manual-steps row from 3.12 — each blocks speech while Piper is selected (Story 3.4)
+**And** it is labelled "stock voice", never receives the Reference Voice Sample, opens no socket and needs no disclosure (AD-8)
+**And** with no backend in settings, core resolves Piper (AD-9); an explicit selection is never changed; Settings does not auto-open for a missing Reference Voice Sample while Piper is selected
+**And** `voice-me-tts-system-linux` now uses `voice-me-espeak` too, with Story 3.12's behaviour unchanged
+**And** a failure (phonemizer, unknown phoneme, inference) is one notification naming Piper and the reason
+
+### Story 3.14: Speak Instantly With the Windows Speech Engine
 
 As Erdem,
 I want an instant local voice on Windows,
@@ -582,7 +601,7 @@ So that Windows gets the same no-download, no-key option Linux has.
 **And** it is labelled "stock voice", never receives the Reference Voice Sample, opens no socket and needs no disclosure
 **And** the crate compiles and its unit tests pass on CI's Windows job; manual verification waits until the Windows app can start (Story 2.8, tray)
 
-### Story 3.14: Generate Through Azure Neural TTS
+### Story 3.15: Generate Through Azure Neural TTS
 
 As Erdem,
 I want to use Azure's standard neural voices with my own key,
@@ -598,6 +617,21 @@ So that I have a fast remote option even when I don't need my cloned voice.
 **And** generation requests SSML with `riff-24khz-16bit-mono-pcm`, which plays through the Virtual Microphone unchanged (AD-11)
 **And** no key, no region, or no voice selected is a speech-blocking capability row naming what is missing; a provider failure (rejected key, timeout, provider error) is one notification naming Azure and the reason, never re-sent
 **And** the key stays plaintext-with-notice and out of logs; the region is stored beside it
+
+### Story 3.16: Speak With Piper on Windows
+
+As Erdem,
+I want Piper on Windows as well,
+So that Windows gets the same natural, instant default as Linux.
+
+**Acceptance Criteria:**
+
+**Given** I select Local → Piper in Settings → Backend on Windows, or no backend was ever selected
+**When** I perform a Speak Action
+**Then** the same `voice-me-tts-piper` generates it, with `voice-me-espeak` running the eSpeak NG program on Windows (still a separate process, never linked)
+**And** `voice-me-deps` provisions eSpeak NG on Windows with one click from the official eSpeak NG release (pinned URL and SHA-256), and `voice-me-espeak` finds it there as well as on PATH
+**And** the first-run default on Windows becomes Piper (AD-9)
+**And** the crates compile and their unit tests pass on CI's Windows job; manual verification waits until the Windows app can start (Story 2.8, tray)
 
 ## Epic 4: Use It In Your Language
 
