@@ -38,7 +38,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: onnxruntime-${{ inputs.ort_version }}-${{ inputs.build_number }}
+  group: onnxruntime-${{ inputs.ort_version }}-${{ inputs.build_number }}-${{ inputs.targets }}
   cancel-in-progress: false
 
 env:
