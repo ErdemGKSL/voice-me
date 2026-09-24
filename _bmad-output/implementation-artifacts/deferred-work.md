@@ -197,3 +197,10 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-prompt-overlay-pill-bar.md`
   summary: `epics.md` UX-DR4 ("one `Input` and nothing else, popover-family elevation/shadow") and UX-DR22 ("fade/scale-in"), and EXPERIENCE.md, still describe the boxed overlay rather than the pill bar with its icon and Enter hint.
   evidence: the user asked for the pill bar (DESIGN.md was updated with it); the planning documents were left for a correct-course pass rather than edited from a review.
+
+- source_spec: none
+  summary: Story 3.13 — speak with Windows' own local speech engine (the user's choice for Windows instead of Edge TTS), next after the Windows virtual microphone.
+  evidence: split from "finish the remaining Windows implementations" (2026-09-24); the user put the virtual microphone first and asked for the Windows speech API rather than porting Edge TTS.
+- source_spec: none
+  summary: Story 3.16 — Piper on Windows.
+  evidence: split from "finish the remaining Windows implementations" (2026-09-24); not in the user's first two priorities.
