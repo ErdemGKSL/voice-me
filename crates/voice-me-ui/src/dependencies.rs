@@ -554,6 +554,7 @@ fn slug(kind: DependencyKind) -> &'static str {
         DependencyKind::VirtualMicrophone => "virtual-microphone",
         DependencyKind::BackendCapability => "backend-capability",
         DependencyKind::SystemVoiceEngine => "system-voice-engine",
+        DependencyKind::EdgeTtsProgram => "edge-tts-program",
     }
 }
 
@@ -1268,5 +1269,25 @@ mod tests {
 
         assert_eq!(*port.last_request.lock().unwrap(), Some(request.clone()));
         assert_eq!(*port.last_backend.lock().unwrap(), Some(request.backend));
+    }
+
+    /// Story 3.17: the `edge-tts` row's slug, and what the overlay says.
+    #[test]
+    fn the_edge_tts_row_has_its_own_slug_and_notice() {
+        assert_eq!(slug(DependencyKind::EdgeTtsProgram), "edge-tts-program");
+        assert_eq!(
+            row_marker(DependencyKind::EdgeTtsProgram),
+            "dependency-row-edge-tts-program"
+        );
+        let row = Dependency::missing(
+            DependencyKind::EdgeTtsProgram,
+            "edge-tts",
+            "edge-tts is not installed. Please install it: pipx install edge-tts",
+        )
+        .manual(["Or: pip install --user edge-tts", "Press Check again."]);
+        assert_eq!(
+            blocker_notice(&row),
+            "edge-tts — edge-tts is not installed. Please install it: pipx install edge-tts"
+        );
     }
 }

@@ -306,7 +306,8 @@ pub fn capability_row(request: &CheckRequest, probe: &dyn GpuProbe) -> Option<De
             SpeechExecutionTarget::WebGpu => Some(webgpu_row(selection, probe.vulkan())),
         },
         BackendSelection::Remote(provider) => {
-            if !request.has_api_key {
+            // Story 3.17: Edge TTS has no key to be missing.
+            if provider.needs_api_key() && !request.has_api_key {
                 return Some(cannot_run(
                     selection,
                     &format!(
@@ -340,6 +341,16 @@ pub fn capability_row(request: &CheckRequest, probe: &dyn GpuProbe) -> Option<De
                     "Azure has no voice selected — pick one in Settings → Backend.",
                 )),
                 RemoteProvider::Azure => None,
+                // Story 3.17: on Linux Edge TTS's readiness is the
+                // `edge-tts` program row ([`edge_tts_program_row`]), not a
+                // capability row. Elsewhere no engine is built (E1).
+                RemoteProvider::EdgeTts => {
+                    if cfg!(target_os = "linux") {
+                        None
+                    } else {
+                        Some(cannot_run(selection, EDGE_TTS_OTHER_OS))
+                    }
+                }
             }
         }
         // Story 3.12: on Linux the System voice's readiness is the eSpeak
@@ -378,6 +389,36 @@ pub fn system_voice_engine_row(found: Option<&Path>, install_step: &str) -> Depe
             "The espeak-ng program is not on PATH. The System voice speaks through it.".to_string(),
         )
         .manual([install_step.to_string(), "Press Check again.".to_string()]),
+    }
+}
+
+/// What Edge TTS's capability row says off Linux (Story 3.17, E1).
+pub const EDGE_TTS_OTHER_OS: &str = "Edge TTS isn't available on this OS yet.";
+
+/// The `edge-tts` row's name.
+pub const EDGE_TTS_PROGRAM_LABEL: &str = "edge-tts";
+
+/// What the missing `edge-tts` row says.
+pub const EDGE_TTS_NOT_INSTALLED: &str =
+    "edge-tts is not installed. Please install it: pipx install edge-tts";
+
+/// Edge TTS's program row (Story 3.17): ready, naming where `edge-tts` was
+/// found, or missing and speech-blocking with manual steps only — voice-me
+/// never runs pip. `steps` are the distribution's pipx command (or the pip
+/// fallback) and "Press Check again.".
+pub fn edge_tts_program_row(found: Option<&Path>, steps: Vec<String>) -> Dependency {
+    match found {
+        Some(path) => Dependency::ready(
+            DependencyKind::EdgeTtsProgram,
+            EDGE_TTS_PROGRAM_LABEL,
+            format!("Found at {}.", path.display()),
+        ),
+        None => Dependency::missing(
+            DependencyKind::EdgeTtsProgram,
+            EDGE_TTS_PROGRAM_LABEL,
+            EDGE_TTS_NOT_INSTALLED,
+        )
+        .manual(steps),
     }
 }
 
@@ -805,6 +846,66 @@ mod tests {
         );
         assert_eq!(capability_row(&azure(true, true, true), &probe), None);
         assert_eq!(probe.asked.load(Ordering::SeqCst), 0);
+    }
+
+    fn edge_tts() -> CheckRequest {
+        CheckRequest {
+            selection: BackendSelection::Remote(RemoteProvider::EdgeTts),
+            ..remote(false)
+        }
+    }
+
+    /// Story 3.17: Edge TTS has no key, so no key row — on Linux no
+    /// capability row at all, and nothing probed.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn edge_tts_on_linux_has_no_key_or_capability_row() {
+        let probe = good_gpu();
+        assert_eq!(capability_row(&edge_tts(), &probe), None);
+        assert_eq!(probe.asked.load(Ordering::SeqCst), 0);
+    }
+
+    /// Elsewhere it is listed but cannot run, and says so.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn edge_tts_off_linux_cannot_run_yet() {
+        let row = capability_row(&edge_tts(), &good_gpu()).unwrap();
+        assert_blocks(&row, "Edge TTS isn't available on this OS yet.");
+        assert!(!row.detail.contains("API key"), "{}", row.detail);
+    }
+
+    #[test]
+    fn a_missing_edge_tts_blocks_with_manual_steps_only() {
+        let row = edge_tts_program_row(
+            None,
+            vec![
+                "If you don't have pipx: sudo apt install pipx".to_string(),
+                "Press Check again.".to_string(),
+            ],
+        );
+
+        assert_eq!(row.kind, DependencyKind::EdgeTtsProgram);
+        assert_eq!(row.status, DependencyStatus::Missing);
+        assert!(row.kind.blocks_speech());
+        assert!(!row.automatable, "voice-me never runs pip: steps only");
+        assert_eq!(row.label, "edge-tts");
+        assert_eq!(
+            row.detail,
+            "edge-tts is not installed. Please install it: pipx install edge-tts"
+        );
+        assert!(row.manual_steps[0].contains("sudo apt install pipx"));
+        assert_eq!(row.manual_steps[1], "Press Check again.");
+    }
+
+    #[test]
+    fn a_found_edge_tts_is_ready_and_names_its_path() {
+        let row = edge_tts_program_row(
+            Some(Path::new("/home/erdem/.local/bin/edge-tts")),
+            Vec::new(),
+        );
+
+        assert_eq!(row.status, DependencyStatus::Ready);
+        assert_eq!(row.detail, "Found at /home/erdem/.local/bin/edge-tts.");
     }
 
     /// The deadline wrapper hands back what the probe returned.

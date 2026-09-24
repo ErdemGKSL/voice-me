@@ -8675,6 +8675,7 @@ dependencies = [
  "voice-me-tray-linux",
  "voice-me-tray-windows",
  "voice-me-tts",
+ "voice-me-tts-edge",
  "voice-me-tts-remote",
  "voice-me-tts-system-linux",
  "voice-me-ui",
@@ -8727,6 +8728,7 @@ dependencies = [
  "tokio",
  "voice-me-audio-linux",
  "voice-me-core",
+ "voice-me-tts-edge",
  "voice-me-tts-system-linux",
  "zip",
 ]
@@ -8819,6 +8821,17 @@ dependencies = [
  "tokenizers",
  "tokio",
  "voice-me-core",
+]
+
+[[package]]
+name = "voice-me-tts-edge"
+version = "0.1.0"
+dependencies = [
+ "rubato",
+ "symphonia 0.6.1",
+ "tempfile",
+ "voice-me-core",
+ "voice-me-tts-system-linux",
 ]
 
 [[package]]

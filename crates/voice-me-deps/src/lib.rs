@@ -35,8 +35,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use voice_me_core::{
-    AppEvent, AppEventSender, CheckRequest, Dependency, DependencyKind, DependencyProvisioningPort,
-    DependencyReport, SpeechBackend, SpeechExecutionTarget, SpeechWeights, VoiceMeError, assets,
+    AppEvent, AppEventSender, BackendSelection, CheckRequest, Dependency, DependencyKind,
+    DependencyProvisioningPort, DependencyReport, RemoteProvider, SpeechBackend,
+    SpeechExecutionTarget, SpeechWeights, VoiceMeError, assets,
 };
 
 use crate::capability::{GpuProbe, SystemGpuProbe};
@@ -141,6 +142,10 @@ impl DepsAdapter {
             DependencyKind::SystemVoiceEngine => Err(VoiceMeError::Other(
                 "voice-me cannot install eSpeak NG; follow the steps on the row.".to_string(),
             )),
+            // Story 3.17: voice-me never runs pip; the row has steps only.
+            DependencyKind::EdgeTtsProgram => Err(VoiceMeError::Other(
+                "voice-me cannot install edge-tts; follow the steps on the row.".to_string(),
+            )),
             // Nothing to fetch: a backend that cannot run here is fixed by
             // choosing another one, which the row's own action does.
             DependencyKind::BackendCapability => Err(VoiceMeError::Other(
@@ -223,6 +228,11 @@ impl DependencyProvisioningPort for DepsAdapter {
             // Story 3.12: the System voice's one engine row. It is not an
             // ONNX target, so it has no runtime or model rows.
             None if request.selection.is_system_voice() => system_voice_rows(),
+            // Story 3.17: Edge TTS's one program row. Its key-free
+            // readiness is whether `edge-tts` is found.
+            None if request.selection == BackendSelection::Remote(RemoteProvider::EdgeTts) => {
+                edge_tts_rows()
+            }
             None => Vec::new(),
         };
 
@@ -593,6 +603,27 @@ fn system_voice_rows() -> Vec<Dependency> {
 /// is no engine to report on.
 #[cfg(not(target_os = "linux"))]
 fn system_voice_rows() -> Vec<Dependency> {
+    Vec::new()
+}
+
+/// Edge TTS's program row (Story 3.17): where `edge-tts` is, asked of the
+/// crate that runs it (PATH, then `~/.local/bin`), with the distribution's
+/// pipx command when it is not found.
+#[cfg(target_os = "linux")]
+fn edge_tts_rows() -> Vec<Dependency> {
+    let found = voice_me_tts_edge::find_program();
+    let steps = if found.is_some() {
+        Vec::new()
+    } else {
+        voice_me_tts_edge::install_steps()
+    };
+    vec![capability::edge_tts_program_row(found.as_deref(), steps)]
+}
+
+/// Off Linux the capability row says Edge TTS cannot run here; there is no
+/// program to report on.
+#[cfg(not(target_os = "linux"))]
+fn edge_tts_rows() -> Vec<Dependency> {
     Vec::new()
 }
 
@@ -1196,5 +1227,89 @@ mod tests {
             "{}",
             report.dependencies[0].detail
         );
+    }
+
+    /// Story 3.17: Edge TTS gets its program row — blocking when
+    /// `edge-tts` is missing — and no key, ONNX or eSpeak row.
+    #[test]
+    fn an_edge_tts_selection_reports_only_its_program_row() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let report = check_with(
+            CheckRequest {
+                backend: SpeechBackend::CPU,
+                selection: BackendSelection::Remote(RemoteProvider::EdgeTts),
+                has_api_key: false,
+                has_region: false,
+                has_voice: false,
+            },
+            dir.path(),
+        );
+
+        assert!(
+            !report.dependencies.iter().any(|row| matches!(
+                row.kind,
+                DependencyKind::OnnxRuntime
+                    | DependencyKind::ModelWeights
+                    | DependencyKind::SystemVoiceEngine
+            )),
+            "{:?}",
+            report.dependencies
+        );
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                !report
+                    .dependencies
+                    .iter()
+                    .any(|row| row.kind == DependencyKind::BackendCapability),
+                "no key row: {:?}",
+                report.dependencies
+            );
+            let program = row(&report.dependencies, DependencyKind::EdgeTtsProgram);
+            let missing = voice_me_tts_edge::find_program().is_none();
+            assert_eq!(program.status.is_missing(), missing);
+            if missing {
+                assert!(!program.automatable);
+                assert_eq!(
+                    report.speech_engine_blocker().map(|row| row.kind),
+                    Some(DependencyKind::EdgeTtsProgram)
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(
+                report.speech_engine_blocker().map(|row| row.kind),
+                Some(DependencyKind::BackendCapability)
+            );
+            assert!(
+                report.dependencies[0]
+                    .detail
+                    .contains("Edge TTS isn't available on this OS yet."),
+                "{}",
+                report.dependencies[0].detail
+            );
+        }
+    }
+
+    /// Story 3.17: there is no Install for `edge-tts`.
+    #[test]
+    fn provisioning_edge_tts_is_refused() {
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+
+        let error = DepsAdapter::new()
+            .provision(DependencyKind::EdgeTtsProgram, SpeechBackend::CPU, tx)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("cannot install edge-tts"), "{error}");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AppEvent::ProvisioningFinished {
+                kind: DependencyKind::EdgeTtsProgram,
+                result: Err(_),
+            })
+        ));
     }
 }

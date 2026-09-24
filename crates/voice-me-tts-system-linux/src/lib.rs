@@ -15,7 +15,9 @@
 #![cfg(target_os = "linux")]
 
 mod os_release;
-mod process;
+/// The bounded runner, public so `voice-me-tts-edge` (Story 3.17) runs
+/// `edge-tts` through the same one.
+pub mod process;
 mod voices;
 mod wav;
 
@@ -25,7 +27,10 @@ use std::time::Duration;
 
 use voice_me_core::{AudioBuffer, StockVoice, TtsPort, VoiceMeError};
 
-pub use os_release::{GENERIC_INSTALL_STEP, install_command_for, install_step};
+pub use os_release::{
+    GENERIC_INSTALL_STEP, distro_ids, install_command_for, install_step, is_opensuse,
+    read_os_release,
+};
 pub use voices::parse_voices;
 pub use wav::decode_wav;
 

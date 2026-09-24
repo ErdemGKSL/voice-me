@@ -25,11 +25,12 @@ pub use speak::{
 };
 pub use state::{
     AZURE_REGION_INVALID, ActiveBackend, ApiKeys, AppState, BackendSelection, DEFAULT_AZURE_LOCALE,
-    DEFAULT_SPEECH_LANGUAGE, DEFAULT_UI_LANGUAGE, Dependency, DependencyKind, DependencyOutcome,
-    DependencyReport, DependencyStatus, LanguageBackend, LanguageOption, LocalRuntime,
-    RemoteProvider, RemoteSample, SpeechBackend, SpeechExecutionTarget, SpeechLanguage,
-    SpeechLanguages, SpeechVoices, SpeechWeights, StockVoice, StockVoiceRefusal, backend_choices,
-    format_bytes, parse_azure_region, resolve_stock_voice, stock_voice_languages, stock_voices_of,
+    DEFAULT_EDGE_TTS_LOCALE, DEFAULT_SPEECH_LANGUAGE, DEFAULT_UI_LANGUAGE, Dependency,
+    DependencyKind, DependencyOutcome, DependencyReport, DependencyStatus, LanguageBackend,
+    LanguageOption, LocalRuntime, RemoteProvider, RemoteSample, SpeechBackend,
+    SpeechExecutionTarget, SpeechLanguage, SpeechLanguages, SpeechVoices, SpeechWeights,
+    StockVoice, StockVoiceRefusal, backend_choices, format_bytes, parse_azure_region,
+    resolve_stock_voice, stock_voice_languages, stock_voices_of,
 };
 
 /// Sender half of the shared `AppEvent` channel (AD-3). Adapters hold only

@@ -340,8 +340,11 @@ fn check_request(state: &AppState) -> CheckRequest {
     CheckRequest {
         backend: resolve_backend(&state.backend_selection),
         selection: state.backend_selection.clone(),
+        // Story 3.17: a keyless provider (Edge TTS) always "has" its key.
         has_api_key: match &state.backend_selection {
-            BackendSelection::Remote(provider) => state.api_keys.has(*provider),
+            BackendSelection::Remote(provider) => {
+                !provider.needs_api_key() || state.api_keys.has(*provider)
+            }
             BackendSelection::Local { .. } | BackendSelection::SystemVoice => false,
         },
         // Story 3.14: only Azure has a region; only its voice is required.
@@ -476,6 +479,22 @@ fn build_engine(
                 .to_string(),
         );
     }
+    // Story 3.17: Edge TTS is the `edge-tts` program as a child process on
+    // Linux — no reqwest, no key — and has no engine elsewhere (E1).
+    if let BackendSelection::Remote(RemoteProvider::EdgeTts) = &state.backend_selection {
+        #[cfg(target_os = "linux")]
+        return Engine {
+            port: Some(Arc::new(voice_me_tts_edge::EdgeTts::new())),
+            unavailable: None,
+            generation,
+        };
+        #[cfg(not(target_os = "linux"))]
+        return unavailable(
+            "Edge TTS isn't available on this OS yet. Choose another backend under Settings → \
+             Backend."
+                .to_string(),
+        );
+    }
     if let BackendSelection::Remote(provider) = &state.backend_selection {
         return unavailable(format!(
             "{} is selected, and remote generation through it arrives in a later voice-me \
@@ -499,13 +518,17 @@ fn build_engine(
 /// The remote provider whose disclosure the hotkey press has to ask about
 /// first (Story 3.6, Decision 1): DeepInfra, when it is selected, has a key
 /// and has not been confirmed. With no key the capability row blocks
-/// instead. Only DeepInfra and Azure (Story 3.14) can generate yet, so
-/// fal.ai is never asked about — Story 3.7 widens this.
+/// instead. Only DeepInfra, Azure (Story 3.14) and Edge TTS (Story 3.17)
+/// can generate yet, so fal.ai is never asked about — Story 3.7 widens
+/// this. Edge TTS has no key, so it has no key guard.
 fn disclosure_needed(state: &AppState) -> Option<RemoteProvider> {
     match &state.backend_selection {
         BackendSelection::Remote(
-            provider @ (RemoteProvider::DeepInfra | RemoteProvider::Azure),
-        ) if state.api_keys.has(*provider) && !state.disclosure_confirmed(*provider) => {
+            provider
+            @ (RemoteProvider::DeepInfra | RemoteProvider::Azure | RemoteProvider::EdgeTts),
+        ) if (!provider.needs_api_key() || state.api_keys.has(*provider))
+            && !state.disclosure_confirmed(*provider) =>
+        {
             Some(*provider)
         }
         _ => None,
@@ -636,6 +659,7 @@ fn current_state(
     dependencies: &DependencyOutcome,
     system_voices: &[StockVoice],
     azure_voices: &[StockVoice],
+    edge_tts_voices: &[StockVoice],
 ) -> AppState {
     let mut state = settings_store.load().unwrap_or_else(|error| {
         // Falling back to defaults keeps the Speak Action reaching a real
@@ -656,6 +680,8 @@ fn current_state(
     state.system_voices = system_voices.to_vec();
     // Story 3.14: Azure's voice list, cached for the session (D1).
     state.azure_voices = azure_voices.to_vec();
+    // Story 3.17: Edge TTS's list, as the program last listed it.
+    state.edge_tts_voices = edge_tts_voices.to_vec();
     state
 }
 
@@ -666,11 +692,40 @@ const AZURE_LIST_ERROR: &str = "Couldn't list Azure's voices: ";
 /// Remove the speech-language error only if it is a failed Azure voice
 /// listing, so a failed language save is never cleared by a fetch.
 fn clear_azure_list_error(errors: &mut HashMap<BackendArea, String>) {
+    clear_list_error(errors, AZURE_LIST_ERROR);
+}
+
+/// How a failed Edge TTS voice listing starts its message beside the
+/// speech language (Story 3.17).
+// Only the Linux listing (and the tests) use it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const EDGE_TTS_LIST_ERROR: &str = "Couldn't list Edge TTS voices: ";
+
+/// Remove the speech-language error only if it is a failed Edge TTS voice
+/// listing, so nothing else there is cleared by a listing.
+// Only the Linux listing (and the tests) use it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn clear_edge_tts_list_error(errors: &mut HashMap<BackendArea, String>) {
+    clear_list_error(errors, EDGE_TTS_LIST_ERROR);
+}
+
+fn clear_list_error(errors: &mut HashMap<BackendArea, String>, prefix: &str) {
     if errors
         .get(&BackendArea::SpeechLanguage)
-        .is_some_and(|message| message.starts_with(AZURE_LIST_ERROR))
+        .is_some_and(|message| message.starts_with(prefix))
     {
         errors.remove(&BackendArea::SpeechLanguage);
+    }
+}
+
+/// The reason a failed Edge TTS listing gives, without the "speech engine
+/// failure" frame: the adapter's message already names Edge TTS.
+// Only the Linux listing (and the tests) use it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn edge_tts_list_reason(error: &VoiceMeError) -> String {
+    match error {
+        VoiceMeError::SpeechEngine(reason) => reason.clone(),
+        other => other.to_string(),
     }
 }
 
@@ -680,7 +735,23 @@ fn clear_azure_list_error(errors: &mut HashMap<BackendArea, String>) {
 fn disclosure_text(state: &AppState, provider: RemoteProvider) -> DisclosureText {
     let backend = state.backend_selection.language_backend();
     let language = state.speech_language().unwrap_or_default();
-    let voice = state.speech_voices.get(backend).map(|id| {
+    // Story 3.17: with no voice stored, Edge TTS speaks the language's
+    // first listed one, so that is the one named.
+    let stored = state.speech_voices.get(backend).or_else(|| {
+        (provider == RemoteProvider::EdgeTts)
+            .then(|| {
+                voice_me_core::resolve_stock_voice(
+                    backend,
+                    state.stock_voices(backend),
+                    language,
+                    None,
+                )
+                .ok()
+                .map(|voice| voice.id.as_str())
+            })
+            .flatten()
+    });
+    let voice = stored.map(|id| {
         match state
             .stock_voices(backend)
             .iter()
@@ -1048,13 +1119,13 @@ mod tests {
         });
 
         assert!(
-            current_state(&store, &DependencyOutcome::Pending, &[], &[])
+            current_state(&store, &DependencyOutcome::Pending, &[], &[], &[])
                 .reference_voice_sample
                 .is_none(),
             "nothing recorded yet at launch"
         );
         assert!(
-            current_state(&store, &DependencyOutcome::Pending, &[], &[])
+            current_state(&store, &DependencyOutcome::Pending, &[], &[], &[])
                 .reference_voice_sample
                 .is_some(),
             "a sample recorded in Settings since launch has to count — \
@@ -1077,13 +1148,17 @@ mod tests {
         }];
 
         assert_eq!(
-            current_state(&store, &DependencyOutcome::Pending, &voices, &[]).system_voices,
+            current_state(&store, &DependencyOutcome::Pending, &voices, &[], &[]).system_voices,
             voices
         );
         // Story 3.14: Azure's cached list is merged the same way.
-        let state = current_state(&store, &DependencyOutcome::Pending, &[], &voices);
+        let state = current_state(&store, &DependencyOutcome::Pending, &[], &voices, &[]);
         assert_eq!(state.azure_voices, voices);
         assert!(state.system_voices.is_empty());
+        // Story 3.17: and Edge TTS's.
+        let state = current_state(&store, &DependencyOutcome::Pending, &[], &[], &voices);
+        assert_eq!(state.edge_tts_voices, voices);
+        assert!(state.azure_voices.is_empty());
     }
 
     #[test]
@@ -1093,7 +1168,7 @@ mod tests {
         });
 
         assert_eq!(
-            current_state(&store, &DependencyOutcome::Pending, &[], &[]).speech_backend,
+            current_state(&store, &DependencyOutcome::Pending, &[], &[], &[]).speech_backend,
             SpeechBackend::CPU,
             "AD-9: the engine reads its backend off AppState, so it has to be written there"
         );
@@ -1617,6 +1692,118 @@ mod tests {
             assert!(errors.is_empty());
         }
 
+        /// Story 3.17: an Edge TTS selection — no key — with a listed
+        /// voice pair.
+        fn edge_tts_state() -> AppState {
+            let voice = |id: &str, name: &str, priority| StockVoice {
+                id: id.to_string(),
+                language: "tr-TR".to_string(),
+                language_label: "tr-TR".to_string(),
+                name: name.to_string(),
+                priority,
+            };
+            AppState {
+                backend_selection: BackendSelection::Remote(RemoteProvider::EdgeTts),
+                edge_tts_voices: vec![
+                    voice("tr-TR-AhmetNeural", "Ahmet (Male)", 0),
+                    voice("tr-TR-EmelNeural", "Emel (Female)", 1),
+                ],
+                ..AppState::default()
+            }
+        }
+
+        /// Story 3.17: Edge TTS gets its own engine on Linux — built
+        /// without looking for the program — and none elsewhere; it is
+        /// never an ONNX target.
+        #[test]
+        fn edge_tts_gets_its_own_engine_and_no_onnx_runtime() {
+            let state = edge_tts_state();
+            assert_eq!(
+                resolve_backend(&state.backend_selection),
+                SpeechBackend::CPU
+            );
+            assert_eq!(selection_library(&state.backend_selection), None);
+
+            let (tx, _rx) = mpsc::unbounded();
+            let engine = build_engine(&state, None, &tx, &unused_store());
+            #[cfg(target_os = "linux")]
+            {
+                assert!(engine.unavailable.is_none());
+                assert!(engine.port.expect("an engine in the slot").is_ready());
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                assert!(engine.port.is_none());
+                assert!(
+                    engine
+                        .unavailable
+                        .unwrap()
+                        .contains("Edge TTS isn't available on this OS yet")
+                );
+            }
+        }
+
+        /// Story 3.17: with no key at all, the check is told the keyless
+        /// provider has what it needs, and the disclosure is still asked
+        /// for once.
+        #[test]
+        fn edge_tts_needs_no_key_for_the_check_or_the_disclosure() {
+            let state = edge_tts_state();
+            assert!(!state.api_keys.has(RemoteProvider::EdgeTts));
+            assert!(check_request(&state).has_api_key);
+
+            assert_eq!(disclosure_needed(&state), Some(RemoteProvider::EdgeTts));
+            let confirmed = AppState {
+                confirmed_disclosures: vec![RemoteProvider::EdgeTts],
+                ..state
+            };
+            assert_eq!(disclosure_needed(&confirmed), None);
+        }
+
+        /// Story 3.17: the disclosure names the voice that will speak —
+        /// the language's first when none is stored.
+        #[test]
+        fn edge_tts_disclosure_names_the_voice_in_effect() {
+            let text = disclosure_text(&edge_tts_state(), RemoteProvider::EdgeTts);
+            assert!(text.items.iter().any(|item| item.contains("tr-TR")));
+            assert!(
+                text.items
+                    .iter()
+                    .any(|item| item.contains("Ahmet (Male) (tr-TR-AhmetNeural)")),
+                "{:?}",
+                text.items
+            );
+            assert!(text.note.unwrap().contains("Edge Read Aloud"));
+        }
+
+        /// Story 3.17: an Edge TTS listing clears only its own error.
+        #[test]
+        fn the_edge_tts_list_clears_only_its_own_error() {
+            let mut errors = HashMap::new();
+            errors.insert(
+                BackendArea::SpeechLanguage,
+                format!("{AZURE_LIST_ERROR}Azure rejected the API key."),
+            );
+            clear_edge_tts_list_error(&mut errors);
+            assert!(errors.contains_key(&BackendArea::SpeechLanguage));
+
+            let reason = edge_tts_list_reason(&VoiceMeError::SpeechEngine(
+                "Edge TTS listed no voices".to_string(),
+            ));
+            errors.insert(
+                BackendArea::SpeechLanguage,
+                format!("{EDGE_TTS_LIST_ERROR}{reason}"),
+            );
+            assert_eq!(
+                errors[&BackendArea::SpeechLanguage],
+                "Couldn't list Edge TTS voices: Edge TTS listed no voices"
+            );
+            clear_azure_list_error(&mut errors);
+            assert!(errors.contains_key(&BackendArea::SpeechLanguage));
+            clear_edge_tts_list_error(&mut errors);
+            assert!(errors.is_empty());
+        }
+
         /// Story 3.12: the System voice is never an ONNX target — it
         /// resolves to the CPU placeholder, needs no key, no library and no
         /// restart — and on Linux gets the eSpeak NG engine.
@@ -1898,7 +2085,7 @@ fn main() {
         // cause is exactly the unactionable message the rest of this story
         // works to avoid.
         let engine: Rc<RefCell<Engine>> = Rc::new(RefCell::new(build_engine(
-            &current_state(&settings_store, &DependencyOutcome::Pending, &[], &[]),
+            &current_state(&settings_store, &DependencyOutcome::Pending, &[], &[], &[]),
             runtime_error.as_deref(),
             &event_tx,
             &remote_store,
@@ -2037,6 +2224,10 @@ fn main() {
         // already in flight for the old key or region is discarded.
         let azure_voices: Rc<RefCell<Vec<StockVoice>>> = Rc::new(RefCell::new(Vec::new()));
         let azure_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        // Story 3.17: the voices `edge-tts --list-voices` listed at the last
+        // check run with Edge TTS selected and the program found. Held here,
+        // never persisted, and merged into `AppState` and the panel.
+        let edge_tts_voices: Rc<RefCell<Vec<StockVoice>>> = Rc::new(RefCell::new(Vec::new()));
 
         // What the backend section shows, from the settings file and the
         // state above.
@@ -2049,6 +2240,7 @@ fn main() {
             let deleting_samples = deleting_samples.clone();
             let system_voices = system_voices.clone();
             let azure_voices = azure_voices.clone();
+            let edge_tts_voices = edge_tts_voices.clone();
             move || {
                 let state = settings_store.load().unwrap_or_default();
                 BackendPanel {
@@ -2067,6 +2259,7 @@ fn main() {
                     system_voices: system_voices.borrow().clone(),
                     azure_region: state.azure_region,
                     azure_voices: azure_voices.borrow().clone(),
+                    edge_tts_voices: edge_tts_voices.borrow().clone(),
                 }
             }
         });
@@ -2209,6 +2402,61 @@ fn main() {
             }
         });
 
+        // Story 3.17: with Edge TTS selected and `edge-tts` found, every
+        // Dependency Check also re-reads its voice list in the background
+        // and pushes it into an open Backend tab. Selecting Edge TTS never
+        // looks for the program; a missing one is the Dependencies row's to
+        // say, not this. A failed listing keeps the last list and says why
+        // beside the speech language; a listing only ever clears the error
+        // it set itself.
+        let refresh_edge_tts_voices: Rc<dyn Fn(&mut App)> = Rc::new({
+            let settings_store = settings_store.clone();
+            let edge_tts_voices = edge_tts_voices.clone();
+            let backend_errors = backend_errors.clone();
+            let push_panel = push_panel.clone();
+            move |cx: &mut App| {
+                let selected = settings_store.load().is_ok_and(|state| {
+                    state.backend_selection == BackendSelection::Remote(RemoteProvider::EdgeTts)
+                });
+                if !selected {
+                    return;
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    if voice_me_tts_edge::find_program().is_none() {
+                        clear_edge_tts_list_error(&mut backend_errors.borrow_mut());
+                        return;
+                    }
+                    let list = cx.background_spawn(async move { voice_me_tts_edge::list_voices() });
+                    let edge_tts_voices = edge_tts_voices.clone();
+                    let backend_errors = backend_errors.clone();
+                    let push_panel = push_panel.clone();
+                    cx.spawn(async move |cx| {
+                        match list.await {
+                            Ok(voices) => {
+                                clear_edge_tts_list_error(&mut backend_errors.borrow_mut());
+                                *edge_tts_voices.borrow_mut() = voices;
+                            }
+                            Err(error) => {
+                                eprintln!("could not list Edge TTS voices: {error}");
+                                backend_errors.borrow_mut().insert(
+                                    BackendArea::SpeechLanguage,
+                                    format!(
+                                        "{EDGE_TTS_LIST_ERROR}{}",
+                                        edge_tts_list_reason(&error)
+                                    ),
+                                );
+                            }
+                        }
+                        cx.update(|cx| (*push_panel)(cx));
+                    })
+                    .detach();
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = (&edge_tts_voices, &backend_errors, &push_panel, cx);
+            }
+        });
+
         // Saving a new Azure key or region drops the cached list, and any
         // fetch still in flight for the old one.
         let drop_azure_voices: Rc<dyn Fn()> = Rc::new({
@@ -2232,12 +2480,15 @@ fn main() {
             let provisioning = provisioning.clone();
             let refresh_system_voices = refresh_system_voices.clone();
             let refresh_azure_voices = refresh_azure_voices.clone();
+            let refresh_edge_tts_voices = refresh_edge_tts_voices.clone();
             move |cx: &mut App| {
                 (*refresh_system_voices)(cx);
                 (*refresh_azure_voices)(cx);
+                (*refresh_edge_tts_voices)(cx);
                 let request = check_request(&current_state(
                     &settings_store,
                     &dependency_outcome.borrow(),
+                    &[],
                     &[],
                     &[],
                 ));
@@ -2309,6 +2560,7 @@ fn main() {
                             let state = current_state(
                                 &settings_store,
                                 &dependency_outcome.borrow(),
+                                &[],
                                 &[],
                                 &[],
                             );
@@ -2659,6 +2911,7 @@ fn main() {
         let open_overlay = {
             let overlay_slot = overlay_slot.clone();
             let azure_voices = azure_voices.clone();
+            let edge_tts_voices = edge_tts_voices.clone();
             let event_tx = event_tx.clone();
             let dependency_outcome = dependency_outcome.clone();
             let settings_store = settings_store.clone();
@@ -2675,6 +2928,7 @@ fn main() {
                     &dependency_outcome.borrow(),
                     &[],
                     &azure_voices.borrow(),
+                    &edge_tts_voices.borrow(),
                 );
                 let disclosure = if blocker.is_none() {
                     disclosure_needed(&state)
@@ -2828,9 +3082,11 @@ fn main() {
         {
             (*refresh_system_voices)(cx);
             (*refresh_azure_voices)(cx);
+            (*refresh_edge_tts_voices)(cx);
             let request = check_request(&current_state(
                 &settings_store,
                 &DependencyOutcome::Pending,
+                &[],
                 &[],
                 &[],
             ));
@@ -2914,6 +3170,7 @@ fn main() {
                                 &current_state(
                                     &settings_store,
                                     &DependencyOutcome::Pending,
+                                    &[],
                                     &[],
                                     &[],
                                 )
@@ -3076,6 +3333,7 @@ fn main() {
                                 &dependency_outcome.borrow(),
                                 &system_voices.borrow(),
                                 &azure_voices.borrow(),
+                                &edge_tts_voices.borrow(),
                             );
                             let work = tokio_bridge::spawn_blocking(cx, move || {
                                 // Generation *and* playback, on the blocking

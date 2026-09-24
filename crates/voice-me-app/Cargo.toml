@@ -34,6 +34,9 @@ voice-me-audio-linux = { path = "../voice-me-audio-linux" }
 # Story 3.12: the System voice — eSpeak NG as a bounded child process.
 # Offline; Linux only (Windows is Story 3.13).
 voice-me-tts-system-linux = { path = "../voice-me-tts-system-linux" }
+# Story 3.17: Edge TTS — the user-installed `edge-tts` program as a bounded
+# child process. Linux only; no reqwest.
+voice-me-tts-edge = { path = "../voice-me-tts-edge" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 voice-me-tray-windows = { path = "../voice-me-tray-windows" }

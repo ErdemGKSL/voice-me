@@ -212,7 +212,7 @@ pub fn delete_held_sample(
             "{} does not hold voice samples in this voice-me release.",
             provider.label()
         ))),
-        RemoteProvider::Azure => Err(VoiceMeError::Other(format!(
+        RemoteProvider::Azure | RemoteProvider::EdgeTts => Err(VoiceMeError::Other(format!(
             "{} holds no voice samples — it speaks in a stock Microsoft voice.",
             provider.label()
         ))),

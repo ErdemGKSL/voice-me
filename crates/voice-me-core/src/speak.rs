@@ -144,6 +144,28 @@ fn speak_inner(
         return play(virtual_mic, audio);
     }
 
+    // Story 3.17: Edge TTS speaks in a stock Microsoft voice through the
+    // `edge-tts` program, with no key and no sample. The language and the
+    // stored voice are checked against the voices the program listed —
+    // refused by name, never substituted; an unset voice is the language's
+    // first. Then the disclosure, before any process is spawned.
+    if backend == LanguageBackend::Remote(RemoteProvider::EdgeTts) {
+        let voice = resolve_stock_voice(
+            backend,
+            &state.edge_tts_voices,
+            stored,
+            state.speech_voices.get(backend),
+        )
+        .map_err(|refusal| VoiceMeError::Other(refusal.to_string()))?;
+        if !state.disclosure_confirmed(RemoteProvider::EdgeTts) {
+            return Err(VoiceMeError::DisclosureNotConfirmed(
+                RemoteProvider::EdgeTts.label().to_string(),
+            ));
+        }
+        let audio = tts.generate(text, None, &voice.language, Some(&voice.id))?;
+        return play(virtual_mic, audio);
+    }
+
     // Story 3.14: Azure speaks in a stock Microsoft voice. A voice has to
     // be chosen (D4). With the voice list fetched, the stored locale and
     // voice are checked against it — refused by name, never substituted;
@@ -1207,5 +1229,127 @@ mod tests {
             .map(|call| call.2.clone())
             .collect();
         assert_eq!(locales, vec!["tr-TR", "tr-TR"]);
+    }
+
+    fn edge_voice(id: &str, locale: &str, priority: u32) -> crate::state::StockVoice {
+        crate::state::StockVoice {
+            id: id.to_string(),
+            language: locale.to_string(),
+            language_label: locale.to_string(),
+            name: id.to_string(),
+            priority,
+        }
+    }
+
+    /// Edge TTS selected, its voices listed, disclosure confirmed — no key
+    /// and no sample.
+    fn edge_state(locale: &str, voice: Option<&str>) -> AppState {
+        AppState {
+            backend_selection: BackendSelection::Remote(RemoteProvider::EdgeTts),
+            confirmed_disclosures: vec![RemoteProvider::EdgeTts],
+            speech_languages: SpeechLanguages {
+                edge_tts: locale.to_string(),
+                ..SpeechLanguages::default()
+            },
+            speech_voices: crate::state::SpeechVoices {
+                edge_tts: voice.map(str::to_string),
+                ..Default::default()
+            },
+            edge_tts_voices: vec![
+                edge_voice("en-US-JennyNeural", "en-US", 0),
+                edge_voice("tr-TR-AhmetNeural", "tr-TR", 1),
+                edge_voice("tr-TR-EmelNeural", "tr-TR", 2),
+            ],
+            ..AppState::default()
+        }
+    }
+
+    /// The matrix's Speak row: `tr-TR` with no voice set speaks the
+    /// language's first listed voice, with no clip, and plays the buffer.
+    #[test]
+    fn edge_tts_speaks_the_languages_first_voice_with_no_sample_or_key() {
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+
+        speak("Merhaba", &edge_state("tr-TR", None), &tts, &mic, &notifier).unwrap();
+        speak(
+            "Merhaba",
+            &edge_state("tr-tr", Some("tr-TR-EmelNeural")),
+            &tts,
+            &mic,
+            &notifier,
+        )
+        .unwrap();
+
+        assert_eq!(tts.calls.lock().unwrap()[0].2, "tr-TR");
+        assert_eq!(
+            *tts.voices.lock().unwrap(),
+            vec![
+                (None, Some("tr-TR-AhmetNeural".to_string())),
+                (None, Some("tr-TR-EmelNeural".to_string())),
+            ]
+        );
+        assert_eq!(mic.played().len(), 2);
+        assert!(notifier.summaries().is_empty());
+    }
+
+    /// The No disclosure row: refused before anything is spawned, with one
+    /// notification.
+    #[test]
+    fn edge_tts_is_refused_before_generate_until_its_disclosure_is_confirmed() {
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+        let state = AppState {
+            confirmed_disclosures: vec![RemoteProvider::Azure],
+            ..edge_state("tr-TR", None)
+        };
+
+        let error = speak("Merhaba", &state, &tts, &mic, &notifier).unwrap_err();
+
+        assert!(
+            matches!(error, VoiceMeError::DisclosureNotConfirmed(ref name) if name == "Edge TTS")
+        );
+        assert!(tts.calls.lock().unwrap().is_empty());
+        assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
+    }
+
+    /// An unlisted language or voice is refused by name, never
+    /// substituted; so is speaking before any voice was listed.
+    #[test]
+    fn an_unlisted_edge_tts_language_or_voice_is_refused_by_name() {
+        for (state, needle) in [
+            (edge_state("xx-XX", None), "\"xx-XX\""),
+            (
+                edge_state("tr-TR", Some("tr-TR-GoneNeural")),
+                "\"tr-TR-GoneNeural\"",
+            ),
+            (
+                edge_state("en-US", Some("tr-TR-EmelNeural")),
+                "\"tr-TR-EmelNeural\"",
+            ),
+            (
+                AppState {
+                    edge_tts_voices: Vec::new(),
+                    ..edge_state("tr-TR", None)
+                },
+                "no voices listed",
+            ),
+        ] {
+            let tts = FakeTts::default();
+            let notifier = FakeNotifier::default();
+            let mic = FakeMic::default();
+
+            let error = speak("Merhaba", &state, &tts, &mic, &notifier).unwrap_err();
+
+            assert!(tts.calls.lock().unwrap().is_empty());
+            let message = error.to_string();
+            assert!(
+                message.contains("Edge TTS") && message.contains(needle),
+                "{message}"
+            );
+            assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
+        }
     }
 }

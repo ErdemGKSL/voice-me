@@ -176,15 +176,20 @@ pub struct BackendPanel {
     /// Azure's voice list as the root last fetched it (Story 3.14). Not
     /// persisted; cached by the root for the session.
     pub azure_voices: Vec<StockVoice>,
+    /// The voices `edge-tts --list-voices` listed at the last check with
+    /// Edge TTS selected (Story 3.17). Not persisted; held by the root.
+    pub edge_tts_voices: Vec<StockVoice>,
 }
 
 impl BackendPanel {
     /// The run-time voice list `backend`'s languages and voices come from:
-    /// the System voice's engine list, Azure's voice list, or nothing.
+    /// the System voice's engine list, Azure's voice list, Edge TTS's
+    /// voice list, or nothing.
     fn stock_voices(&self, backend: LanguageBackend) -> &[StockVoice] {
         match backend {
             LanguageBackend::SystemVoice => &self.system_voices,
             LanguageBackend::Remote(RemoteProvider::Azure) => &self.azure_voices,
+            LanguageBackend::Remote(RemoteProvider::EdgeTts) => &self.edge_tts_voices,
             _ => &[],
         }
     }
@@ -208,6 +213,7 @@ impl Default for BackendPanel {
             system_voices: Vec::new(),
             azure_region: None,
             azure_voices: Vec::new(),
+            edge_tts_voices: Vec::new(),
         }
     }
 }
@@ -215,6 +221,10 @@ impl Default for BackendPanel {
 /// The line under Azure's options (Story 3.14): a stock voice, not the
 /// user's.
 pub const AZURE_STOCK_VOICE_NOTE: &str = "Speech will be in this Microsoft voice, not yours.";
+
+/// The line under Edge TTS's options (Story 3.17): a stock voice, not the
+/// user's.
+pub const EDGE_TTS_STOCK_VOICE_NOTE: &str = "Speech will be in this Microsoft voice, not yours.";
 
 /// What the Backend tab says while Azure has no voice saved (D4).
 pub const AZURE_PICK_A_VOICE: &str = "Pick a voice for Azure";
@@ -254,7 +264,7 @@ impl BackendKind {
     fn label(self) -> &'static str {
         match self {
             BackendKind::Local => "Local — on this computer",
-            BackendKind::Remote => "Remote — with your own API key",
+            BackendKind::Remote => "Remote — online providers",
         }
     }
 
@@ -528,8 +538,10 @@ impl BackendView {
             }
         });
 
+        // Story 3.17: a keyless provider (Edge TTS) gets no key field.
         let key_inputs = RemoteProvider::ALL
             .into_iter()
+            .filter(|provider| provider.needs_api_key())
             .map(|provider| {
                 let saved = panel.api_keys.get(provider).unwrap_or_default().to_string();
                 let input = cx.new(|cx| {
@@ -584,7 +596,8 @@ impl BackendView {
         // The same for the language `Select`: a failed save leaves the
         // picked language showing until it is resynced to the saved one.
         let voices_changed = panel.system_voices != self.panel.system_voices
-            || panel.azure_voices != self.panel.azure_voices;
+            || panel.azure_voices != self.panel.azure_voices
+            || panel.edge_tts_voices != self.panel.edge_tts_voices;
         let region_changed = panel.azure_region != self.panel.azure_region;
         self.language_items_stale |= voices_changed;
         self.language_stale |= panel.speech_languages != self.panel.speech_languages
@@ -912,6 +925,34 @@ impl BackendView {
                             .children(language)
                             .children(voice)
                             .child(self.azure_voice_status(cx))
+                            .when(!others.is_empty(), |el| {
+                                el.child(
+                                    v_flex()
+                                        .id("backend-other-providers")
+                                        .test_support()
+                                        .gap_2()
+                                        .children(others),
+                                )
+                            })
+                            .into_any_element(),
+                    );
+                }
+                // Story 3.17: Edge TTS has no key and holds no sample — its
+                // locale and voice, and what it speaks in.
+                if saved == Some(RemoteProvider::EdgeTts) {
+                    return Some(
+                        v_flex()
+                            .gap_6()
+                            .children(language)
+                            .children(voice)
+                            .child(
+                                div()
+                                    .id("backend-edge-tts-stock-note")
+                                    .test_support()
+                                    .text_size(px(12.))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(EDGE_TTS_STOCK_VOICE_NOTE),
+                            )
                             .when(!others.is_empty(), |el| {
                                 el.child(
                                     v_flex()
@@ -1493,6 +1534,15 @@ fn speech_language_note(panel: &BackendPanel, backend: LanguageBackend) -> Strin
                 region are saved."
             .to_string();
     }
+    // Story 3.17: a missing program is the Dependencies row's to say; a
+    // failed listing is the error beside this language.
+    if backend == LanguageBackend::Remote(RemoteProvider::EdgeTts)
+        && panel.edge_tts_voices.is_empty()
+    {
+        return "Edge TTS's voices are not listed yet. They are listed by the edge-tts program \
+             at the next check."
+            .to_string();
+    }
     let saved = panel.speech_languages.get(backend).unwrap_or_default();
     format!(
         "The saved speech language {saved:?} is not one {} speaks. Choose one to speak again.",
@@ -1537,6 +1587,7 @@ fn provider_slug(provider: RemoteProvider) -> &'static str {
         RemoteProvider::DeepInfra => "deepinfra",
         RemoteProvider::FalAi => "fal-ai",
         RemoteProvider::Azure => "azure",
+        RemoteProvider::EdgeTts => "edge-tts",
     }
 }
 
@@ -2983,5 +3034,136 @@ mod tests {
             assert!(note.contains("Azure"), "{note}");
         })
         .unwrap();
+    }
+
+    fn edge_voice(id: &str, locale: &str, name: &str, priority: u32) -> StockVoice {
+        StockVoice {
+            id: id.to_string(),
+            language: locale.to_string(),
+            language_label: locale.to_string(),
+            name: name.to_string(),
+            priority,
+        }
+    }
+
+    /// Edge TTS saved, speaking `locale` with `voice` stored, against a
+    /// small list as `edge-tts --list-voices` gives it.
+    fn edge_tts_panel(locale: &str, voice: Option<&str>) -> BackendPanel {
+        BackendPanel {
+            selection: BackendSelection::Remote(RemoteProvider::EdgeTts),
+            speech_languages: SpeechLanguages {
+                edge_tts: locale.to_string(),
+                ..SpeechLanguages::default()
+            },
+            speech_voices: SpeechVoices {
+                edge_tts: voice.map(str::to_string),
+                ..SpeechVoices::default()
+            },
+            edge_tts_voices: vec![
+                edge_voice("en-US-AvaMultilingualNeural", "en-US", "Ava (Female)", 0),
+                edge_voice("tr-TR-AhmetNeural", "tr-TR", "Ahmet (Male)", 1),
+                edge_voice(EMEL, "tr-TR", "Emel (Female)", 2),
+            ],
+            ..BackendPanel::default()
+        }
+    }
+
+    /// Story 3.17: Edge TTS has no key field and no sample line; its
+    /// locale and voice come from its list, with the first listed voice in
+    /// effect, and it says it speaks in a Microsoft voice.
+    #[gpui_kit::test]
+    fn edge_tts_shows_its_locale_and_voice_and_no_key(cx: &mut TestAppContext) {
+        let (window, view, recorded) = open_backend_tab(cx, edge_tts_panel("tr-TR", None));
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).kind, BackendKind::Remote);
+            assert!(
+                !view
+                    .read(cx)
+                    .key_inputs
+                    .iter()
+                    .any(|(provider, _)| *provider == RemoteProvider::EdgeTts)
+            );
+            assert!(window.try_find("api-key-save-edge-tts").is_none());
+            assert!(window.try_find("backend-api-keys").is_none());
+            assert!(window.try_find("api-key-plaintext-notice").is_none());
+            assert!(window.try_find("backend-remote-samples").is_none());
+            assert!(window.try_find("backend-speech-language").is_some());
+            assert_eq!(
+                view.read(cx).language_select.read(cx).selected_value(),
+                Some(&"tr-TR".to_string())
+            );
+            assert!(window.try_find("backend-speech-voice").is_some());
+            assert_eq!(
+                view.read(cx).voice_select.read(cx).selected_value(),
+                Some(&"tr-TR-AhmetNeural".to_string()),
+                "the language's first listed voice"
+            );
+            assert!(window.try_find("backend-edge-tts-stock-note").is_some());
+            assert!(window.try_find("backend-stock-voice").is_some());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(recorded.borrow().is_empty());
+    }
+
+    /// Picking Emel asks the root once, under Edge TTS.
+    #[gpui_kit::test]
+    fn picking_an_edge_tts_voice_asks_the_root(cx: &mut TestAppContext) {
+        let (window, view, recorded) = open_backend_tab(cx, edge_tts_panel("tr-TR", None));
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let select = view.read(cx).voice_select.clone();
+            select.update(cx, |_, cx| {
+                // The voice in effect is not a change.
+                cx.emit(SelectEvent::Confirm(Some("tr-TR-AhmetNeural".to_string())));
+                cx.emit(SelectEvent::Confirm(Some(EMEL.to_string())));
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            *recorded.borrow(),
+            vec![BackendAction::SetSpeechVoice(
+                LanguageBackend::Remote(RemoteProvider::EdgeTts),
+                Some(EMEL.to_string())
+            )]
+        );
+    }
+
+    /// Edge TTS is listed after Azure, under the Remote kind, which no
+    /// longer promises a key.
+    #[test]
+    fn edge_tts_is_the_last_remote_entry() {
+        let remote = choices(BackendKind::Remote, &[]);
+        let last = remote.last().unwrap();
+        assert_eq!(
+            last.selection,
+            BackendSelection::Remote(RemoteProvider::EdgeTts)
+        );
+        assert_eq!(last.label.as_ref(), "Edge TTS — free, online (stock voice)");
+        assert_eq!(
+            remote[remote.len() - 2].selection,
+            BackendSelection::Remote(RemoteProvider::Azure)
+        );
+        assert_eq!(BackendKind::Remote.label(), "Remote — online providers");
+        assert_eq!(provider_slug(RemoteProvider::EdgeTts), "edge-tts");
+    }
+
+    /// Nothing listed yet: the note says so, and never that the program is
+    /// missing — the Dependencies row says that.
+    #[test]
+    fn edge_tts_with_no_list_yet_says_so() {
+        let panel = BackendPanel {
+            edge_tts_voices: Vec::new(),
+            ..edge_tts_panel("tr-TR", None)
+        };
+        let note = speech_language_note(&panel, LanguageBackend::Remote(RemoteProvider::EdgeTts));
+        assert!(note.contains("Edge TTS"), "{note}");
+        assert!(note.contains("not listed yet"), "{note}");
+        assert!(!note.contains("  "), "no stray spaces: {note}");
     }
 }

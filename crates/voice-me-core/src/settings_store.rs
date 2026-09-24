@@ -16,9 +16,9 @@ use crate::error::VoiceMeError;
 use crate::ports::SettingsStore;
 use crate::state::{
     ActiveBackend, ApiKeys, AppState, BackendSelection, DEFAULT_AZURE_LOCALE,
-    DEFAULT_SPEECH_LANGUAGE, DependencyOutcome, LanguageBackend, LocalRuntime, RemoteProvider,
-    RemoteSample, SpeechBackend, SpeechExecutionTarget, SpeechLanguages, SpeechVoices,
-    parse_azure_region,
+    DEFAULT_EDGE_TTS_LOCALE, DEFAULT_SPEECH_LANGUAGE, DependencyOutcome, LanguageBackend,
+    LocalRuntime, RemoteProvider, RemoteSample, SpeechBackend, SpeechExecutionTarget,
+    SpeechLanguages, SpeechVoices, parse_azure_region,
 };
 
 const SETTINGS_FILE_NAME: &str = "settings.toml";
@@ -138,6 +138,13 @@ struct SpeechLanguagesFile {
         skip_serializing_if = "Option::is_none"
     )]
     azure: Option<String>,
+    /// Story 3.17: an Edge TTS locale. Never seeded by the legacy key.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    edge_tts: Option<String>,
 }
 
 impl SpeechLanguagesFile {
@@ -147,6 +154,7 @@ impl SpeechLanguagesFile {
             LanguageBackend::Remote(RemoteProvider::DeepInfra) => Some(&mut self.deepinfra),
             LanguageBackend::Remote(RemoteProvider::FalAi) => None,
             LanguageBackend::Remote(RemoteProvider::Azure) => Some(&mut self.azure),
+            LanguageBackend::Remote(RemoteProvider::EdgeTts) => Some(&mut self.edge_tts),
             LanguageBackend::SystemVoice => Some(&mut self.system_voice),
         }
     }
@@ -162,6 +170,10 @@ impl SpeechLanguagesFile {
                 .azure
                 .clone()
                 .unwrap_or_else(|| DEFAULT_AZURE_LOCALE.to_string()),
+            edge_tts: self
+                .edge_tts
+                .clone()
+                .unwrap_or_else(|| DEFAULT_EDGE_TTS_LOCALE.to_string()),
         }
     }
 }
@@ -172,6 +184,7 @@ impl SpeechLanguagesFile {
 /// [speech_voices]
 /// system_voice = "sit/yue-Latn-jyutping"
 /// azure = "tr-TR-EmelNeural"
+/// edge_tts = "tr-TR-EmelNeural"
 /// ```
 ///
 /// An absent key is the language's top-priority voice — for Azure, no
@@ -191,6 +204,13 @@ struct SpeechVoicesFile {
         skip_serializing_if = "Option::is_none"
     )]
     azure: Option<String>,
+    /// Story 3.17.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    edge_tts: Option<String>,
 }
 
 impl SpeechVoicesFile {
@@ -198,6 +218,7 @@ impl SpeechVoicesFile {
         match backend {
             LanguageBackend::SystemVoice => Some(&mut self.system_voice),
             LanguageBackend::Remote(RemoteProvider::Azure) => Some(&mut self.azure),
+            LanguageBackend::Remote(RemoteProvider::EdgeTts) => Some(&mut self.edge_tts),
             _ => None,
         }
     }
@@ -206,6 +227,7 @@ impl SpeechVoicesFile {
         SpeechVoices {
             system_voice: self.system_voice.clone(),
             azure: self.azure.clone(),
+            edge_tts: self.edge_tts.clone(),
         }
     }
 }
@@ -330,6 +352,7 @@ impl Default for SettingsFile {
                 deepinfra: Some(DEFAULT_SPEECH_LANGUAGE.to_string()),
                 system_voice: Some(DEFAULT_SPEECH_LANGUAGE.to_string()),
                 azure: Some(DEFAULT_AZURE_LOCALE.to_string()),
+                edge_tts: Some(DEFAULT_EDGE_TTS_LOCALE.to_string()),
             },
             speech_voices: SpeechVoicesFile::default(),
             selected_mic_device: None,
@@ -419,6 +442,11 @@ impl FileSettingsStore {
             .speech_languages
             .azure
             .get_or_insert_with(|| DEFAULT_AZURE_LOCALE.to_string());
+        // Story 3.17: so does Edge TTS.
+        settings
+            .speech_languages
+            .edge_tts
+            .get_or_insert_with(|| DEFAULT_EDGE_TTS_LOCALE.to_string());
         // A hand-edited region that is not `[a-z0-9]+` is no region: it
         // must never reach the host name.
         settings.azure_region = settings
@@ -478,6 +506,8 @@ impl FileSettingsStore {
             // Fetched from Azure and cached by the composition root for
             // the session, never a file.
             azure_voices: Vec::new(),
+            // Listed by the `edge-tts` program at a check, never a file.
+            edge_tts_voices: Vec::new(),
         }
     }
 }
@@ -1311,6 +1341,50 @@ mod tests {
 
         // `None` removes the region.
         assert_eq!(store.save_azure_region(None).unwrap().azure_region, None);
+    }
+
+    /// Story 3.17: Edge TTS's locale and voice round trip under
+    /// `edge_tts`, a new locale clears the voice, and it has no key.
+    #[test]
+    fn edge_tts_locale_and_voice_round_trip() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = store_in(config_dir.path(), data_dir.path());
+        let edge = LanguageBackend::Remote(RemoteProvider::EdgeTts);
+        let state = store.load().unwrap();
+        assert_eq!(state.speech_languages.edge_tts, "tr-TR");
+        assert_eq!(state.speech_voices.edge_tts, None);
+
+        store
+            .save_backend_selection(&BackendSelection::Remote(RemoteProvider::EdgeTts))
+            .unwrap();
+        store.save_speech_language(edge, "en-US").unwrap();
+        store
+            .save_speech_voice(edge, Some("en-US-AvaMultilingualNeural"))
+            .unwrap();
+        let state = store
+            .save_api_key(RemoteProvider::EdgeTts, Some("ignored"))
+            .unwrap();
+        assert_eq!(state.api_keys.get(RemoteProvider::EdgeTts), None);
+
+        let reloaded = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+        assert_eq!(
+            reloaded.backend_selection,
+            BackendSelection::Remote(RemoteProvider::EdgeTts)
+        );
+        assert_eq!(reloaded.speech_languages.edge_tts, "en-US");
+        assert_eq!(
+            reloaded.speech_voices.edge_tts.as_deref(),
+            Some("en-US-AvaMultilingualNeural")
+        );
+        assert_eq!(reloaded.speech_languages.azure, "tr-TR", "untouched");
+        let written = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
+        assert!(written.contains("provider = \"edge_tts\""), "{written}");
+        assert!(written.contains("edge_tts = \"en-US\""), "{written}");
+        assert!(!written.contains("ignored"), "{written}");
+
+        let state = store.save_speech_language(edge, "tr-TR").unwrap();
+        assert_eq!(state.speech_voices.edge_tts, None);
     }
 
     #[test]

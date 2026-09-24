@@ -4,13 +4,35 @@
 /// `os_release` (the contents of `/etc/os-release`) describes, going by
 /// `ID` and then `ID_LIKE`. `None` for a distribution not known here.
 pub fn install_command_for(os_release: &str) -> Option<&'static str> {
+    distro_ids(os_release)
+        .iter()
+        .find_map(|id| match id.as_str() {
+            "arch" => Some("sudo pacman -S espeak-ng"),
+            "debian" | "ubuntu" => Some("sudo apt install espeak-ng"),
+            "fedora" => Some("sudo dnf install espeak-ng"),
+            id if is_opensuse(id) => Some("sudo zypper install espeak-ng"),
+            _ => None,
+        })
+}
+
+/// Whether `id` names an openSUSE flavour (`opensuse`,
+/// `opensuse-tumbleweed`, …).
+pub fn is_opensuse(id: &str) -> bool {
+    id == "opensuse" || id.starts_with("opensuse-")
+}
+
+/// The distribution ids `os_release` (the contents of `/etc/os-release`)
+/// names, lowercased: `ID` first, then each of `ID_LIKE`. What every
+/// per-distribution install command is chosen by — eSpeak NG's here, and
+/// `pipx`'s in `voice-me-tts-edge` (Story 3.17).
+pub fn distro_ids(os_release: &str) -> Vec<String> {
     let field = |key: &str| {
         os_release.lines().find_map(|line| {
             let (name, value) = line.trim().split_once('=')?;
             (name.trim() == key).then(|| value.trim().trim_matches(['"', '\'']).to_string())
         })
     };
-    let ids: Vec<String> = field("ID")
+    field("ID")
         .into_iter()
         .chain(field("ID_LIKE"))
         .flat_map(|value| {
@@ -19,26 +41,20 @@ pub fn install_command_for(os_release: &str) -> Option<&'static str> {
                 .map(str::to_ascii_lowercase)
                 .collect::<Vec<_>>()
         })
-        .collect();
+        .collect()
+}
 
-    ids.iter().find_map(|id| match id.as_str() {
-        "arch" => Some("sudo pacman -S espeak-ng"),
-        "debian" | "ubuntu" => Some("sudo apt install espeak-ng"),
-        "fedora" => Some("sudo dnf install espeak-ng"),
-        id if id == "opensuse" || id.starts_with("opensuse-") => {
-            Some("sudo zypper install espeak-ng")
-        }
-        _ => None,
-    })
+/// The contents of this machine's os-release file, or nothing.
+pub fn read_os_release() -> String {
+    std::fs::read_to_string("/etc/os-release")
+        .or_else(|_| std::fs::read_to_string("/usr/lib/os-release"))
+        .unwrap_or_default()
 }
 
 /// The one step that installs `espeak-ng` here: the distribution's command
 /// when it is known, otherwise a sentence saying what to install.
 pub fn install_step() -> String {
-    let os_release = std::fs::read_to_string("/etc/os-release")
-        .or_else(|_| std::fs::read_to_string("/usr/lib/os-release"))
-        .unwrap_or_default();
-    match install_command_for(&os_release) {
+    match install_command_for(&read_os_release()) {
         Some(command) => format!("Install it from a terminal: {command}"),
         None => GENERIC_INSTALL_STEP.to_string(),
     }

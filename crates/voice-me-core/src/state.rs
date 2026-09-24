@@ -18,6 +18,10 @@ pub const DEFAULT_SPEECH_LANGUAGE: &str = "tr";
 /// everywhere else.
 pub const DEFAULT_AZURE_LOCALE: &str = "tr-TR";
 
+/// Edge TTS's speech language when nothing has been saved yet (Story
+/// 3.17): its voices are named by locale, like Azure's.
+pub const DEFAULT_EDGE_TTS_LOCALE: &str = "tr-TR";
+
 /// Why an Azure region was not saved (Story 3.14).
 pub const AZURE_REGION_INVALID: &str =
     "An Azure region is letters and digits only, like westeurope.";
@@ -157,6 +161,8 @@ impl SpeechBackend {
 ///
 /// DeepInfra generates since Story 3.6; fal.ai is selectable, and generates
 /// with Story 3.7. Azure (Story 3.14) speaks in a stock Microsoft voice.
+/// Edge TTS (Story 3.17) speaks in the same voices through the separately
+/// installed `edge-tts` program, with no key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteProvider {
@@ -164,14 +170,16 @@ pub enum RemoteProvider {
     DeepInfra,
     FalAi,
     Azure,
+    EdgeTts,
 }
 
 impl RemoteProvider {
     /// Every provider, in the order the UI lists them.
-    pub const ALL: [RemoteProvider; 3] = [
+    pub const ALL: [RemoteProvider; 4] = [
         RemoteProvider::DeepInfra,
         RemoteProvider::FalAi,
         RemoteProvider::Azure,
+        RemoteProvider::EdgeTts,
     ];
 
     /// How the provider is named to the user.
@@ -180,14 +188,23 @@ impl RemoteProvider {
             RemoteProvider::DeepInfra => "DeepInfra",
             RemoteProvider::FalAi => "fal.ai",
             RemoteProvider::Azure => "Azure",
+            RemoteProvider::EdgeTts => "Edge TTS",
         }
+    }
+
+    /// Whether this provider needs the user's API key (Story 3.17): every
+    /// provider but Edge TTS, which runs a program that needs no account.
+    /// Every key check — the capability row, the Backend tab's key field,
+    /// the disclosure's key guard — asks this first.
+    pub fn needs_api_key(self) -> bool {
+        self != RemoteProvider::EdgeTts
     }
 
     /// Whether this provider speaks in a stock voice rather than cloning
     /// the user's (Story 3.14): it never receives the Reference Voice
     /// Sample.
     pub fn is_stock_voice(self) -> bool {
-        self == RemoteProvider::Azure
+        matches!(self, RemoteProvider::Azure | RemoteProvider::EdgeTts)
     }
 }
 
@@ -225,18 +242,22 @@ impl LanguageBackend {
         match self {
             LanguageBackend::Local => LOCAL_SPEECH_LANGUAGES,
             LanguageBackend::Remote(RemoteProvider::DeepInfra) => DEEPINFRA_SPEECH_LANGUAGES,
-            LanguageBackend::Remote(RemoteProvider::FalAi | RemoteProvider::Azure)
+            LanguageBackend::Remote(
+                RemoteProvider::FalAi | RemoteProvider::Azure | RemoteProvider::EdgeTts,
+            )
             | LanguageBackend::SystemVoice => &[],
         }
     }
 
     /// Whether this backend's languages and voices come from a list read
     /// at run time rather than a static table: the System voice's engine
-    /// (Story 3.12) and Azure's voice list (Story 3.14).
+    /// (Story 3.12), Azure's voice list (Story 3.14) and `edge-tts
+    /// --list-voices` (Story 3.17).
     pub fn has_voice_list(self) -> bool {
         matches!(
             self,
-            LanguageBackend::SystemVoice | LanguageBackend::Remote(RemoteProvider::Azure)
+            LanguageBackend::SystemVoice
+                | LanguageBackend::Remote(RemoteProvider::Azure | RemoteProvider::EdgeTts)
         )
     }
 
@@ -520,6 +541,9 @@ pub struct SpeechLanguages {
     /// Story 3.14: an Azure locale. Defaults to `tr-TR`; the legacy key
     /// never seeds it.
     pub azure: String,
+    /// Story 3.17: an Edge TTS locale. Defaults to `tr-TR`; the legacy key
+    /// never seeds it.
+    pub edge_tts: String,
 }
 
 impl Default for SpeechLanguages {
@@ -529,6 +553,7 @@ impl Default for SpeechLanguages {
             deepinfra: DEFAULT_SPEECH_LANGUAGE.to_string(),
             system_voice: DEFAULT_SPEECH_LANGUAGE.to_string(),
             azure: DEFAULT_AZURE_LOCALE.to_string(),
+            edge_tts: DEFAULT_EDGE_TTS_LOCALE.to_string(),
         }
     }
 }
@@ -541,6 +566,9 @@ pub struct SpeechVoices {
     pub system_voice: Option<String>,
     /// Azure's `ShortName` (`tr-TR-EmelNeural`).
     pub azure: Option<String>,
+    /// Story 3.17: an Edge TTS voice id (`tr-TR-EmelNeural`). `None` is the
+    /// language's first listed voice.
+    pub edge_tts: Option<String>,
 }
 
 impl SpeechVoices {
@@ -549,6 +577,7 @@ impl SpeechVoices {
         match backend {
             LanguageBackend::SystemVoice => self.system_voice.as_deref(),
             LanguageBackend::Remote(RemoteProvider::Azure) => self.azure.as_deref(),
+            LanguageBackend::Remote(RemoteProvider::EdgeTts) => self.edge_tts.as_deref(),
             _ => None,
         }
     }
@@ -562,6 +591,7 @@ impl SpeechLanguages {
             LanguageBackend::Remote(RemoteProvider::DeepInfra) => Some(&self.deepinfra),
             LanguageBackend::Remote(RemoteProvider::FalAi) => None,
             LanguageBackend::Remote(RemoteProvider::Azure) => Some(&self.azure),
+            LanguageBackend::Remote(RemoteProvider::EdgeTts) => Some(&self.edge_tts),
             LanguageBackend::SystemVoice => Some(&self.system_voice),
         }
     }
@@ -671,6 +701,10 @@ impl BackendSelection {
                 runtime: Some(path),
                 target,
             } => format!("{} ({})", target.label(), file_name(path)),
+            // Story 3.17: the UX's own entry for the keyless one.
+            BackendSelection::Remote(RemoteProvider::EdgeTts) => {
+                "Edge TTS — free, online (stock voice)".to_string()
+            }
             BackendSelection::Remote(provider) => format!("{} (remote)", provider.label()),
             BackendSelection::SystemVoice => "System voice — instant (stock voice)".to_string(),
         }
@@ -765,6 +799,8 @@ impl ApiKeys {
             RemoteProvider::DeepInfra => self.deepinfra.as_deref(),
             RemoteProvider::FalAi => self.fal_ai.as_deref(),
             RemoteProvider::Azure => self.azure.as_deref(),
+            // Story 3.17: Edge TTS has no key.
+            RemoteProvider::EdgeTts => None,
         }
         .filter(|key| !key.trim().is_empty())
     }
@@ -784,6 +820,8 @@ impl ApiKeys {
             RemoteProvider::DeepInfra => self.deepinfra = key,
             RemoteProvider::FalAi => self.fal_ai = key,
             RemoteProvider::Azure => self.azure = key,
+            // Story 3.17: Edge TTS has no key, so there is nothing to set.
+            RemoteProvider::EdgeTts => {}
         }
     }
 }
@@ -907,6 +945,9 @@ pub enum DependencyKind {
     /// `espeak-ng` program). Blocking, with manual steps: it is a system
     /// package voice-me cannot install.
     SystemVoiceEngine,
+    /// The `edge-tts` program Edge TTS runs (Story 3.17). Blocking, with
+    /// manual steps only: voice-me never runs pip for the user.
+    EdgeTtsProgram,
 }
 
 impl DependencyKind {
@@ -919,6 +960,7 @@ impl DependencyKind {
                 | DependencyKind::ModelWeights
                 | DependencyKind::BackendCapability
                 | DependencyKind::SystemVoiceEngine
+                | DependencyKind::EdgeTtsProgram
         )
     }
 }
@@ -1131,6 +1173,10 @@ pub struct AppState {
     /// Azure selected (Story 3.14, D1). Cached by the composition root for
     /// the session and never persisted.
     pub azure_voices: Vec<StockVoice>,
+    /// The voices `edge-tts --list-voices` listed at the last Dependency
+    /// Check with Edge TTS selected and the program found (Story 3.17).
+    /// Merged in by the composition root; never persisted.
+    pub edge_tts_voices: Vec<StockVoice>,
 }
 
 /// Hand-written rather than derived so the two language fields default to
@@ -1156,6 +1202,7 @@ impl Default for AppState {
             system_voices: Vec::new(),
             azure_region: None,
             azure_voices: Vec::new(),
+            edge_tts_voices: Vec::new(),
         }
     }
 }
@@ -1175,6 +1222,7 @@ impl AppState {
         match backend {
             LanguageBackend::SystemVoice => &self.system_voices,
             LanguageBackend::Remote(RemoteProvider::Azure) => &self.azure_voices,
+            LanguageBackend::Remote(RemoteProvider::EdgeTts) => &self.edge_tts_voices,
             _ => &[],
         }
     }
@@ -1236,6 +1284,43 @@ mod tests {
         }
     }
 
+    /// Story 3.17: only Edge TTS goes without a key; it is a stock voice
+    /// listed after Azure, and its program blocks speech.
+    #[test]
+    fn edge_tts_needs_no_key_and_its_program_blocks_speech() {
+        for provider in RemoteProvider::ALL {
+            assert_eq!(
+                provider.needs_api_key(),
+                provider != RemoteProvider::EdgeTts,
+                "{provider:?}"
+            );
+        }
+        assert_eq!(RemoteProvider::ALL[3], RemoteProvider::EdgeTts);
+        assert_eq!(RemoteProvider::EdgeTts.label(), "Edge TTS");
+        assert!(RemoteProvider::EdgeTts.is_stock_voice());
+        assert!(DependencyKind::EdgeTtsProgram.blocks_speech());
+
+        let edge = LanguageBackend::Remote(RemoteProvider::EdgeTts);
+        assert!(edge.has_voice_list());
+        assert!(!edge.requires_voice());
+        assert_eq!(SpeechLanguages::default().get(edge), Some("tr-TR"));
+
+        let mut keys = ApiKeys::default();
+        keys.set(RemoteProvider::EdgeTts, Some("anything".to_string()));
+        assert_eq!(keys, ApiKeys::default());
+        assert!(!keys.has(RemoteProvider::EdgeTts));
+
+        #[derive(Serialize, Deserialize)]
+        struct Wrapper {
+            provider: RemoteProvider,
+        }
+        let written = toml::to_string(&Wrapper {
+            provider: RemoteProvider::EdgeTts,
+        })
+        .unwrap();
+        assert_eq!(written.trim(), "provider = \"edge_tts\"");
+    }
+
     #[test]
     fn a_blank_key_is_no_key() {
         let mut keys = ApiKeys::default();
@@ -1287,9 +1372,9 @@ mod tests {
         assert_eq!(choices[0].label(), "CPU (bundled runtime)");
         assert_eq!(
             choices.last(),
-            Some(&BackendSelection::Remote(RemoteProvider::Azure))
+            Some(&BackendSelection::Remote(RemoteProvider::EdgeTts))
         );
-        assert_eq!(choices.len(), 6);
+        assert_eq!(choices.len(), 7);
         // The System voice comes after the local runtimes, before remote.
         assert_eq!(choices[2], BackendSelection::SystemVoice);
     }

@@ -86,6 +86,10 @@ pub const DISCLOSURE_ITEMS: [&str; 3] = [
      in Settings → Backend or record a new sample)",
 ];
 
+/// The closing line of Edge TTS's disclosure (Story 3.17).
+pub const EDGE_TTS_DISCLOSURE_NOTE: &str = "Edge TTS sends the text to Microsoft's Edge Read Aloud service. It is free, needs no \
+     account, and is not an official API: it may stop working at any time.";
+
 /// What the confirm-first shape lists for one provider: exactly what
 /// leaves the machine, and — for a stock-voice provider — a closing line
 /// saying whose voice the speech will be in.
@@ -101,7 +105,8 @@ impl DisclosureText {
     ///
     /// A cloning provider gets [`DISCLOSURE_ITEMS`]. Azure (Story 3.14, D2)
     /// gets the typed text, the language and the voice name, and says the
-    /// speech will be in a Microsoft voice, not the user's.
+    /// speech will be in a Microsoft voice, not the user's. Edge TTS
+    /// (Story 3.17) lists the same three and says what its service is.
     pub fn for_provider(provider: RemoteProvider, language: &str, voice: Option<&str>) -> Self {
         match provider {
             RemoteProvider::Azure => Self {
@@ -115,6 +120,16 @@ impl DisclosureText {
                      Sample is never sent."
                         .to_string(),
                 ),
+            },
+            // Story 3.17: the same three items as Azure — no key, no
+            // sample — and what the service is.
+            RemoteProvider::EdgeTts => Self {
+                items: vec![
+                    "the text you type".to_string(),
+                    format!("the speech language: {}", language.trim()),
+                    format!("the voice name: {}", voice.unwrap_or("none chosen")),
+                ],
+                note: Some(EDGE_TTS_DISCLOSURE_NOTE.to_string()),
             },
             RemoteProvider::DeepInfra | RemoteProvider::FalAi => Self {
                 items: DISCLOSURE_ITEMS
@@ -1014,5 +1029,31 @@ mod tests {
             DISCLOSURE_ITEMS.map(str::to_string).to_vec()
         );
         assert_eq!(deepinfra.note, None);
+    }
+
+    /// Story 3.17: Edge TTS lists the text, the language and the voice,
+    /// never a sample or a key, and says what its service is.
+    #[test]
+    fn the_edge_tts_disclosure_names_the_voice_and_the_service() {
+        let edge = DisclosureText::for_provider(
+            RemoteProvider::EdgeTts,
+            "tr-TR",
+            Some("tr-TR-AhmetNeural"),
+        );
+        assert_eq!(
+            edge.items,
+            vec![
+                "the text you type".to_string(),
+                "the speech language: tr-TR".to_string(),
+                "the voice name: tr-TR-AhmetNeural".to_string(),
+            ]
+        );
+        assert_eq!(
+            edge.note.as_deref(),
+            Some(
+                "Edge TTS sends the text to Microsoft's Edge Read Aloud service. It is free, \
+                 needs no account, and is not an official API: it may stop working at any time."
+            )
+        );
     }
 }

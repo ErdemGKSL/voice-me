@@ -1,5 +1,8 @@
-//! One bounded run of the engine program: no shell, input on stdin, every
+//! One bounded run of a fixed program: no shell, input on stdin, every
 //! pipe drained on its own thread, killed and reaped at the deadline.
+//!
+//! Program-agnostic (Story 3.17): the one runner both `espeak-ng` and
+//! `edge-tts` go through (AD-12).
 
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
@@ -13,9 +16,12 @@ const POLL: Duration = Duration::from_millis(5);
 /// Why a run produced no usable output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunError {
-    /// The program could not be started at all (not on PATH, not
-    /// executable).
+    /// The program could not be started at all (not executable, say).
     Spawn(String),
+    /// The program does not exist: spawning it failed with
+    /// [`std::io::ErrorKind::NotFound`] (Story 3.17 — it can vanish after
+    /// the Dependency Check).
+    NotFound(String),
     /// It was still running at the deadline, and was killed.
     TimedOut(Duration),
     /// It exited unsuccessfully; carries the trimmed stderr.
@@ -25,7 +31,9 @@ pub enum RunError {
 impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RunError::Spawn(reason) => write!(f, "could not be started: {reason}"),
+            RunError::Spawn(reason) | RunError::NotFound(reason) => {
+                write!(f, "could not be started: {reason}")
+            }
             RunError::TimedOut(deadline) => {
                 write!(f, "did not finish within {} seconds", deadline.as_secs())
             }
@@ -58,7 +66,10 @@ pub fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| RunError::Spawn(error.to_string()))?;
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => RunError::NotFound(error.to_string()),
+            _ => RunError::Spawn(error.to_string()),
+        })?;
 
     // Each pipe on its own thread: a child blocked writing a full stdout
     // pipe while we block writing its stdin would otherwise deadlock.

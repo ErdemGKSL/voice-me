@@ -29,6 +29,10 @@ jobs:
             libxrandr-dev \
             libssl-dev \
             espeak-ng
+      # Story 3.17: the pinned `edge-tts` the `--list-voices` smoke test
+      # runs against. Online synthesis stays off (VOICE_ME_EDGE_TTS_ONLINE).
+      - name: Install edge-tts
+        run: pipx install edge-tts==7.2.8
       - run: cargo build --workspace
       # The tests are written to pass with no audio server; the ones that
       # need one are `#[ignore]`d. Without this step nothing automated ever

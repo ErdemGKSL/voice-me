@@ -109,26 +109,35 @@ context: ['{project-root}/_bmad-output/implementation-artifacts/epic-3-context.m
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `crates/voice-me-tts-edge/` + system-linux `pub mod process` + workspace member.
+- [x] `crates/voice-me-tts-edge/` + system-linux `pub mod process` + workspace member.
   - Tests: parse the fixture (header and rule skipped; `tr-TR-EmelNeural` → `tr-TR`, "Emel (Female)"; `zh-CN-liaoning-…`, `iu-Cans-CA-…`, `…MultilingualNeural`); zero voices → error.
   - Tests: argv excludes hostile text; `tone.mp3` decodes to ≈12 000 samples at 24 kHz.
   - Tests with a fake program: deadline, last stderr line, empty stdout, NotFound message; `find_program` via a temp `HOME` with an empty `PATH`; the os-release pipx step per distro.
   - `tests/edge_tts.rs`: skips when the program is absent. Otherwise it lists voices and asserts `tr-TR-EmelNeural`. Synthesis runs only with `VOICE_ME_EDGE_TTS_ONLINE=1`.
-- [ ] `crates/voice-me-core/src/{state,speak,settings_store,lib}.rs`.
+- [x] `crates/voice-me-core/src/{state,speak,settings_store,lib}.rs`.
   - Tests: matrix rows Speak, No disclosure, and unlisted language/voice at core level; settings round trip; `needs_api_key`; `blocks_speech`.
-- [ ] `crates/voice-me-deps/src/{capability,lib}.rs` + `Cargo.toml`.
+- [x] `crates/voice-me-deps/src/{capability,lib}.rs` + `Cargo.toml`.
   - Tests: missing → blocking manual row; present → ready; no key row for EdgeTts; `provision` refused; non-Linux cannot-run (cfg-gated); no eSpeak row.
-- [ ] `crates/voice-me-ui/src/{backend,prompt_overlay,dependencies}.rs`.
+- [x] `crates/voice-me-ui/src/{backend,prompt_overlay,dependencies}.rs`.
   - Tests: no key input for Edge; the voice picker lists Edge voices with the default selected; the disclosure note; the slug.
-- [ ] `crates/voice-me-app/{Cargo.toml,src/main.rs}`.
+- [x] `crates/voice-me-app/{Cargo.toml,src/main.rs}`.
   - Tests: `build_engine` Edge arm (Linux); `check_request`; `disclosure_needed` with no key; the list error clears only its own error.
-- [ ] `.github/workflows/ci.yml` -- pipx install.
+- [x] `.github/workflows/ci.yml` -- pipx install.
 
 **Acceptance Criteria:**
 - Given a Linux machine without `edge-tts`, when I select Remote → Edge TTS, then it stays selected, Dependencies shows the blocking "please install it" row, and the overlay is blocked.
 - Given `cargo test --workspace` and `cargo check --workspace --all-targets`, then all pass, and the egress allowlist is unchanged.
 
 ## Implementation Notes
+
+- New crate `voice-me-tts-edge` (`lib.rs`, `voices.rs`, `mp3.rs`, `install.rs`). Failures read "Edge TTS failed: …", "Edge TTS took longer than 30 s", "Edge TTS returned no audio"; a missing program reads "Edge TTS failed: edge-tts is not installed. Please install it: pipx install edge-tts".
+- The shared runner gained `RunError::NotFound` (spawn `ErrorKind::NotFound`), with the same Display text, so eSpeak NG is unchanged. `os_release.rs` exposes `distro_ids`, `is_opensuse` and `read_os_release` for the pipx steps. A known distro's step reads "If you don't have pipx: <command>"; steps are plain text (the Dependencies tab renders no markdown).
+- `BackendSelection::label` for Edge TTS is "Edge TTS — free, online (stock voice)" (the UX wording). The disclosure names the voice in effect, the language's first when none is stored.
+- `voice-me-tts-remote::delete_held_sample` gained an EdgeTts arm to compile; nothing routes through that crate.
+- The voice list is refreshed on each check with Edge TTS selected and the program found, so `edge-tts --list-voices` (which contacts Microsoft but carries no user text) can run before the disclosure is confirmed. Speech itself is always disclosure-gated. Raised with the product owner at review.
+- Fixed after the handoff: a missing line continuation left ~17 stray spaces in the "not listed yet" note; the test now asserts none.
+- Environment: Rust stable updated to 1.98.1 (`gpui-pre` needs `cold_path`); the stale 1.94.1 artifacts were removed from `target/` to free disk (no current artifact touched). `edge-tts` 7.2.8 is pipx-installed in `~/.local/bin` in this container.
+- Verified: the spec's `cargo test` list passes; `cargo check --workspace --all-targets`, clippy (no new warnings) and `cargo fmt --check` clean per the implementation run. Online synthesis blocked by the container's TLS proxy (the error path reported it correctly). Windows compile not verified locally (disk); CI's Windows job must confirm the cfg-gated paths, including the Other OS matrix row's tests.
 
 ## Spec Change Log
 
