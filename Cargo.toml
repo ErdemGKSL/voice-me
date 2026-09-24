@@ -23,3 +23,14 @@ default-members = ["crates/voice-me-app"]
 
 [workspace.package]
 edition = "2024"
+
+# Smaller release binary with no loss of speed: `opt-level` stays at 3.
+# Fat LTO and one codegen unit let LLVM inline across crates and drop dead
+# code, which usually makes the binary faster as well as smaller. `strip`
+# only removes symbols and debug info, which the binary never reads.
+# `panic` stays "unwind": background tasks are written to survive a panic
+# (see the poisoned-lock recovery in voice-me-core and voice-me-deps).
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
