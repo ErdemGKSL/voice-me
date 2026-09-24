@@ -58,6 +58,19 @@ pub enum AppEvent {
         kind: DependencyKind,
         result: Result<(), String>,
     },
+    /// Downloading one Piper voice from the Piper voices tab moved forward
+    /// (Story 3.15). Throttled like [`AppEvent::ProvisioningProgress`].
+    PiperVoiceProgress {
+        key: String,
+        done_bytes: u64,
+        total_bytes: u64,
+    },
+    /// Downloading one Piper voice from the Piper voices tab ended. Exactly
+    /// one per install that started.
+    PiperVoiceFinished {
+        key: String,
+        result: Result<(), String>,
+    },
     /// The TTS adapter finished trying to build its sessions (Story 3.3).
     ///
     /// The only source of "Active" on the backend line: `Ok` names the

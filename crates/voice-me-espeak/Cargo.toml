@@ -1,0 +1,14 @@
+[package]
+name = "voice-me-espeak"
+version = "0.1.0"
+edition.workspace = true
+
+# Story 3.15: the one crate that spawns `espeak-ng` (AD-12's one child
+# process). eSpeak NG is GPL-3.0, so it is never linked: the program is run
+# by its fixed name on PATH, with no shell, the text on stdin and a 10 s
+# deadline. The System voice (Story 3.12) speaks through it, and Piper
+# phonemizes through it. Offline — no HTTP client (AD-8). Nothing but std.
+[dependencies]
+
+[dev-dependencies]
+tempfile = "3.14"

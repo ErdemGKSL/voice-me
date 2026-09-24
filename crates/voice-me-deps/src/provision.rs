@@ -22,7 +22,7 @@ use reqwest::header::{CONTENT_RANGE, RANGE};
 use sha2::{Digest as _, Sha256};
 use voice_me_core::{AppEvent, AppEventSender, DependencyKind, VoiceMeError, format_bytes};
 
-use crate::sources::{Asset, PlannedDownload};
+use crate::sources::{Asset, Digest, PlannedDownload};
 
 /// The fastest a row's progress is reported: about ten times a second.
 /// Faster only floods the one channel every other event shares.
@@ -32,9 +32,18 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Sends `ProvisioningProgress` for one row, throttled.
+/// What a [`ProgressReporter`] reports on: a Dependencies row, or a voice
+/// being downloaded from the Piper voices tab (Story 3.15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgressTarget {
+    Row(DependencyKind),
+    PiperVoice(String),
+}
+
+/// Sends `ProvisioningProgress` (or `PiperVoiceProgress`) for one row,
+/// throttled.
 pub struct ProgressReporter {
-    kind: DependencyKind,
+    target: ProgressTarget,
     events: AppEventSender,
     done: u64,
     total: u64,
@@ -51,13 +60,22 @@ impl ProgressReporter {
         events: AppEventSender,
         plan: &[PlannedDownload],
     ) -> Self {
+        Self::for_target(ProgressTarget::Row(kind), events, plan)
+    }
+
+    /// [`Self::for_plan`], for any target.
+    pub fn for_target(
+        target: ProgressTarget,
+        events: AppEventSender,
+        plan: &[PlannedDownload],
+    ) -> Self {
         let total = plan.iter().map(|planned| planned.asset.size).sum();
         let done = plan
             .iter()
             .map(|planned| part_len(&planned.destination).min(planned.asset.size))
             .sum();
         let mut reporter = Self {
-            kind,
+            target,
             events,
             done,
             total,
@@ -94,11 +112,19 @@ impl ProgressReporter {
         self.last_sent = Some(Instant::now());
         // A closed receiver means the app is quitting; the download carries
         // on to its next safe point regardless.
-        let _ = self.events.unbounded_send(AppEvent::ProvisioningProgress {
-            kind: self.kind,
-            done_bytes: self.done,
-            total_bytes: self.total,
-        });
+        let event = match &self.target {
+            ProgressTarget::Row(kind) => AppEvent::ProvisioningProgress {
+                kind: *kind,
+                done_bytes: self.done,
+                total_bytes: self.total,
+            },
+            ProgressTarget::PiperVoice(key) => AppEvent::PiperVoiceProgress {
+                key: key.clone(),
+                done_bytes: self.done,
+                total_bytes: self.total,
+            },
+        };
+        let _ = self.events.unbounded_send(event);
     }
 }
 
@@ -280,17 +306,18 @@ fn content_range_start(response: &reqwest::Response) -> Option<u64> {
     range.split('-').next()?.trim().parse().ok()
 }
 
-/// Hash the finished `.part` and compare. A mismatch deletes it: those
-/// bytes are wrong, and resuming onto them would only be wrong again.
+/// Hash the finished `.part` with the asset's digest and compare. A
+/// mismatch deletes it: those bytes are wrong, and resuming onto them would
+/// only be wrong again.
 fn verify(asset: &Asset, part: &Path, dir: &Path) -> Result<(), VoiceMeError> {
     let name = asset.file_name();
-    let actual = sha256_file(part).map_err(|error| {
+    let actual = digest_file(&asset.digest, part).map_err(|error| {
         VoiceMeError::Other(format!(
             "Could not read {name} back from {} to check it: {error}",
             dir.display()
         ))
     })?;
-    if actual.eq_ignore_ascii_case(&asset.sha256) {
+    if actual.eq_ignore_ascii_case(asset.digest.expected()) {
         return Ok(());
     }
     remove_part(part, dir)?;
@@ -301,17 +328,33 @@ fn verify(asset: &Asset, part: &Path, dir: &Path) -> Result<(), VoiceMeError> {
 
 /// Lowercase hex SHA-256 of a file, read in 1 MiB pieces.
 pub fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 1 << 20];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    digest_file(&Digest::Sha256(String::new()), path)
+}
+
+/// Lowercase hex of `path` under the kind of checksum `digest` is.
+pub fn digest_file(digest: &Digest, path: &Path) -> std::io::Result<String> {
+    fn hash<D: sha2::Digest>(mut hasher: D, file: &mut File) -> std::io::Result<String> {
+        let mut buffer = vec![0_u8; 1 << 20];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
         }
-        hasher.update(&buffer[..read]);
+        Ok(hex(&hasher.finalize()))
     }
-    Ok(hex(&hasher.finalize()))
+    let mut file = File::open(path)?;
+    match digest {
+        Digest::Sha256(_) => hash(Sha256::new(), &mut file),
+        Digest::Md5(_) => hash(md5::Md5::new(), &mut file),
+        Digest::GitBlobSha1(_) => {
+            let len = file.metadata()?.len();
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(format!("blob {len}\0").as_bytes());
+            hash(hasher, &mut file)
+        }
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -512,7 +555,7 @@ fn write_error(
 /// The innermost cause, which is where the words a person can act on live
 /// ("Connection reset by peer"), rather than reqwest's outer "error sending
 /// request for url (…)" wrapper.
-fn reason(error: &(dyn std::error::Error + 'static)) -> String {
+pub(crate) fn reason(error: &(dyn std::error::Error + 'static)) -> String {
     let mut innermost = error;
     while let Some(source) = innermost.source() {
         innermost = source;

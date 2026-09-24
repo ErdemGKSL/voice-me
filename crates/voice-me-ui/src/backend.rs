@@ -176,6 +176,9 @@ pub struct BackendPanel {
     /// Azure's voice list as the root last fetched it (Story 3.14). Not
     /// persisted; cached by the root for the session.
     pub azure_voices: Vec<StockVoice>,
+    /// The Piper voices installed in the cache (Story 3.15): Piper's
+    /// language and voice pickers list only these.
+    pub piper_voices: Vec<StockVoice>,
 }
 
 impl BackendPanel {
@@ -185,6 +188,7 @@ impl BackendPanel {
         match backend {
             LanguageBackend::SystemVoice => &self.system_voices,
             LanguageBackend::Remote(RemoteProvider::Azure) => &self.azure_voices,
+            LanguageBackend::Piper => &self.piper_voices,
             _ => &[],
         }
     }
@@ -208,9 +212,18 @@ impl Default for BackendPanel {
             system_voices: Vec::new(),
             azure_region: None,
             azure_voices: Vec::new(),
+            piper_voices: Vec::new(),
         }
     }
 }
+
+/// Emitted by "Manage voices" (Story 3.15); the Settings shell switches to
+/// the Piper voices tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenPiperVoicesTab;
+
+/// What the Backend tab says while no Piper voice is installed.
+pub const PIPER_NO_VOICE_NOTE: &str = "No Piper voice installed — Manage voices";
 
 /// The line under Azure's options (Story 3.14): a stock voice, not the
 /// user's.
@@ -239,7 +252,9 @@ impl BackendKind {
 
     fn of(selection: &BackendSelection) -> Self {
         match selection {
-            BackendSelection::Local { .. } | BackendSelection::SystemVoice => BackendKind::Local,
+            BackendSelection::Local { .. }
+            | BackendSelection::SystemVoice
+            | BackendSelection::Piper => BackendKind::Local,
             BackendSelection::Remote(_) => BackendKind::Remote,
         }
     }
@@ -584,7 +599,8 @@ impl BackendView {
         // The same for the language `Select`: a failed save leaves the
         // picked language showing until it is resynced to the saved one.
         let voices_changed = panel.system_voices != self.panel.system_voices
-            || panel.azure_voices != self.panel.azure_voices;
+            || panel.azure_voices != self.panel.azure_voices
+            || panel.piper_voices != self.panel.piper_voices;
         let region_changed = panel.azure_region != self.panel.azure_region;
         self.language_items_stale |= voices_changed;
         self.language_stale |= panel.speech_languages != self.panel.speech_languages
@@ -882,12 +898,27 @@ impl BackendView {
         let voice = self
             .shows_voice_picker()
             .then(|| self.speech_voice_section(cx));
+        // Story 3.15: Piper's voices are managed on their own tab.
+        let manage_voices = (self.kind == BackendKind::Local && self.panel.selection.is_piper())
+            .then(|| {
+                h_flex()
+                    .child(
+                        Button::new("backend-manage-piper-voices")
+                            .ghost()
+                            .label("Manage voices")
+                            .on_click(
+                                cx.listener(|_this, _, _window, cx| cx.emit(OpenPiperVoicesTab)),
+                            ),
+                    )
+                    .into_any_element()
+            });
         match self.kind {
             BackendKind::Local => Some(
                 v_flex()
                     .gap_6()
                     .children(language)
                     .children(voice)
+                    .children(manage_voices)
                     .child(self.runtimes_section(cx))
                     .into_any_element(),
             ),
@@ -1488,6 +1519,9 @@ fn speech_language_note(panel: &BackendPanel, backend: LanguageBackend) -> Strin
         return "The System voice has not listed its voices yet. See Settings → Backend."
             .to_string();
     }
+    if backend == LanguageBackend::Piper && panel.piper_voices.is_empty() {
+        return PIPER_NO_VOICE_NOTE.to_string();
+    }
     if backend == LanguageBackend::Remote(RemoteProvider::Azure) && panel.azure_voices.is_empty() {
         return "Azure's voices have not been listed yet. They are fetched once its key and \
                 region are saved."
@@ -1499,6 +1533,8 @@ fn speech_language_note(panel: &BackendPanel, backend: LanguageBackend) -> Strin
         backend.label()
     )
 }
+
+impl gpui_kit::EventEmitter<OpenPiperVoicesTab> for BackendView {}
 
 impl Render for BackendView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1957,8 +1993,11 @@ mod tests {
             .into_iter()
             .map(|choice| choice.selection)
             .collect();
-        assert_eq!(local[0], BackendSelection::BUNDLED_CPU);
-        assert_eq!(local[1..local.len() - 1], runtimes[0].entries()[..]);
+        // Story 3.15: "Piper — natural, instant" is listed first under Local.
+        assert_eq!(local[0], BackendSelection::Piper);
+        assert!(local[0].label().starts_with("Piper — natural, instant"));
+        assert_eq!(local[1], BackendSelection::BUNDLED_CPU);
+        assert_eq!(local[2..local.len() - 1], runtimes[0].entries()[..]);
         assert_eq!(local.last(), Some(&BackendSelection::SystemVoice));
         let remote: Vec<_> = choices(BackendKind::Remote, &runtimes)
             .into_iter()
@@ -2983,5 +3022,101 @@ mod tests {
             assert!(note.contains("Azure"), "{note}");
         })
         .unwrap();
+    }
+
+    fn piper_panel(installed: &[(&str, &str)], voice: Option<&str>) -> BackendPanel {
+        BackendPanel {
+            selection: BackendSelection::Piper,
+            speech_voices: SpeechVoices {
+                piper: voice.map(str::to_string),
+                ..SpeechVoices::default()
+            },
+            piper_voices: installed
+                .iter()
+                .map(|(id, locale)| StockVoice {
+                    id: id.to_string(),
+                    language: locale.to_string(),
+                    language_label: if locale.starts_with("tr") {
+                        "Turkish (Turkey)".to_string()
+                    } else {
+                        "English (United States)".to_string()
+                    },
+                    name: id.to_string(),
+                    priority: 0,
+                })
+                .collect(),
+            ..BackendPanel::default()
+        }
+    }
+
+    /// Story 3.15: Piper's pickers list only installed voices, and it is a
+    /// Local stock voice with "Manage voices".
+    #[gpui_kit::test]
+    fn piper_pickers_list_installed_voices_only(cx: &mut TestAppContext) {
+        let panel = piper_panel(
+            &[
+                ("tr_TR-dfki-medium", "tr_TR"),
+                ("tr_TR-fahrettin-medium", "tr_TR"),
+                ("en_US-lessac-medium", "en_US"),
+            ],
+            Some("tr_TR-fahrettin-medium"),
+        );
+        let (window, view, _recorded) = open_backend_tab(cx, panel);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).kind, BackendKind::Local);
+            assert!(window.try_find("backend-stock-voice").is_some());
+            assert!(window.try_find("backend-manage-piper-voices").is_some());
+            assert_eq!(
+                view.read(cx).language_select.read(cx).selected_value(),
+                Some(&"tr_TR".to_string())
+            );
+            let voice = view.read(cx).voice_select.clone();
+            assert_eq!(
+                voice.read(cx).selected_value(),
+                Some(&"tr_TR-fahrettin-medium".to_string())
+            );
+            // An English voice is not among Turkish's.
+            voice.update(cx, |select, cx| {
+                select.set_selected_value(&"en_US-lessac-medium".to_string(), window, cx);
+            });
+            assert_eq!(voice.read(cx).selected_value(), None);
+            voice.update(cx, |select, cx| {
+                select.set_selected_value(&"tr_TR-dfki-medium".to_string(), window, cx);
+            });
+            assert_eq!(
+                voice.read(cx).selected_value(),
+                Some(&"tr_TR-dfki-medium".to_string())
+            );
+        })
+        .unwrap();
+    }
+
+    /// With no Piper voice installed the language note says so and points
+    /// at "Manage voices", which asks the shell for the Piper voices tab.
+    #[gpui_kit::test]
+    fn no_piper_voice_says_so_and_manage_voices_opens_the_tab(cx: &mut TestAppContext) {
+        let (window, view, _recorded) =
+            open_backend_tab(cx, piper_panel(&[], Some("tr_TR-fahrettin-medium")));
+        let opened = Rc::new(std::cell::Cell::new(false));
+        let _subscription = cx.update({
+            let opened = opened.clone();
+            let view = view.clone();
+            move |cx| cx.subscribe(&view, move |_, _: &OpenPiperVoicesTab, _| opened.set(true))
+        });
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("backend-speech-language-note").is_some());
+            assert_eq!(
+                speech_language_note(&view.read(cx).panel, LanguageBackend::Piper),
+                PIPER_NO_VOICE_NOTE
+            );
+            window.click("backend-manage-piper-voices", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(opened.get());
     }
 }

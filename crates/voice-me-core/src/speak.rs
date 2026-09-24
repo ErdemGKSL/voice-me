@@ -131,11 +131,15 @@ fn speak_inner(
     // Story 3.12: a stock voice. The language and the stored voice are
     // checked against the voices the engine listed — refused by name,
     // never substituted — and there is no sample to check and nothing to
-    // disclose: the engine runs on this machine.
-    if backend == LanguageBackend::SystemVoice {
+    // disclose: the engine runs on this machine. Story 3.15: Piper the
+    // same way, against the voices installed in the cache.
+    if matches!(
+        backend,
+        LanguageBackend::SystemVoice | LanguageBackend::Piper
+    ) {
         let voice = resolve_stock_voice(
             backend,
-            &state.system_voices,
+            state.stock_voices(backend),
             stored,
             state.speech_voices.get(backend),
         )
@@ -389,9 +393,12 @@ mod tests {
         }
     }
 
+    /// Local Chatterbox with a sample. Explicitly the bundled CPU: since
+    /// Story 3.15 an unsaved selection is Piper on Linux.
     fn state_with_a_sample() -> AppState {
         AppState {
             reference_voice_sample: Some(PathBuf::from("/data/reference_voice_sample.wav")),
+            backend_selection: BackendSelection::BUNDLED_CPU,
             ..AppState::default()
         }
     }
@@ -425,7 +432,10 @@ mod tests {
         let tts = FakeTts::default();
         let notifier = FakeNotifier::default();
         let mic = FakeMic::default();
-        let state = AppState::default();
+        let state = AppState {
+            backend_selection: BackendSelection::BUNDLED_CPU,
+            ..AppState::default()
+        };
 
         let error = speak("Merhaba", &state, &tts, &mic, &notifier).unwrap_err();
 
@@ -1207,5 +1217,128 @@ mod tests {
             .map(|call| call.2.clone())
             .collect();
         assert_eq!(locales, vec!["tr-TR", "tr-TR"]);
+    }
+
+    fn piper_voice(id: &str, locale: &str) -> crate::state::StockVoice {
+        crate::state::StockVoice {
+            id: id.to_string(),
+            language: locale.to_string(),
+            language_label: "Turkish".to_string(),
+            name: id.to_string(),
+            priority: 0,
+        }
+    }
+
+    /// Piper with the default language and voice, fahrettin (and dfki)
+    /// installed — and no Reference Voice Sample.
+    fn piper_state(voice: Option<&str>) -> AppState {
+        AppState {
+            backend_selection: BackendSelection::Piper,
+            speech_voices: crate::state::SpeechVoices {
+                piper: voice.map(str::to_string),
+                ..Default::default()
+            },
+            piper_voices: vec![
+                piper_voice("tr_TR-dfki-medium", "tr_TR"),
+                piper_voice("tr_TR-fahrettin-medium", "tr_TR"),
+            ],
+            ..AppState::default()
+        }
+    }
+
+    /// The matrix's Speak row at core level: no sample, no disclosure, the
+    /// installed voice and no clip reach the engine, and the buffer plays.
+    #[test]
+    fn piper_speaks_the_stored_voice_with_no_sample() {
+        let tts = FakeTts::cold();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+
+        speak(
+            "Merhaba Erdem, bu yerel ve anında.",
+            &piper_state(Some("tr_TR-fahrettin-medium")),
+            &tts,
+            &mic,
+            &notifier,
+        )
+        .unwrap();
+
+        assert_eq!(tts.calls.lock().unwrap()[0].2, "tr_TR");
+        assert_eq!(
+            tts.voices.lock().unwrap()[0],
+            (None, Some("tr_TR-fahrettin-medium".to_string()))
+        );
+        assert_eq!(mic.played().len(), 1);
+        assert!(
+            notifier.summaries().is_empty(),
+            "a Piper voice loads in about a second: no still-working notice"
+        );
+    }
+
+    /// "Use" on another voice: the next line speaks in it. A voice that is
+    /// not installed (deleted) is refused by name, before the engine.
+    #[test]
+    fn piper_uses_the_chosen_voice_and_refuses_one_not_installed() {
+        let tts = FakeTts::default();
+        speak(
+            "Bir",
+            &piper_state(Some("tr_TR-dfki-medium")),
+            &tts,
+            &FakeMic::default(),
+            &FakeNotifier::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            tts.voices.lock().unwrap()[0].1.as_deref(),
+            Some("tr_TR-dfki-medium")
+        );
+
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let state = AppState {
+            piper_voices: vec![piper_voice("tr_TR-dfki-medium", "tr_TR")],
+            ..piper_state(Some("tr_TR-fahrettin-medium"))
+        };
+        let error = speak("Bir", &state, &tts, &FakeMic::default(), &notifier).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("Piper") && message.contains("tr_TR-fahrettin-medium"),
+            "{message}"
+        );
+        assert!(tts.calls.lock().unwrap().is_empty());
+        assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
+
+        // Nothing installed at all.
+        let error = speak(
+            "Bir",
+            &AppState {
+                piper_voices: Vec::new(),
+                ..piper_state(None)
+            },
+            &FakeTts::default(),
+            &FakeMic::default(),
+            &FakeNotifier::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Piper"), "{error}");
+    }
+
+    /// A Piper failure is one notification naming Piper and the reason.
+    #[test]
+    fn a_piper_failure_is_one_notification_naming_piper() {
+        let tts = FakeTts::failing(VoiceMeError::SpeechEngine(
+            "Piper could not phonemize the text: espeak-ng could not be started".to_string(),
+        ));
+        let notifier = FakeNotifier::default();
+        speak(
+            "Merhaba",
+            &piper_state(None),
+            &tts,
+            &FakeMic::default(),
+            &notifier,
+        )
+        .unwrap_err();
+        assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
+        assert!(notifier.bodies()[0].contains("Piper"));
     }
 }

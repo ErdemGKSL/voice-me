@@ -106,6 +106,39 @@ const MODEL_FILES: [(&str, u64, &str); 13] = [
     ),
 ];
 
+/// What a downloaded file is checked against before it takes its final
+/// name: lowercase hex, of the kind its source publishes (Story 3.15).
+///
+/// Everything pinned in code is SHA-256. A user-chosen Piper voice is
+/// checked with whatever its catalog gives — MD5 for `rhasspy/piper-voices`,
+/// the Git blob SHA-1 Hugging Face reports for a small non-LFS file — since
+/// that is the only integrity data there is for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Digest {
+    Sha256(String),
+    Md5(String),
+    /// SHA-1 of `blob <len>\0` followed by the bytes: Git's object id.
+    GitBlobSha1(String),
+}
+
+impl Digest {
+    /// The expected value, lowercase hex.
+    pub fn expected(&self) -> &str {
+        match self {
+            Digest::Sha256(hex) | Digest::Md5(hex) | Digest::GitBlobSha1(hex) => hex,
+        }
+    }
+
+    /// The checksum's name, for messages.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Digest::Sha256(_) => "SHA-256",
+            Digest::Md5(_) => "MD5",
+            Digest::GitBlobSha1(_) => "Git blob SHA-1",
+        }
+    }
+}
+
 /// One file this crate knows how to fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Asset {
@@ -116,8 +149,8 @@ pub struct Asset {
     /// Its exact size — the progress total, and how an early end of the
     /// body is told apart from a finished one.
     pub size: u64,
-    /// Lowercase hex. Nothing takes its final name without matching this.
-    pub sha256: String,
+    /// Nothing takes its final name without matching this.
+    pub digest: Digest,
 }
 
 impl Asset {
@@ -180,7 +213,7 @@ impl Sources {
                 relative_path: (*relative_path).to_string(),
                 url: format!("{MODEL_REPO_URL}/{MODEL_REVISION}/{relative_path}"),
                 size: *size,
-                sha256: (*sha256).to_string(),
+                digest: Digest::Sha256((*sha256).to_string()),
             })
             .collect();
         Self {
@@ -239,7 +272,9 @@ fn pinned_runtime() -> Option<RuntimeArchive> {
             size: 9_128_991,
             // GitHub's own digest for the release asset, and the hash of
             // the copy this spec was written against.
-            sha256: "d7209b8751b27b862b0c76332c2e20e203396edb5dab700ecf4bb485cf147415".to_string(),
+            digest: Digest::Sha256(
+                "d7209b8751b27b862b0c76332c2e20e203396edb5dab700ecf4bb485cf147415".to_string(),
+            ),
         },
         library_entry: format!(
             "onnxruntime-linux-x64-{RUNTIME_VERSION}/lib/libonnxruntime.so.{RUNTIME_VERSION}"
@@ -261,7 +296,9 @@ fn pinned_runtime() -> Option<RuntimeArchive> {
             size: 78_620_837,
             // GitHub's own digest for the release asset (the same API
             // returns the Linux pin above).
-            sha256: "c4eedd29489d5feca21866d054638416f3655bf6b18851b3b6b85c8313e95c35".to_string(),
+            digest: Digest::Sha256(
+                "c4eedd29489d5feca21866d054638416f3655bf6b18851b3b6b85c8313e95c35".to_string(),
+            ),
         },
         library_entry: format!("onnxruntime-win-x64-{RUNTIME_VERSION}/lib/onnxruntime.dll"),
     })
@@ -299,7 +336,11 @@ mod tests {
         for asset in Sources::pinned().model_files {
             assert!(asset.url.contains(MODEL_REVISION), "{}", asset.url);
             assert!(asset.url.starts_with("https://"), "{}", asset.url);
-            assert_eq!(asset.sha256.len(), 64, "{}", asset.relative_path);
+            assert!(
+                matches!(&asset.digest, Digest::Sha256(hex) if hex.len() == 64),
+                "{}",
+                asset.relative_path
+            );
         }
     }
 
@@ -347,7 +388,7 @@ mod tests {
         );
         assert!(runtime.archive.url.starts_with("https://"));
         assert!(runtime.archive.url.contains(RUNTIME_VERSION));
-        assert_eq!(runtime.archive.sha256.len(), 64);
+        assert!(matches!(&runtime.archive.digest, Digest::Sha256(hex) if hex.len() == 64));
         assert!(
             runtime.library_entry.ends_with("/lib/onnxruntime.dll"),
             "{}",

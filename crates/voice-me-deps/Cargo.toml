@@ -18,6 +18,15 @@ tokio = { version = "1.53", default-features = false, features = ["rt"] }
 # Every downloaded file is checked against a SHA-256 pinned in `sources.rs`
 # before it takes its final name.
 sha2 = "0.10"
+# Story 3.15: a user-chosen Piper voice is checked with the digest its
+# catalog publishes — MD5 for `rhasspy/piper-voices`, the Git blob SHA-1
+# Hugging Face reports for a non-LFS `config.json`. Same `digest` 0.10 trait
+# as `sha2`.
+md-5 = "0.10"
+sha1 = "0.10"
+# Story 3.15: the three Piper catalogs are JSON.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 # The Linux ONNX Runtime ships as a `.tgz`; only its real shared library is
 # extracted. (Windows ships a `.zip`, below.)
 flate2 = "1.1"
@@ -42,7 +51,9 @@ ash = { version = "0.38", default-features = false, features = ["loaded", "std"]
 voice-me-audio-linux = { path = "../voice-me-audio-linux" }
 # Story 3.12: whether `espeak-ng` is on PATH, and the distribution's install
 # command, are *asked of* the crate that runs it — the same rule as above.
-voice-me-tts-system-linux = { path = "../voice-me-tts-system-linux" }
+# Story 3.15: that crate is now `voice-me-espeak`, shared by the System
+# voice and Piper.
+voice-me-espeak = { path = "../voice-me-espeak" }
 
 [dev-dependencies]
 tempfile = "3.14"

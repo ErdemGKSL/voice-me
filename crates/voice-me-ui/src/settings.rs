@@ -24,15 +24,34 @@ use voice_me_core::{
     SettingsStore,
 };
 
-use crate::backend::{BackendActions, BackendPanel, BackendView};
+use crate::backend::{BackendActions, BackendPanel, BackendView, OpenPiperVoicesTab};
 use crate::dependencies::{DependenciesView, OpenBackendTab, RowProvisioning};
 use crate::hotkey::HotkeyView;
+use crate::piper_voices::{PiperVoicesActions, PiperVoicesPanel, PiperVoicesView};
 use crate::voice_setup::VoiceSetupView;
 
 const VOICE_TAB: usize = 0;
 const HOTKEY_TAB: usize = 1;
 const BACKEND_TAB: usize = 2;
 const DEPENDENCIES_TAB: usize = 3;
+const PIPER_VOICES_TAB: usize = 4;
+
+/// The Piper voices tab's startup state and where its requests go (Story
+/// 3.15).
+#[derive(Clone)]
+pub struct PiperVoicesTab {
+    pub panel: PiperVoicesPanel,
+    pub actions: PiperVoicesActions,
+}
+
+impl Default for PiperVoicesTab {
+    fn default() -> Self {
+        Self {
+            panel: PiperVoicesPanel::default(),
+            actions: std::rc::Rc::new(|_, _| {}),
+        }
+    }
+}
 
 /// Everything the Backend and Dependencies tabs need, as one argument.
 ///
@@ -56,6 +75,8 @@ pub struct DependenciesTab {
     /// (Story 3.2), so a reopened window never offers a second Install on
     /// a row that is still downloading.
     pub provisioning: HashMap<DependencyKind, RowProvisioning>,
+    /// Story 3.15: the Piper voices tab.
+    pub piper: PiperVoicesTab,
 }
 
 /// The tabbed Settings window.
@@ -64,6 +85,7 @@ pub struct SettingsView {
     hotkey: Entity<HotkeyView>,
     backend: Entity<BackendView>,
     dependencies: Entity<DependenciesView>,
+    piper_voices: Entity<PiperVoicesView>,
     active_tab: usize,
     _subscriptions: Vec<Subscription>,
 }
@@ -113,6 +135,10 @@ impl SettingsView {
             )
         });
 
+        let piper = dependencies.piper.clone();
+        let piper_voices =
+            cx.new(|cx| PiperVoicesView::new(piper.panel, piper.actions, window, cx));
+
         let dependencies = cx.new(|_| {
             DependenciesView::new(
                 dependencies.deps_port,
@@ -128,15 +154,33 @@ impl SettingsView {
             this.active_tab = BACKEND_TAB;
             cx.notify();
         });
+        // Story 3.15: the Backend tab's "Manage voices".
+        let open_piper_voices = cx.subscribe(&backend, |this, _, _: &OpenPiperVoicesTab, cx| {
+            this.show_piper_voices(cx);
+        });
 
         Self {
             voice,
             hotkey,
             backend,
             dependencies,
+            piper_voices,
             active_tab: VOICE_TAB,
-            _subscriptions: vec![open_backend],
+            _subscriptions: vec![open_backend, open_piper_voices],
         }
+    }
+
+    /// Show the Piper voices tab; the catalogs are fetched the first time.
+    pub fn show_piper_voices(&mut self, cx: &mut Context<Self>) {
+        self.active_tab = PIPER_VOICES_TAB;
+        self.piper_voices.update(cx, |view, cx| view.opened(cx));
+        cx.notify();
+    }
+
+    /// Push the Piper voices tab's new state.
+    pub fn set_piper_voices_panel(&mut self, panel: PiperVoicesPanel, cx: &mut Context<Self>) {
+        self.piper_voices
+            .update(cx, |view, cx| view.set_panel(panel, cx));
     }
 
     /// Open the window on the Dependencies tab.
@@ -198,9 +242,14 @@ impl Render for SettingsView {
                     .child(Tab::new().label("Hotkey"))
                     .child(Tab::new().label("Backend"))
                     .child(Tab::new().label("Dependencies"))
+                    .child(Tab::new().label("Piper voices"))
                     .on_click(cx.listener(|this, index: &usize, _window, cx| {
-                        this.active_tab = *index;
-                        cx.notify();
+                        if *index == PIPER_VOICES_TAB {
+                            this.show_piper_voices(cx);
+                        } else {
+                            this.active_tab = *index;
+                            cx.notify();
+                        }
                     })),
             )
             .child(
@@ -211,6 +260,7 @@ impl Render for SettingsView {
                         HOTKEY_TAB => el.child(self.hotkey.clone()),
                         BACKEND_TAB => el.child(self.backend.clone()),
                         DEPENDENCIES_TAB => el.child(self.dependencies.clone()),
+                        PIPER_VOICES_TAB => el.child(self.piper_voices.clone()),
                         _ => el.child(self.voice.clone()),
                     }),
             )
@@ -325,7 +375,7 @@ mod tests {
         fn provision(
             &self,
             _kind: DependencyKind,
-            _backend: voice_me_core::SpeechBackend,
+            _request: voice_me_core::CheckRequest,
             _events: AppEventSender,
         ) -> Result<(), VoiceMeError> {
             Ok(())
@@ -370,6 +420,7 @@ mod tests {
                         actions: std::rc::Rc::new(|_, _| {}),
                         outcome: DependencyOutcome::Pending,
                         provisioning: HashMap::new(),
+                        piper: PiperVoicesTab::default(),
                     },
                     window,
                     cx,
@@ -415,6 +466,73 @@ mod tests {
                 "the fourth tab must route to the Dependencies section"
             );
             assert!(window.try_find("backend-surface").is_none());
+
+            window.click(PIPER_VOICES_TAB, cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("piper-voices-surface").is_some(),
+                "the fifth tab must route to the Piper voices section"
+            );
+            assert!(window.try_find("dependencies-surface").is_none());
+        })
+        .unwrap();
+    }
+
+    /// Story 3.15: "Manage voices" under a Piper selection on the Backend
+    /// tab switches Settings to the Piper voices tab.
+    #[gpui_kit::test]
+    fn manage_voices_switches_to_the_piper_voices_tab(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let settings_store: Arc<dyn SettingsStore> = Arc::new(StubSettingsStore);
+        let hotkey_port: Arc<dyn HotkeyPort> = Arc::new(StubHotkeyPort);
+        let (event_tx, _event_rx) = futures::channel::mpsc::unbounded::<AppEvent>();
+        let handle = cx.open_window(size(px(640.), px(640.)), |window, cx| {
+            let view = cx.new(|cx| {
+                SettingsView::new(
+                    settings_store.clone(),
+                    hotkey_port.clone(),
+                    true,
+                    None,
+                    None,
+                    None,
+                    DependenciesTab {
+                        deps_port: Arc::new(StubDepsPort),
+                        events: event_tx.clone(),
+                        backend: BackendPanel {
+                            selection: voice_me_core::BackendSelection::Piper,
+                            ..BackendPanel::default()
+                        },
+                        actions: std::rc::Rc::new(|_, _| {}),
+                        outcome: DependencyOutcome::Pending,
+                        provisioning: HashMap::new(),
+                        piper: PiperVoicesTab::default(),
+                    },
+                    window,
+                    cx,
+                )
+            });
+            Root::new(view, window, cx)
+        });
+
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click(BACKEND_TAB, cx);
+            window.render_frame(cx);
+            assert!(window.try_find("piper-voices-surface").is_none());
+
+            window.click("backend-manage-piper-voices", cx);
+        })
+        .unwrap();
+        // The tab switch arrives as an event, delivered once the click's
+        // update has finished.
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("piper-voices-surface").is_some(),
+                "Manage voices must open the Piper voices tab"
+            );
+            assert!(window.try_find("backend-surface").is_none());
         })
         .unwrap();
     }
@@ -448,6 +566,7 @@ mod tests {
                         actions: std::rc::Rc::new(|_, _| {}),
                         outcome: DependencyOutcome::Pending,
                         provisioning: HashMap::new(),
+                        piper: PiperVoicesTab::default(),
                     },
                     window,
                     cx,
@@ -523,6 +642,7 @@ mod tests {
                         actions: std::rc::Rc::new(|_, _| {}),
                         outcome,
                         provisioning: HashMap::new(),
+                        piper: PiperVoicesTab::default(),
                     },
                     window,
                     cx,

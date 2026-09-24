@@ -257,9 +257,9 @@ impl DependenciesView {
 
         let deps = self.deps.clone();
         let events = self.events.clone();
-        let backend = self.panel.check_request.backend;
+        let request = self.panel.check_request.clone();
         let work =
-            tokio_bridge::spawn_blocking_on(&handle, move || deps.provision(kind, backend, events));
+            tokio_bridge::spawn_blocking_on(&handle, move || deps.provision(kind, request, events));
         let events = self.events.clone();
         cx.spawn(async move |this, cx| {
             let Err(error) = work.await else { return };
@@ -554,6 +554,7 @@ fn slug(kind: DependencyKind) -> &'static str {
         DependencyKind::VirtualMicrophone => "virtual-microphone",
         DependencyKind::BackendCapability => "backend-capability",
         DependencyKind::SystemVoiceEngine => "system-voice-engine",
+        DependencyKind::PiperVoice => "piper-voice",
     }
 }
 
@@ -629,7 +630,7 @@ mod tests {
         fails_with: Option<String>,
         /// What the last check and install were asked about.
         last_request: std::sync::Mutex<Option<CheckRequest>>,
-        last_backend: std::sync::Mutex<Option<voice_me_core::SpeechBackend>>,
+        last_provision: std::sync::Mutex<Option<CheckRequest>>,
     }
 
     impl DependencyProvisioningPort for CountingDepsPort {
@@ -649,10 +650,10 @@ mod tests {
         fn provision(
             &self,
             _kind: DependencyKind,
-            backend: voice_me_core::SpeechBackend,
+            request: voice_me_core::CheckRequest,
             _events: AppEventSender,
         ) -> Result<(), VoiceMeError> {
-            *self.last_backend.lock().unwrap() = Some(backend);
+            *self.last_provision.lock().unwrap() = Some(request);
             self.provisions.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -806,7 +807,7 @@ mod tests {
             fn provision(
                 &self,
                 _kind: DependencyKind,
-                _backend: voice_me_core::SpeechBackend,
+                _request: voice_me_core::CheckRequest,
                 _events: AppEventSender,
             ) -> Result<(), VoiceMeError> {
                 Err(VoiceMeError::Other(
@@ -1238,6 +1239,7 @@ mod tests {
             has_api_key: false,
             has_region: false,
             has_voice: false,
+            piper_voice: None,
         };
         let panel = BackendPanel {
             check_request: request.clone(),
@@ -1267,6 +1269,50 @@ mod tests {
         }
 
         assert_eq!(*port.last_request.lock().unwrap(), Some(request.clone()));
-        assert_eq!(*port.last_backend.lock().unwrap(), Some(request.backend));
+        assert_eq!(*port.last_provision.lock().unwrap(), Some(request));
+    }
+
+    /// Install on the Piper voice row passes the selected voice through, so
+    /// the adapter downloads that voice, not the default.
+    #[gpui_kit::test]
+    fn install_on_the_piper_voice_row_forwards_the_selected_voice(cx: &mut TestAppContext) {
+        let request = CheckRequest {
+            backend: voice_me_core::SpeechBackend::CPU,
+            selection: voice_me_core::BackendSelection::Piper,
+            has_api_key: false,
+            has_region: false,
+            has_voice: false,
+            piper_voice: Some("tr_TR-dfki-medium".to_string()),
+        };
+        let panel = BackendPanel {
+            selection: voice_me_core::BackendSelection::Piper,
+            check_request: request.clone(),
+            ..BackendPanel::default()
+        };
+        let outcome = DependencyOutcome::Ready(voice_me_core::DependencyReport::new(
+            voice_me_core::SpeechBackend::CPU,
+            vec![Dependency::missing(
+                DependencyKind::PiperVoice,
+                "Piper voice",
+                "The selected voice tr_TR-dfki-medium is not installed.",
+            )],
+        ));
+        let port = Arc::new(CountingDepsPort::default());
+        let (window, _runtime) = open_tab_with_panel(cx, port.clone(), outcome, panel);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click("dependency-install-piper-voice", cx);
+        })
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while port.provisions.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            cx.run_until_parked();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let forwarded = port.last_provision.lock().unwrap().clone().unwrap();
+        assert_eq!(forwarded.piper_voice.as_deref(), Some("tr_TR-dfki-medium"));
+        assert_eq!(forwarded, request);
     }
 }

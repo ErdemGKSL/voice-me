@@ -22,6 +22,7 @@
 //!   means. `deps` never depends on `tts`.
 
 pub mod capability;
+pub mod piper;
 pub mod provision;
 #[cfg(test)]
 mod provision_tests;
@@ -35,13 +36,15 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use voice_me_core::{
-    AppEvent, AppEventSender, CheckRequest, Dependency, DependencyKind, DependencyProvisioningPort,
-    DependencyReport, SpeechBackend, SpeechExecutionTarget, SpeechWeights, VoiceMeError, assets,
+    AppEvent, AppEventSender, CatalogResult, CheckRequest, Dependency, DependencyKind,
+    DependencyProvisioningPort, DependencyReport, PiperCatalogEntry, PiperCatalogPort,
+    SpeechBackend, SpeechExecutionTarget, SpeechWeights, VoiceMeError, assets,
 };
 
 use crate::capability::{GpuProbe, SystemGpuProbe};
 
-use crate::provision::ProgressReporter;
+use crate::piper::{CatalogVoice, PiperSources};
+use crate::provision::{ProgressReporter, ProgressTarget};
 use crate::sources::{PlannedDownload, Sources};
 
 /// `DependencyProvisioningPort` adapter.
@@ -63,6 +66,14 @@ pub struct DepsAdapter {
     /// driver and Vulkan probes in the app; injectable so every capability
     /// row is testable with no GPU.
     gpu_probe: Arc<dyn GpuProbe>,
+    /// Where the Piper catalogs are fetched from (Story 3.15).
+    piper_sources: Arc<PiperSources>,
+    /// The voices the last catalog fetch listed: what makes a voice other
+    /// than the built-in default one voice-me knows how to install. Held
+    /// only for this process, and only filled when the tab asked.
+    piper_catalog: Arc<Mutex<Vec<CatalogVoice>>>,
+    /// The voices being downloaded from the Piper voices tab right now.
+    piper_in_flight: Arc<Mutex<HashSet<String>>>,
 }
 
 type VirtualMicInstaller = dyn Fn() -> Result<(), VoiceMeError> + Send + Sync;
@@ -96,7 +107,58 @@ impl DepsAdapter {
             in_flight: Arc::default(),
             virtual_mic_installer: Arc::new(install_virtual_microphone),
             gpu_probe: Arc::new(SystemGpuProbe),
+            piper_sources: Arc::new(PiperSources::pinned()),
+            piper_catalog: Arc::default(),
+            piper_in_flight: Arc::default(),
         }
+    }
+
+    /// Replace where the Piper catalogs are fetched from.
+    pub fn with_piper_sources(mut self, sources: PiperSources) -> Self {
+        self.piper_sources = Arc::new(sources);
+        self
+    }
+
+    /// The voice `key`, if voice-me knows where to download it: the
+    /// built-in default, or one the last catalog fetch listed.
+    fn known_piper_voice(&self, key: &str) -> Option<CatalogVoice> {
+        let default = piper::default_voice();
+        if key == default.entry.key {
+            return Some(default);
+        }
+        self.piper_catalog
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|voice| voice.entry.key == key)
+            .cloned()
+    }
+
+    /// Story 3.15: Install on the Piper voice row. With nothing installed
+    /// that is the default voice; otherwise the voice the request names.
+    fn provision_piper_voice(
+        &self,
+        request: &CheckRequest,
+        events: &AppEventSender,
+    ) -> Result<(), VoiceMeError> {
+        let root = assets::model_cache_root()?;
+        let key = request
+            .piper_voice
+            .clone()
+            .unwrap_or_else(|| assets::PIPER_DEFAULT_VOICE.key.to_string());
+        let voice = self.known_piper_voice(&key).ok_or_else(|| {
+            VoiceMeError::Other(format!(
+                "voice-me does not know where to download {key}; open Settings → Piper voices \
+                 to find it again."
+            ))
+        })?;
+        piper::install_voice(
+            &root,
+            &voice,
+            &self.piper_sources,
+            ProgressTarget::Row(DependencyKind::PiperVoice),
+            events,
+        )
     }
 
     /// Replace what the capability row asks the hardware.
@@ -117,9 +179,10 @@ impl DepsAdapter {
     fn provision_row(
         &self,
         kind: DependencyKind,
-        backend: SpeechBackend,
+        request: &CheckRequest,
         events: &AppEventSender,
     ) -> Result<(), VoiceMeError> {
+        let backend = request.backend;
         match kind {
             DependencyKind::ModelWeights => {
                 let root = assets::model_cache_root()?;
@@ -137,6 +200,7 @@ impl DepsAdapter {
                 });
                 (self.virtual_mic_installer)()
             }
+            DependencyKind::PiperVoice => self.provision_piper_voice(request, events),
             // A system package: its row has manual steps, never Install.
             DependencyKind::SystemVoiceEngine => Err(VoiceMeError::Other(
                 "voice-me cannot install eSpeak NG; follow the steps on the row.".to_string(),
@@ -222,7 +286,12 @@ impl DependencyProvisioningPort for DepsAdapter {
             ),
             // Story 3.12: the System voice's one engine row. It is not an
             // ONNX target, so it has no runtime or model rows.
-            None if request.selection.is_system_voice() => system_voice_rows(),
+            None if request.selection.is_system_voice() => {
+                system_voice_rows("The System voice speaks through it.")
+            }
+            // Story 3.15: Piper's shared CPU runtime, its voice, and the
+            // eSpeak NG it reads text through.
+            None if request.selection.is_piper() => self.piper_rows(&root, &request),
             None => Vec::new(),
         };
 
@@ -245,7 +314,7 @@ impl DependencyProvisioningPort for DepsAdapter {
     fn provision(
         &self,
         kind: DependencyKind,
-        backend: SpeechBackend,
+        request: CheckRequest,
         events: AppEventSender,
     ) -> Result<(), VoiceMeError> {
         // A second Install on a row already being installed: the first run
@@ -254,7 +323,7 @@ impl DependencyProvisioningPort for DepsAdapter {
             return Ok(());
         };
 
-        let result = self.provision_row(kind, backend, &events);
+        let result = self.provision_row(kind, &request, &events);
         // Released before the event goes out: once the row reads "missing"
         // again, the next Install must not be swallowed as a duplicate.
         drop(claim);
@@ -266,24 +335,112 @@ impl DependencyProvisioningPort for DepsAdapter {
     }
 }
 
-/// Removes its row from the in-flight set when dropped — including when the
-/// provisioning job panics, so a crashed run never leaves Install dead.
-struct InFlight {
-    set: Arc<Mutex<HashSet<DependencyKind>>>,
-    kind: DependencyKind,
+impl DepsAdapter {
+    /// Story 3.15: Piper's rows — the shared CPU runtime (the one the
+    /// bundled CPU backend uses; Piper never downloads its own), the voice,
+    /// and eSpeak NG. Linux only: elsewhere the capability row says Piper
+    /// arrives later.
+    fn piper_rows(&self, root: &Path, request: &CheckRequest) -> Vec<Dependency> {
+        if !cfg!(target_os = "linux") {
+            return Vec::new();
+        }
+        let known = |key: &str| self.known_piper_voice(key).is_some();
+        let mut rows = vec![
+            runtime_row(
+                root,
+                SpeechBackend::CPU,
+                None,
+                self.sources.runtime.is_some(),
+            ),
+            piper::piper_voice_row(root, request.piper_voice.as_deref(), &known),
+        ];
+        rows.extend(system_voice_rows("Piper reads text through it."));
+        rows
+    }
 }
 
-impl InFlight {
-    fn claim(set: &Arc<Mutex<HashSet<DependencyKind>>>, kind: DependencyKind) -> Option<Self> {
+/// Story 3.15: the Piper voices tab's catalogs, downloads and deletes.
+impl PiperCatalogPort for DepsAdapter {
+    fn fetch_catalog(&self) -> Vec<CatalogResult> {
+        let results = piper::fetch_catalogs(&self.piper_sources);
+        let voices: Vec<CatalogVoice> = results
+            .iter()
+            .filter_map(|(_, result)| result.as_ref().ok())
+            .flatten()
+            .cloned()
+            .collect();
+        // A refresh that failed entirely keeps what an earlier one listed:
+        // those voices are still where they were.
+        if !voices.is_empty() {
+            *self
+                .piper_catalog
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = voices;
+        }
+        piper::catalog_results(&results)
+    }
+
+    fn install(
+        &self,
+        entry: &PiperCatalogEntry,
+        events: AppEventSender,
+    ) -> Result<(), VoiceMeError> {
+        let key = entry.key.clone();
+        // A second Download of a voice already downloading: nothing sent.
+        let Some(_claim) = InFlight::claim(&self.piper_in_flight, key.clone()) else {
+            return Ok(());
+        };
+        let result = (|| {
+            let root = assets::model_cache_root()?;
+            let listed = self
+                .piper_catalog
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let voice = piper::voice_for_entry(&listed, entry).ok_or_else(|| {
+                VoiceMeError::Other(format!(
+                    "{key} is not in the catalog any more; refresh the list."
+                ))
+            })?;
+            piper::install_voice(
+                &root,
+                &voice,
+                &self.piper_sources,
+                ProgressTarget::PiperVoice(key.clone()),
+                &events,
+            )
+        })();
+        drop(_claim);
+        let _ = events.unbounded_send(AppEvent::PiperVoiceFinished {
+            key,
+            result: result.as_ref().map(|_| ()).map_err(ToString::to_string),
+        });
+        result
+    }
+
+    fn delete(&self, key: &str) -> Result<(), VoiceMeError> {
+        piper::delete_voice(&assets::model_cache_root()?, key)
+    }
+}
+
+/// Removes its row from the in-flight set when dropped — including when the
+/// provisioning job panics, so a crashed run never leaves Install dead.
+struct InFlight<K: std::hash::Hash + Eq + Clone = DependencyKind> {
+    set: Arc<Mutex<HashSet<K>>>,
+    kind: K,
+}
+
+impl<K: std::hash::Hash + Eq + Clone> InFlight<K> {
+    fn claim(set: &Arc<Mutex<HashSet<K>>>, kind: K) -> Option<Self> {
         let mut rows = set.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        rows.insert(kind).then(|| Self {
+        rows.insert(kind.clone()).then(|| Self {
             set: set.clone(),
             kind,
         })
     }
 }
 
-impl Drop for InFlight {
+impl<K: std::hash::Hash + Eq + Clone> Drop for InFlight<K> {
     fn drop(&mut self) {
         self.set
             .lock()
@@ -299,12 +456,21 @@ fn fetch(
     plan: &[PlannedDownload],
     events: &AppEventSender,
 ) -> Result<(), VoiceMeError> {
+    fetch_to(ProgressTarget::Row(kind), plan, events)
+}
+
+/// [`fetch`], reporting on any target — a Piper voice from its tab, too.
+fn fetch_to(
+    target: ProgressTarget,
+    plan: &[PlannedDownload],
+    events: &AppEventSender,
+) -> Result<(), VoiceMeError> {
     // Nothing to fetch, nothing to report: the reporter's constructor
     // would otherwise send a meaningless 0-of-0 figure.
     if plan.is_empty() {
         return Ok(());
     }
-    let mut progress = ProgressReporter::for_plan(kind, events.clone(), plan);
+    let mut progress = ProgressReporter::for_target(target, events.clone(), plan);
     block_on(async {
         let client = provision::client()?;
         for planned in plan {
@@ -575,24 +741,28 @@ fn virtual_microphone_row() -> Option<Dependency> {
 /// The System voice's engine row (Story 3.12): whether `espeak-ng` is on
 /// PATH, asked of the crate that runs it, with the distribution's install
 /// command when it is not.
+///
+/// `used_by` finishes the missing row's sentence: who needs it (Story 3.15:
+/// the System voice speaks through it, Piper reads text through it).
 #[cfg(target_os = "linux")]
-fn system_voice_rows() -> Vec<Dependency> {
-    let found = voice_me_tts_system_linux::find_program();
+fn system_voice_rows(used_by: &str) -> Vec<Dependency> {
+    let found = voice_me_espeak::find_program();
     let install = if found.is_some() {
         String::new()
     } else {
-        voice_me_tts_system_linux::install_step()
+        voice_me_espeak::install_step()
     };
     vec![capability::system_voice_engine_row(
         found.as_deref(),
         &install,
+        used_by,
     )]
 }
 
 /// Off Linux the capability row says the System voice cannot run yet; there
 /// is no engine to report on.
 #[cfg(not(target_os = "linux"))]
-fn system_voice_rows() -> Vec<Dependency> {
+fn system_voice_rows(_used_by: &str) -> Vec<Dependency> {
     Vec::new()
 }
 
@@ -1013,6 +1183,7 @@ mod tests {
                 has_api_key: false,
                 has_region: false,
                 has_voice: false,
+                piper_voice: None,
             },
             dir.path(),
         );
@@ -1072,6 +1243,7 @@ mod tests {
                 has_api_key: false,
                 has_region: false,
                 has_voice: false,
+                piper_voice: None,
             },
             dir.path(),
         );
@@ -1104,6 +1276,7 @@ mod tests {
                 has_api_key: false,
                 has_region: false,
                 has_voice: false,
+                piper_voice: None,
             },
             dir.path(),
         );
@@ -1121,7 +1294,7 @@ mod tests {
             let engine = row(&report.dependencies, DependencyKind::SystemVoiceEngine);
             assert_eq!(
                 engine.status.is_missing(),
-                voice_me_tts_system_linux::find_program().is_none()
+                voice_me_espeak::find_program().is_none()
             );
         }
         #[cfg(not(target_os = "linux"))]
@@ -1173,6 +1346,7 @@ mod tests {
                 has_api_key: true,
                 has_region: true,
                 has_voice: false,
+                piper_voice: None,
             },
             dir.path(),
         );
@@ -1196,5 +1370,199 @@ mod tests {
             "{}",
             report.dependencies[0].detail
         );
+    }
+
+    fn piper_request(voice: Option<&str>) -> CheckRequest {
+        CheckRequest {
+            backend: SpeechBackend::CPU,
+            selection: voice_me_core::BackendSelection::Piper,
+            has_api_key: false,
+            has_region: false,
+            has_voice: voice.is_some(),
+            piper_voice: voice.map(str::to_string),
+        }
+    }
+
+    /// Story 3.15's First run row: Piper reports the shared runtime, "No
+    /// Piper voice installed" (Install) and eSpeak NG — no Chatterbox
+    /// model rows, and on Linux no capability row.
+    #[test]
+    fn a_piper_selection_reports_runtime_voice_and_espeak_rows() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let report = check_with(
+            piper_request(Some(assets::PIPER_DEFAULT_VOICE.key)),
+            dir.path(),
+        );
+
+        assert!(
+            !report
+                .dependencies
+                .iter()
+                .any(|row| row.kind == DependencyKind::ModelWeights),
+            "{:?}",
+            report.dependencies
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let kinds: Vec<_> = report
+                .dependencies
+                .iter()
+                .map(|row| row.kind)
+                .filter(|kind| *kind != DependencyKind::VirtualMicrophone)
+                .collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    DependencyKind::OnnxRuntime,
+                    DependencyKind::PiperVoice,
+                    DependencyKind::SystemVoiceEngine
+                ]
+            );
+            let voice = row(&report.dependencies, DependencyKind::PiperVoice);
+            assert!(voice.status.is_missing() && voice.automatable);
+            assert!(voice.detail.contains("No Piper voice installed"));
+            assert_eq!(
+                report.speech_engine_blocker().map(|row| row.kind),
+                Some(DependencyKind::OnnxRuntime),
+                "the runtime row comes first and blocks"
+            );
+            let espeak = row(&report.dependencies, DependencyKind::SystemVoiceEngine);
+            assert_eq!(
+                espeak.status.is_missing(),
+                voice_me_espeak::find_program().is_none()
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            report.dependencies[0].kind,
+            DependencyKind::BackendCapability
+        );
+    }
+
+    /// Install on the voice row for a voice voice-me knows nothing about
+    /// fails with one sentence, reported once — nothing is fetched.
+    #[test]
+    fn installing_an_unknown_piper_voice_is_refused_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = assets::piper_voice_files(dir.path(), "tr_TR-dfki-medium").unwrap();
+        std::fs::create_dir_all(&files.dir).unwrap();
+        std::fs::write(&files.model, b"m").unwrap();
+        std::fs::write(&files.config, b"c").unwrap();
+        std::fs::write(
+            &files.manifest,
+            "name = \"dfki\"\nlocale = \"tr_TR\"\nlabel = \"Turkish\"\nquality = \"medium\"\n\
+             source = \"voice-me\"\n",
+        )
+        .unwrap();
+        let _env = EnvGuard::new().set(assets::CACHE_ROOT_ENV, dir.path());
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+
+        let error = DepsAdapter::new()
+            .provision(
+                DependencyKind::PiperVoice,
+                piper_request(Some("xx_XX-unknown-low")),
+                tx,
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("xx_XX-unknown-low"), "{error}");
+        let mut finished = 0;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, AppEvent::ProvisioningFinished { .. }) {
+                finished += 1;
+            }
+        }
+        assert_eq!(finished, 1);
+    }
+
+    /// The Piper voices tab through the port: the catalogs are fetched,
+    /// then Download of a listed, non-default official voice installs it
+    /// and reports exactly one successful finish.
+    #[test]
+    fn the_catalog_port_lists_and_installs_an_official_voice() {
+        use md5::Digest as _;
+        use std::collections::HashMap;
+
+        use crate::provision_tests::TestServer;
+
+        let md5 = |bytes: &[u8]| -> String {
+            md5::Md5::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        };
+        let model = vec![3_u8; 4_000];
+        let config = b"{\"audio\":{\"sample_rate\":22050}}".to_vec();
+        let base = "tr/tr_TR/dfki/medium/tr_TR-dfki-medium";
+        let voices_json = serde_json::json!({
+            "tr_TR-dfki-medium": {
+                "key": "tr_TR-dfki-medium",
+                "name": "dfki",
+                "language": {
+                    "code": "tr_TR",
+                    "family": "tr",
+                    "region": "TR",
+                    "name_native": "Türkçe",
+                    "name_english": "Turkish",
+                    "country_english": "Turkey"
+                },
+                "quality": "medium",
+                "num_speakers": 1,
+                "speaker_id_map": {},
+                "files": {
+                    format!("{base}.onnx"): {
+                        "size_bytes": model.len(), "md5_digest": md5(&model)
+                    },
+                    format!("{base}.onnx.json"): {
+                        "size_bytes": config.len(), "md5_digest": md5(&config)
+                    }
+                },
+                "aliases": []
+            }
+        })
+        .to_string();
+        let server = TestServer::start(HashMap::from([
+            ("voices.json".to_string(), voices_json.into_bytes()),
+            (format!("files/{base}.onnx"), model.clone()),
+            (format!("files/{base}.onnx.json"), config.clone()),
+        ]));
+        let cache = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::new()
+            .unset("http_proxy")
+            .unset("HTTP_PROXY")
+            .unset("all_proxy")
+            .unset("ALL_PROXY")
+            .set(assets::CACHE_ROOT_ENV, cache.path());
+        let adapter = DepsAdapter::new().with_piper_sources(PiperSources {
+            voice_me_catalog: format!("{}/missing-catalog.json", server.base),
+            official_voices: format!("{}/voices.json", server.base),
+            official_files: format!("{}/files", server.base),
+            speaches_list: format!("{}/missing-list", server.base),
+            ..PiperSources::pinned()
+        });
+
+        let catalogs = adapter.fetch_catalog();
+        let entry = catalogs
+            .iter()
+            .filter_map(|catalog| catalog.result.as_ref().ok())
+            .flatten()
+            .find(|entry| entry.key == "tr_TR-dfki-medium")
+            .cloned()
+            .expect("the official catalog lists dfki");
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        adapter.install(&entry, tx).unwrap();
+
+        let installed = assets::installed_piper_voices(cache.path());
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].key, "tr_TR-dfki-medium");
+        let mut finished = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let AppEvent::PiperVoiceFinished { key, result } = event {
+                finished.push((key, result));
+            }
+        }
+        assert_eq!(finished, vec![("tr_TR-dfki-medium".to_string(), Ok(()))]);
     }
 }

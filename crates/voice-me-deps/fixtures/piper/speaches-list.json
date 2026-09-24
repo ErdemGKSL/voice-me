@@ -1,0 +1,78 @@
+[
+ {
+  "_id": "67db9ec10814ac58418a6240",
+  "id": "speaches-ai/piper-en_US-lessac-medium",
+  "likes": 1,
+  "trendingScore": 0,
+  "private": false,
+  "downloads": 130,
+  "tags": [
+   "onnx",
+   "speaches",
+   "piper",
+   "text-to-speech",
+   "en",
+   "region:us"
+  ],
+  "pipeline_tag": "text-to-speech",
+  "createdAt": "2025-03-20T04:51:13.000Z",
+  "modelId": "speaches-ai/piper-en_US-lessac-medium"
+ },
+ {
+  "_id": "67dba5282a8359ac1f80f5a0",
+  "id": "speaches-ai/piper-tr_TR-dfki-medium",
+  "likes": 0,
+  "trendingScore": 0,
+  "private": false,
+  "downloads": 31,
+  "tags": [
+   "onnx",
+   "speaches",
+   "piper",
+   "text-to-speech",
+   "tr",
+   "region:us"
+  ],
+  "pipeline_tag": "text-to-speech",
+  "createdAt": "2025-03-20T05:18:32.000Z",
+  "modelId": "speaches-ai/piper-tr_TR-dfki-medium"
+ },
+ {
+  "_id": "67dba532e2c23c4aeedc19aa",
+  "id": "speaches-ai/piper-tr_TR-fahrettin-medium",
+  "likes": 0,
+  "trendingScore": 0,
+  "private": false,
+  "downloads": 146,
+  "tags": [
+   "onnx",
+   "speaches",
+   "piper",
+   "text-to-speech",
+   "tr",
+   "region:us"
+  ],
+  "pipeline_tag": "text-to-speech",
+  "createdAt": "2025-03-20T05:18:42.000Z",
+  "modelId": "speaches-ai/piper-tr_TR-fahrettin-medium"
+ },
+ {
+  "_id": "67dba53a9bab26930bbc976b",
+  "id": "speaches-ai/piper-tr_TR-fettah-medium",
+  "likes": 1,
+  "trendingScore": 0,
+  "private": false,
+  "downloads": 133,
+  "tags": [
+   "onnx",
+   "speaches",
+   "piper",
+   "text-to-speech",
+   "tr",
+   "region:us"
+  ],
+  "pipeline_tag": "text-to-speech",
+  "createdAt": "2025-03-20T05:18:50.000Z",
+  "modelId": "speaches-ai/piper-tr_TR-fettah-medium"
+ }
+]

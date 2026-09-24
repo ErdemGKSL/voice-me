@@ -2,7 +2,7 @@
 title: 'Speak naturally and instantly with Piper on Linux, with a Piper voices tab (Story 3.15)'
 type: 'feature'
 created: '2026-09-24'
-status: 'in-progress'
+status: 'done'
 route: 'dispatch'
 review_loop_iteration: 0
 baseline_commit: '45357e95e5a9702fef615a7ae553f0dbdd5a4fbb'
@@ -119,13 +119,13 @@ context: ['{project-root}/_bmad-output/implementation-artifacts/epic-3-context.m
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `crates/voice-me-espeak/` + `voice-me-tts-system-linux` -- extract the runner; existing tests pass unchanged or move.
-- [ ] `crates/voice-me-tts-piper/` -- phonemes, config and engine. Tests: fixture ids (all 3 cases), clause splitting (`1,500` stays one clause, trailing text without a terminator), skipped symbols, normalisation, `sid` only when multi-speaker. A real-engine test that skips itself when `espeak-ng`, `ORT_DYLIB_PATH` or `VOICE_ME_PIPER_TEST_VOICE` is absent.
-- [ ] `crates/voice-me-core/src/{assets,state,settings_store,speak,ports}.rs` -- types, default, persistence, speak branch. Tests: the matrix rows First run and Speak at core level; settings round trip; other OSes keep the bundled CPU default.
-- [ ] `crates/voice-me-deps/src/{piper,lib,capability,sources,provision}.rs` + `Cargo.toml` -- catalogs, installer, rows. Tests: each parser from a captured fixture; dedupe order; hash mismatch removes the `.part`; row states (none installed / selected missing / ready).
-- [ ] `crates/voice-me-ui/src/{piper_voices,settings,backend,dependencies,lib}.rs` -- the tab and pickers. Tests: filter; an installed row shows Delete/Use; a download shows progress; "Use" sends one action; the Backend Piper pickers list installed voices only.
-- [ ] `crates/voice-me-app/{Cargo.toml,src/main.rs}` + workspace `Cargo.toml` -- wiring. Tests for `check_request`, `selection_library` and `build_engine` Piper arms.
-- [ ] `piper-voices/{catalog.json,README.md}` and the planning docs above.
+- [x] `crates/voice-me-espeak/` + `voice-me-tts-system-linux` -- extract the runner; existing tests pass unchanged or move.
+- [x] `crates/voice-me-tts-piper/` -- phonemes, config and engine. Tests: fixture ids (all 3 cases), clause splitting (`1,500` stays one clause, trailing text without a terminator), skipped symbols, normalisation, `sid` only when multi-speaker. A real-engine test that skips itself when `espeak-ng`, `ORT_DYLIB_PATH` or `VOICE_ME_PIPER_TEST_VOICE` is absent.
+- [x] `crates/voice-me-core/src/{assets,state,settings_store,speak,ports}.rs` -- types, default, persistence, speak branch. Tests: the matrix rows First run and Speak at core level; settings round trip; other OSes keep the bundled CPU default.
+- [x] `crates/voice-me-deps/src/{piper,lib,capability,sources,provision}.rs` + `Cargo.toml` -- catalogs, installer, rows. Tests: each parser from a captured fixture; dedupe order; hash mismatch removes the `.part`; row states (none installed / selected missing / ready).
+- [x] `crates/voice-me-ui/src/{piper_voices,settings,backend,dependencies,lib}.rs` -- the tab and pickers. Tests: filter; an installed row shows Delete/Use; a download shows progress; "Use" sends one action; the Backend Piper pickers list installed voices only.
+- [x] `crates/voice-me-app/{Cargo.toml,src/main.rs}` + workspace `Cargo.toml` -- wiring. Tests for `check_request`, `selection_library` and `build_engine` Piper arms.
+- [x] `piper-voices/{catalog.json,README.md}` and the planning docs above.
 
 **Acceptance Criteria:**
 - Given a fresh Linux profile with `espeak-ng` present, when I click Install on the runtime and fahrettin rows and type a Turkish line, then it plays through the Virtual Microphone in fahrettin's voice within about a second.
@@ -134,9 +134,55 @@ context: ['{project-root}/_bmad-output/implementation-artifacts/epic-3-context.m
 
 ## Implementation Notes
 
+- Post-implementation fix (step 3 audit): a tab Download of fahrettin failed with "not in the catalog any more" whenever voice-me's own catalog was unreachable, since the tab then lists fahrettin under speaches-ai but the lookup returned the built-in entry, whose source is voice-me. `piper::voice_for_entry` now looks up by key and source and falls back to the built-in default by key. Test: `a_download_finds_its_voice_by_key_and_source_and_the_default_always`.
+- Verification here: every listed crate's tests pass (espeak 11, tts-piper 19, tts-system-linux 14, core 95, deps 80, ui 112, app 44, tests 11). The disk filled up, so the user approved deleting `target/debug/examples` and the stale incremental caches (no `cargo clean`, no dependency rebuild).
+- Review patches (pass 1):
+  - A named voice missing from an empty cache now asks for that voice, not fahrettin, in both the row and the Install.
+  - The tab's "in use" follows the real backend selection.
+  - Non-espeak `phoneme_type` voices are refused with a reason.
+  - The language filter compares codes, not counts.
+  - Use goes through `use_piper_voice`, which saves the language before the voice.
+  - Tests added: the catalog port (list → install → exactly one Finished), Install forwarding the Piper voice, `current_state` merging installed voices, and "Manage voices" switching the tab.
+  - The app tests that read the cache root share one lock, so the env-setting test cannot race the comparison test.
+- Verified after the patches:
+  - Tests pass: espeak 11, tts-piper 20, tts-system-linux 14, core 95, deps 82, ui 114, app 46, tests 11.
+  - `cargo fmt --check` is clean.
+  - Clippy shows only the two existing warnings (`type_complexity` on `apply_selection`, `assert!(true)` in `voice-me-tests`).
+  - The manual app checks were not run (no display in this session).
+
 ## Spec Change Log
 
 ## Review Triage Log
+
+Pass 1 (blind-hunter, edge-case-hunter, verification-gap).
+
+| Verdict | Finding | Evidence |
+|---|---|---|
+| false | Existing Linux profiles with no saved backend move to Piper (blind) | That is the approved intent: the frozen block says "When no backend is saved: Linux uses Piper", and the proposal names the consequence → rejected |
+| medium | Deleting the only installed voice (the selected one, e.g. dfki) gives "No Piper voice installed — Install fahrettin". Install fetches fahrettin and the row stays blocked (blind, edge ×2) | Confirmed: `piper_voice_row` and `provision_piper_voice` both check "nothing installed" before looking at the named voice. The matrix Delete row wants that voice's Install → patch |
+| low | Row Install and tab Download can fetch the same key at once, using separate in-flight sets (blind, edge) | Real, but it needs two clicks on two tabs. A clash fails the hash check and is removed, never installed. The fix adds a shared guard → rejected |
+| false | Delete can run during a download (blind) | Delete is only offered on installed rows (those with `voice.toml`, written last). A downloading voice has no manifest, so it is not installed → rejected |
+| low | `install_voice` keeps an existing file without re-checking it (blind, edge) | A file only takes its final name after verification. A mismatch needs the same key installed from two sources with an interruption in between. Rare, and the fix adds hashing → rejected |
+| medium | The tab shows "in use", and Use looks like it works, while another backend is selected (blind) | Confirmed: `make_piper_panel` forces `BackendSelection::Piper` before `piper_voice_for` → patch (status reflects the real selection) |
+| low | After Use, warm-up still targets the old voice; the first line pays ~1 s (blind) | Real, but it costs about one second once per switch. The fix rebuilds or re-warms the engine → rejected |
+| low | `normalize` lets NaN through (blind, edge) | Real only if the graph ever outputs NaN, which has not been seen. The fix adds a branch → rejected |
+| false | The speaches-ai list is paginated and catalog fetches are sequential (blind) | `curl` without `limit` returns all 124 repositories and no `Link` header. Sequential fetches are a latency nicety → rejected |
+| false | Download progress rescans the disk with no throttle (blind) | `ProgressReporter` throttles to `PROGRESS_INTERVAL` (100 ms). Each rescan reads a handful of small files → rejected |
+| low | The language filter rebuilds only when the number of languages changes (blind, edge) | Confirmed. Fixed by comparing codes instead of counts (direct correction) → patch |
+| low | The filtered locale can vanish and leave "No voices match" (edge) | Rare (it needs the last voice of the filtered locale to go), and the fix adds a branch → rejected |
+| maybe-false | Fixed 64 px rows may clip the progress or error line (blind) | Not rendered here. It would only be cosmetic (low) → rejected. A manual check of the tab settles it |
+| low | Clause splitting ignores quotes, `…`, and has no length cap (blind) | eSpeak still phonemizes such text; only a pause is lost. The overlay takes single short lines → rejected |
+| false | Spec and sprint status disagree; the note about deleting target files (blind) | Sprint status moves at step 5. The deletion was approved by the user and is recorded as a fact → rejected |
+| low | A saved voice whose locale is not the saved language reads Ready (edge) | Only reachable by hand-editing; Use and the pickers save matching pairs, and Speak refuses it by name → rejected |
+| medium | A voice whose `phoneme_type` is not espeak installs, then fails or speaks garbage (edge) | Confirmed: `PiperConfig` ignores `phoneme_type`, and the official catalog has non-espeak voices → patch (refuse with a reason) |
+| false | A cleared Piper voice is re-seeded to fahrettin (edge) | Any save writes the whole file, including `speech_languages.piper`, so the seeding branch never runs again → rejected |
+| medium | The `PiperCatalogPort` adapter methods (fetch → install → Finished) are untested (verification-gap) | Pre-verified → patch |
+| medium | The real engine (`ensure_voice` rebuild, `run_graph` inputs) runs only in a test that skips in CI (verification-gap) | Pre-verified. The fix needs either a session-builder test seam or CI downloading the runtime and a voice → defer |
+| medium | Use's save order (language before voice) is untested (verification-gap) | Pre-verified → patch |
+| medium | Install on the Piper row passing `piper_voice` is untested in the UI (verification-gap) | Pre-verified → patch |
+| medium | Install on "No Piper voice installed" fetching fahrettin is untested (verification-gap) | Pre-verified. It needs an injectable default-voice source → defer |
+| medium | `current_state` merging the installed Piper voices is untested (verification-gap) | Pre-verified → patch |
+| low | "Manage voices" switching the Settings tab is untested (verification-gap) | Pre-verified → patch |
 
 ## Design Notes
 

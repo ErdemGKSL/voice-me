@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "voices": [
+    {
+      "key": "tr_TR-fahrettin-medium",
+      "name": "fahrettin",
+      "locale": "tr_TR",
+      "language": "Turkish (Turkey)",
+      "quality": "medium",
+      "licence": "CC0-1.0",
+      "model": {
+        "url": "https://huggingface.co/speaches-ai/piper-tr_TR-fahrettin-medium/resolve/aab8f92429ede58091e17de506484a2c84384792/model.onnx",
+        "size": 63201294,
+        "sha256": "39081c47270180e8a0dfac69b07bf329fb6d039fcc1279dbe26c2daf2848b190"
+      },
+      "config": {
+        "url": "https://huggingface.co/speaches-ai/piper-tr_TR-fahrettin-medium/resolve/aab8f92429ede58091e17de506484a2c84384792/config.json",
+        "size": 5022,
+        "sha256": "93741b234acc5f123430a0e343f619e01cfda6b1dc0970ee80bce7da22b1a09b"
+      }
+    }
+  ]
+}
