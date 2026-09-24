@@ -18,7 +18,6 @@ use std::time::Duration;
 use voice_me_core::{AudioBuffer, StockVoice, TtsPort, VoiceMeError};
 use windows::Media::SpeechSynthesis::{SpeechSynthesizer, VoiceInformation};
 use windows::Storage::Streams::DataReader;
-use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize};
 use windows::core::HSTRING;
 
 use crate::voices::{RawVoice, default_first, to_stock_voices};
@@ -102,29 +101,27 @@ impl TtsPort for SystemVoiceWindows {
 
 /// Run `work` on a new thread in the multithreaded apartment and wait for
 /// it for at most `deadline`. `doing` names the work in a failure.
+///
+/// The apartment is kept alive for the whole process ([`keep_mta_alive`])
+/// rather than entered and left per thread. The `windows` crate caches
+/// activation factories (`SpeechSynthesizer`'s among them) in statics: once
+/// the last thread left the apartment with `RoUninitialize`, COM tore it
+/// down, and the next worker called into a cached factory from a dead
+/// apartment — an access violation (Windows CI, the live WinRT test). A
+/// thread that never initialises COM runs in the process's MTA while one
+/// exists, so the workers need no initialisation of their own.
 fn on_worker<T, F>(deadline: Duration, doing: &str, work: F) -> Result<T, VoiceMeError>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T, String> + Send + 'static,
 {
+    keep_mta_alive().map_err(|reason| failure(format!("could not start WinRT: {reason}")))?;
     let (tx, rx) = mpsc::channel();
     std::thread::Builder::new()
         .name("voice-me-windows-speech".to_string())
         .spawn(move || {
-            // SAFETY: called once on this fresh thread, before any other
-            // WinRT call on it, and balanced below.
-            let result = match unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
-                Ok(()) => {
-                    let result = work();
-                    // SAFETY: balances the successful `RoInitialize` above;
-                    // every WinRT object `work` made has been dropped.
-                    unsafe { RoUninitialize() };
-                    result
-                }
-                Err(error) => Err(format!("could not start WinRT: {}", reason(&error))),
-            };
             // The caller may have given up at the deadline.
-            let _ = tx.send(result);
+            let _ = tx.send(work());
         })
         .map_err(|error| failure(format!("could not start its worker thread: {error}")))?;
 
@@ -139,6 +136,23 @@ where
             Err(failure(format!("stopped unexpectedly while {doing}")))
         }
     }
+}
+
+/// Hold one reference on the process's multithreaded apartment for the
+/// rest of the process (never released), so it — and every factory the
+/// `windows` crate has cached in it — outlives each worker thread.
+fn keep_mta_alive() -> Result<(), String> {
+    use std::sync::OnceLock;
+    use windows::Win32::System::Com::CoIncrementMTAUsage;
+    static MTA: OnceLock<Result<(), String>> = OnceLock::new();
+    MTA.get_or_init(|| {
+        // SAFETY: no preconditions; the cookie is deliberately never passed
+        // to `CoDecrementMTAUsage`.
+        unsafe { CoIncrementMTAUsage() }
+            .map(|_cookie| ())
+            .map_err(|error| reason(&error))
+    })
+    .clone()
 }
 
 /// A WinRT error in words: its message, or its HRESULT when it has none.
