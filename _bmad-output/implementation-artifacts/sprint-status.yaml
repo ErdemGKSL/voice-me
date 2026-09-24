@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 09-20-2026 19:26
-last_updated: 09-24-2026 08:30
+last_updated: 09-24-2026 09:30
 project: voice-me
 project_key: NOKEY
 tracking_system: file-system
@@ -70,7 +70,7 @@ development_status:
   3-12-speak-instantly-with-espeak-ng-on-linux: review
   3-13-speak-instantly-with-the-windows-speech-engine: backlog
   3-14-generate-through-azure-neural-tts: review
-  3-15-speak-naturally-and-instantly-with-piper-on-linux: backlog  # next up (sprint change 2026-09-24)
+  3-15-speak-naturally-and-instantly-with-piper-on-linux: in-progress
   3-16-speak-with-piper-on-windows: backlog
   epic-3-retrospective: optional
 
