@@ -17,11 +17,12 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, IndexPath, Sizable as _,
+    ActiveTheme as _, Disableable as _, IndexPath, Sizable as _, VirtualListScrollHandle,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
     progress::Progress,
+    scroll::Scrollbar,
     select::{Select, SelectEvent, SelectState},
     tag::Tag,
     v_flex, v_virtual_list,
@@ -241,6 +242,10 @@ pub struct PiperVoicesView {
     visible: Rc<Vec<VoiceRow>>,
     /// The language filter's items need rebuilding at the next render.
     filters_stale: bool,
+    /// The list's scroll position. It has to outlive a render: without it
+    /// `v_virtual_list` makes a new handle each frame and the list snaps
+    /// back to the top, so it cannot be scrolled at all.
+    scroll: VirtualListScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -275,6 +280,7 @@ impl PiperVoicesView {
             language: None,
             visible: Rc::default(),
             filters_stale: false,
+            scroll: VirtualListScrollHandle::new(),
             _subscriptions: subscriptions,
         };
         view.visible = Rc::new(view.filtered(cx));
@@ -569,14 +575,22 @@ impl Render for PiperVoicesView {
                     )
                 } else {
                     el.child(
-                        v_virtual_list(
-                            cx.entity(),
-                            "piper-voices-list",
-                            sizes,
-                            |this, range, _window, cx| this.rows_in(range, cx),
-                        )
-                        .flex_1()
-                        .w_full(),
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .child(
+                                v_virtual_list(
+                                    cx.entity(),
+                                    "piper-voices-list",
+                                    sizes,
+                                    |this, range, _window, cx| this.rows_in(range, cx),
+                                )
+                                .track_scroll(&self.scroll)
+                                .size_full(),
+                            )
+                            .child(Scrollbar::vertical(&self.scroll)),
                     )
                 }
             })
@@ -717,6 +731,52 @@ mod tests {
             Root::new(view, window, cx)
         });
         (handle, slot.unwrap(), sent)
+    }
+
+    /// A long catalog scrolls, and stays scrolled on the next frame: the
+    /// list's scroll handle lives in the view, not in one render.
+    #[gpui_kit::test]
+    fn a_long_voice_list_scrolls_and_stays_scrolled(cx: &mut TestAppContext) {
+        let keys: Vec<String> = (0..60)
+            .map(|n| format!("en_US-voice{n:02}-medium"))
+            .collect();
+        let panel = PiperVoicesPanel {
+            installed: Vec::new(),
+            in_use: None,
+            catalog: PiperCatalogState::Loaded(vec![CatalogResult {
+                source: PiperSource::Official,
+                result: Ok(keys
+                    .iter()
+                    .map(|key| entry(key, "en_US", "English (US)", PiperSource::Official))
+                    .collect()),
+            }]),
+            downloads: HashMap::new(),
+            error: None,
+        };
+        let first = format!("piper-voice-row-{}", keys[0]);
+        let (handle, _view, _sent) = open(cx, panel);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find(first.clone()).is_some());
+            window.scroll(
+                first.clone(),
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-2000.))),
+                cx,
+            );
+            window.render_frame(cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find(first.clone()).is_none(),
+                "the first row scrolled out of view and stayed out"
+            );
+            assert!(
+                window
+                    .try_find(format!("piper-voice-row-{}", keys[40]))
+                    .is_some(),
+                "a row far down the list is shown"
+            );
+        })
+        .unwrap();
     }
 
     /// An installed row shows Delete and Use, a catalog row shows Download,
