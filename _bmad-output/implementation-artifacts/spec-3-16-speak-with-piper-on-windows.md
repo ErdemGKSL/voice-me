@@ -2,7 +2,7 @@
 title: 'Speak with Piper on Windows, with eSpeak NG installed in one click'
 type: 'feature'
 created: '2026-09-24'
-status: 'in-progress'
+status: 'done'
 baseline_commit: 'aedc7a52c82845ea0ed7853c63bf79d5389ff1ce'
 route: 'dispatch'
 review_loop_iteration: 0
@@ -67,17 +67,17 @@ context: ['{project-root}/_bmad-output/implementation-artifacts/epic-3-context.m
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `crates/voice-me-espeak/` -- Windows lookup, `--path`, `CREATE_NO_WINDOW`, cfgs. Tests for the portable lookup ordering helper and for `ipa_args` with and without `espeak-ng-data`.
-- [ ] `crates/voice-me-tts-piper/` -- cfgs and per-call program resolution.
-- [ ] `crates/voice-me-core/src/{state,settings_store,assets}.rs` -- Windows default, `espeak_dir`, tests.
-- [ ] `crates/voice-me-deps/src/{sources,capability,lib}.rs`, `Cargo.toml`, `provision_tests.rs` -- the eSpeak asset, the Windows row and the Install flow. Tests, run on Linux via injected sources and a fake unpacker:
+- [x] `crates/voice-me-espeak/` -- Windows lookup, `--path`, `CREATE_NO_WINDOW`, cfgs. Tests for the portable lookup ordering helper and for `ipa_args` with and without `espeak-ng-data`.
+- [x] `crates/voice-me-tts-piper/` -- cfgs and per-call program resolution.
+- [x] `crates/voice-me-core/src/{state,settings_store,assets}.rs` -- Windows default, `espeak_dir`, tests.
+- [x] `crates/voice-me-deps/src/{sources,capability,lib}.rs`, `Cargo.toml`, `provision_tests.rs` -- the eSpeak asset, the Windows row and the Install flow. Tests, run on Linux via injected sources and a fake unpacker:
   - the Install produces a Ready row, the `.msi` is deleted, and progress is reported;
   - on a hash mismatch nothing is installed;
   - an unpacker failure leaves no `espeak-ng` directory;
   - an unpack with no `espeak-ng.exe` is refused;
   - the Linux `SystemVoiceEngine` provision is still refused.
-- [ ] `crates/voice-me-app/src/main.rs` -- `build_piper` on Windows.
-- [ ] `README.md` -- document it.
+- [x] `crates/voice-me-app/src/main.rs` -- `build_piper` on Windows.
+- [x] `README.md` -- document it.
 
 **Acceptance Criteria:**
 - Given `cargo test --workspace` on Linux, when it runs, then everything passes and no Linux test expectation changed except for new tests.
@@ -86,9 +86,50 @@ context: ['{project-root}/_bmad-output/implementation-artifacts/epic-3-context.m
 
 ## Implementation Notes
 
+- `voice-me-espeak` now depends on `voice-me-core`: the unpacked layout is named once in `assets` (`ESPEAK_WINDOWS_INSTALL_DIR`, `ESPEAK_WINDOWS_PROGRAM`, `espeak_program(espeak_dir)`), which both espeak (re-exported as `WINDOWS_INSTALL_DIR`/`WINDOWS_PROGRAM`/`unpacked_program`) and deps use. The Windows lookup's order lives in the portable `find_windows_program(espeak_dir, program_files, path_dirs)`.
+- `msiexec` goes through the one bounded runner: a new Windows-only `voice_me_espeak::run_raw` appends `TARGETDIR="<dir>"` verbatim (`CommandExt::raw_arg`), since msiexec parses `PROPERTY="value"` itself and a cache path can hold spaces. `run`/`run_raw` share one `run_command`, which sets `CREATE_NO_WINDOW` on Windows.
+- Review fixes: an `espeak-ng.msi` already in the cache is reused only if `provision::is_verified` (pinned size and SHA-256) passes, otherwise it is deleted and fetched again; the early return for an already-unpacked eSpeak NG deletes any leftover `.msi`; the msiexec arguments come from the portable `msiexec_unpack_args`, tested on every OS.
+- Install reuses a verified `espeak-ng.msi` left by an earlier failed unpack (as the runtime does with its archive), removes the MSI copy an administrative image carries, and returns at once when `<cache>\espeak-ng\eSpeak NG\espeak-ng.exe` already exists.
+- The Windows eSpeak row is `capability::windows_espeak_row(found, installable)`; with no pinned MSI for the target it falls back to manual steps.
+- Verification here (Linux): tests pass for espeak 15, tts-piper 18+1+1, core 101, deps 97, app 53, tts-system-linux 13+1, tts-edge 22+2. `cargo fmt --check` and clippy on the changed crates are clean. `voice-me-ui` and `voice-me-tests` were only `cargo check --all-targets`ed: the disk was full (under 1 GB free), so superseded test executables for the crates under test were deleted from `target/debug/deps` to relink them (no `cargo clean`, no dependency rebuild). The Windows cross-check was not run: the target is not installed and there was no disk for it.
+- Verified after the review patches (pass 1):
+  - Linux tests pass: espeak 16, tts-piper 21, tts-system-linux 14, tts-edge 24, core 101, deps 101, ui 124, app 53, tests 11.
+  - `cargo fmt --check` is clean.
+  - `voice-me-espeak` was cross-checked for Windows with `cargo clippy --target x86_64-pc-windows-gnu --all-targets` (stub core, since gpui-kit's build script does not cross-compile here). It came out clean.
+  - The deps Windows arms and the Windows-only test were read-checked only. CI `build-windows` is their first compile.
+  - The disk ran out several times. Stale incremental caches and already-passed test binaries were deleted: no `cargo clean`, no dependency rebuild.
+
 ## Spec Change Log
 
 ## Review Triage Log
+
+Pass 1 (blind-hunter, edge-case-hunter, verification-gap).
+
+| Verdict | Finding | Evidence |
+|---|---|---|
+| low | A leftover `espeak-ng.msi` is reused without checking it (blind, edge, vg) | A file only gets its final name once verified, but a later pin change would reuse the old MSI. Direct fix: verify before reuse → patch |
+| false | `msiexec` is resolved through PATH (blind) | Rust's Windows `Command` searches the application dir, System32 and the Windows dir before PATH, so System32's `msiexec.exe` wins → rejected |
+| low | A timeout kills only the msiexec client, and the Installer service may keep writing (blind, edge) | Unpacking 25 MB takes seconds, not 120 s. Handling it needs service detection → rejected |
+| low | Failures give only an exit code, with no log (blind) | Real but cosmetic. Translating codes adds branches → rejected |
+| low | No "Unpacking…" state after the download (blind) | The unpack takes seconds → rejected |
+| low | No tests for a network error, a stale directory, or a timeout (blind) | Network and `.part` handling are 3.2's shared `fetch`, already tested → rejected |
+| maybe-false | Windows-only code never compiled (blind) | `voice-me-espeak` was cross-checked (`clippy --target x86_64-pc-windows-gnu` with a stub core, clean). The deps Windows code was read-checked. CI `build-windows` settles it after the push → tracked there |
+| false | Spec and sprint status disagree (blind) | Sprint status moves at step 5 → rejected |
+| low | The row text hardcodes "1.52.0 (12.8 MB)" (blind) | It would silently go stale on a pin change. Fix: a test ties it to `ESPEAK_VERSION` and the size → patch |
+| low | The eSpeak layout constants exist in both deps and espeak (blind) | Install and the lookup can drift apart. Moved into `voice_me_core::assets` → patch |
+| low | `Program Files (x86)` is not searched (blind) | Current eSpeak NG releases ship x64 only. It only costs a redundant download → rejected |
+| false | The per-clause `find_program` changes Linux behaviour or cost (blind) | It resolves to the same program. A few stats cost microseconds, against a millisecond spawn → rejected |
+| low | The fast path leaves a stray MSI behind (blind, edge) | Real, and the fix is one `remove_file` → patch |
+| low | The README lacks the cache location and cleanup details (blind) | Cosmetic → rejected |
+| low | Bad comment wrap in `state.rs` (blind) | Direct correction → patch |
+| low | An unpack with `espeak-ng.exe` but no data counts as Ready (edge) | msiexec either unpacks all 443 files or fails → rejected |
+| low | A cache copy whose data was deleted wins over Program Files (edge) | Needs someone to hand-delete files → rejected |
+| medium | A non-ANSI profile path breaks `--path`, because espeak-ng.exe reads a narrow argv (edge) | Plausible for profiles outside the ANSI code page. The fix needs `GetShortPathNameW` → defer |
+| false | The row ignores the check's root (edge) | The check's root is `model_cache_root()`, the same one `find_program` reads → rejected |
+| medium | `EspeakPhonemizer::new()`'s per-call lookup is untested (vg) | Pre-verified → patch |
+| medium | The Windows cache wiring and the row's `installable` flag are untested (vg) | Pre-verified → patch (a Windows-only test) |
+| medium | `--path` is never shown reaching the program end to end (vg) | Pre-verified → patch |
+| medium | The msiexec command line is untested (vg, filed defer) | A portable pure argument builder makes it testable on Linux → patch |
 
 ## Design Notes
 

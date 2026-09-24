@@ -13,6 +13,11 @@ use std::time::{Duration, Instant};
 /// How often a running child is asked whether it has exited.
 const POLL: Duration = Duration::from_millis(5);
 
+/// `CREATE_NO_WINDOW`: every child on Windows is spawned without a console
+/// window (Story 3.16).
+#[cfg(target_os = "windows")]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Why a run produced no usable output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunError {
@@ -53,6 +58,37 @@ pub fn run(
     input: &[u8],
     deadline: Duration,
 ) -> Result<Vec<u8>, RunError> {
+    let mut command = Command::new(program);
+    command.args(args);
+    run_command(command, input, deadline)
+}
+
+/// [`run`] for a program with its own command-line parser (Story 3.16:
+/// `msiexec`, which wants `PROPERTY="value"` exactly as written): `args`
+/// are quoted as usual, then `raw_args` are appended verbatim.
+#[cfg(target_os = "windows")]
+pub fn run_raw(
+    program: &OsStr,
+    args: &[OsString],
+    raw_args: &[OsString],
+    input: &[u8],
+    deadline: Duration,
+) -> Result<Vec<u8>, RunError> {
+    use std::os::windows::process::CommandExt as _;
+    let mut command = Command::new(program);
+    command.args(args);
+    for raw in raw_args {
+        command.raw_arg(raw);
+    }
+    run_command(command, input, deadline)
+}
+
+/// One bounded run of `command`, whose program and arguments are set.
+fn run_command(
+    mut command: Command,
+    input: &[u8],
+    deadline: Duration,
+) -> Result<Vec<u8>, RunError> {
     // No input (the voice list) is no stdin at all, rather than an empty
     // pipe.
     let stdin = if input.is_empty() {
@@ -60,16 +96,21 @@ pub fn run(
     } else {
         Stdio::piped()
     };
-    let mut child = Command::new(program)
-        .args(args)
+    command
         .stdin(stdin)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => RunError::NotFound(error.to_string()),
-            _ => RunError::Spawn(error.to_string()),
-        })?;
+        .stderr(Stdio::piped());
+    // Story 3.16: a console program started from the GUI app would flash a
+    // console window on every run.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command.spawn().map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => RunError::NotFound(error.to_string()),
+        _ => RunError::Spawn(error.to_string()),
+    })?;
 
     // Each pipe on its own thread: a child blocked writing a full stdout
     // pipe while we block writing its stdin would otherwise deadlock.

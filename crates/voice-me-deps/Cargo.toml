@@ -58,6 +58,11 @@ voice-me-espeak = { path = "../voice-me-espeak" }
 # that runs it.
 voice-me-tts-edge = { path = "../voice-me-tts-edge" }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# Story 3.16: where `espeak-ng.exe` is, asked of the crate that runs it, and
+# the one bounded runner Install's `msiexec /a` goes through (AD-12).
+voice-me-espeak = { path = "../voice-me-espeak" }
+
 [dev-dependencies]
 tempfile = "3.14"
 # The `AppEvent` channel the check reports on (AD-3).

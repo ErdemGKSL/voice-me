@@ -75,9 +75,17 @@ pub struct DepsAdapter {
     piper_catalog: Arc<Mutex<Vec<CatalogVoice>>>,
     /// The voices being downloaded from the Piper voices tab right now.
     piper_in_flight: Arc<Mutex<HashSet<String>>>,
+    /// What unpacks eSpeak NG's MSI (Story 3.16).
+    espeak_unpacker: Arc<EspeakUnpacker>,
 }
 
 type VirtualMicInstaller = dyn Fn() -> Result<(), VoiceMeError> + Send + Sync;
+
+/// What Install on the Windows eSpeak NG row runs once the MSI is verified
+/// (Story 3.16): unpack `msi` into `target`, a directory that does not
+/// exist yet. `msiexec /a` on Windows; injectable so the whole flow is
+/// testable on any OS.
+type EspeakUnpacker = dyn Fn(&Path, &Path) -> Result<(), VoiceMeError> + Send + Sync;
 
 impl std::fmt::Debug for DepsAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -111,6 +119,7 @@ impl DepsAdapter {
             piper_sources: Arc::new(PiperSources::pinned()),
             piper_catalog: Arc::default(),
             piper_in_flight: Arc::default(),
+            espeak_unpacker: Arc::new(unpack_espeak_msi),
         }
     }
 
@@ -162,6 +171,15 @@ impl DepsAdapter {
         )
     }
 
+    /// Replace what unpacks eSpeak NG's MSI on Install (Story 3.16).
+    pub fn with_espeak_unpacker(
+        mut self,
+        unpacker: impl Fn(&Path, &Path) -> Result<(), VoiceMeError> + Send + Sync + 'static,
+    ) -> Self {
+        self.espeak_unpacker = Arc::new(unpacker);
+        self
+    }
+
     /// Replace what the capability row asks the hardware.
     pub fn with_gpu_probe(mut self, probe: impl GpuProbe + 'static) -> Self {
         self.gpu_probe = Arc::new(probe);
@@ -202,6 +220,11 @@ impl DepsAdapter {
                 (self.virtual_mic_installer)()
             }
             DependencyKind::PiperVoice => self.provision_piper_voice(request, events),
+            // Story 3.16: where eSpeak NG has a pinned download (Windows
+            // x64), Install unpacks the official MSI into the cache.
+            DependencyKind::SystemVoiceEngine if self.sources.espeak.is_some() => {
+                self.provision_espeak(events)
+            }
             // A system package: its row has manual steps, never Install.
             DependencyKind::SystemVoiceEngine => Err(VoiceMeError::Other(
                 "voice-me cannot install eSpeak NG; follow the steps on the row.".to_string(),
@@ -218,6 +241,82 @@ impl DepsAdapter {
                     .to_string(),
             )),
         }
+    }
+
+    /// Story 3.16: Install on the Windows eSpeak NG row. The pinned MSI is
+    /// fetched with progress on the row (a verified one already on disk is
+    /// reused), unpacked into `<cache>/espeak-ng.tmp`, checked for
+    /// `eSpeak NG/espeak-ng.exe`, and only then swapped into
+    /// `<cache>/espeak-ng`. On any failure nothing is left in either
+    /// directory; on success the MSI is deleted.
+    fn provision_espeak(&self, events: &AppEventSender) -> Result<(), VoiceMeError> {
+        let Some(msi_asset) = self.sources.espeak.as_ref() else {
+            return Err(VoiceMeError::Other(
+                "voice-me cannot install eSpeak NG on this system; follow the steps on the row."
+                    .to_string(),
+            ));
+        };
+        let root = assets::model_cache_root()?;
+        let target = assets::espeak_dir(&root);
+        let msi = msi_asset.destination(&root);
+        if assets::espeak_program(&target).is_file() {
+            // A package left by an earlier run is of no use any more.
+            let _ = std::fs::remove_file(&msi);
+            return Ok(());
+        }
+
+        // A package already on disk is reused only when it is the pinned
+        // one; anything else (an older pin, a truncated copy) goes.
+        if msi.exists() && !provision::is_verified(msi_asset, &msi) {
+            let _ = std::fs::remove_file(&msi);
+        }
+        if !msi.exists() {
+            let plan = [PlannedDownload {
+                asset: msi_asset.clone(),
+                destination: msi.clone(),
+            }];
+            fetch(DependencyKind::SystemVoiceEngine, &plan, events)?;
+        }
+
+        let staging = root.join(ESPEAK_STAGING_DIR);
+        remove_dir_if_present(&staging)?;
+        let unpacked = (self.espeak_unpacker)(&msi, &staging).and_then(|()| {
+            if assets::espeak_program(&staging).is_file() {
+                Ok(())
+            } else {
+                Err(VoiceMeError::Other(format!(
+                    "The eSpeak NG package unpacked without {}; nothing was installed.",
+                    assets::espeak_program(Path::new("")).display()
+                )))
+            }
+        });
+        if let Err(error) = unpacked {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        // An administrative image carries a copy of the package itself; it
+        // is of no use once the files are out.
+        if let Some(name) = msi.file_name() {
+            let _ = std::fs::remove_file(staging.join(name));
+        }
+
+        // A directory without the program is a stale leftover, not an
+        // install: it gives way to the complete one.
+        let swapped = remove_dir_if_present(&target).and_then(|()| {
+            std::fs::rename(&staging, &target).map_err(|error| {
+                VoiceMeError::Other(format!(
+                    "Could not move eSpeak NG into {}: {error}",
+                    target.display()
+                ))
+            })
+        });
+        if let Err(error) = swapped {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        // Our own download, of no further use once eSpeak NG is out of it.
+        let _ = std::fs::remove_file(&msi);
+        Ok(())
     }
 
     /// Decision 1: the runtime installs automatically on Linux x64 and
@@ -348,10 +447,10 @@ impl DependencyProvisioningPort for DepsAdapter {
 impl DepsAdapter {
     /// Story 3.15: Piper's rows — the shared CPU runtime (the one the
     /// bundled CPU backend uses; Piper never downloads its own), the voice,
-    /// and eSpeak NG. Linux only: elsewhere the capability row says Piper
-    /// arrives later.
+    /// and eSpeak NG. Linux and (Story 3.16) Windows only: elsewhere the
+    /// capability row says Piper arrives later.
     fn piper_rows(&self, root: &Path, request: &CheckRequest) -> Vec<Dependency> {
-        if !cfg!(target_os = "linux") {
+        if !cfg!(any(target_os = "linux", target_os = "windows")) {
             return Vec::new();
         }
         let known = |key: &str| self.known_piper_voice(key).is_some();
@@ -364,8 +463,26 @@ impl DepsAdapter {
             ),
             piper::piper_voice_row(root, request.piper_voice.as_deref(), &known),
         ];
-        rows.extend(system_voice_rows("Piper reads text through it."));
+        rows.extend(self.piper_espeak_rows());
         rows
+    }
+
+    /// Piper's eSpeak NG row: the System voice's row on Linux.
+    #[cfg(not(target_os = "windows"))]
+    fn piper_espeak_rows(&self) -> Vec<Dependency> {
+        system_voice_rows("Piper reads text through it.")
+    }
+
+    /// Piper's eSpeak NG row on Windows (Story 3.16): found in the cache,
+    /// under Program Files or on PATH, or missing with Install where the
+    /// MSI is pinned. Used for Piper only — the Windows System voice speaks
+    /// through Windows' own engine and has no eSpeak NG row.
+    #[cfg(target_os = "windows")]
+    fn piper_espeak_rows(&self) -> Vec<Dependency> {
+        vec![capability::windows_espeak_row(
+            voice_me_espeak::find_program().as_deref(),
+            self.sources.espeak.is_some(),
+        )]
     }
 }
 
@@ -431,6 +548,79 @@ impl PiperCatalogPort for DepsAdapter {
     fn delete(&self, key: &str) -> Result<(), VoiceMeError> {
         piper::delete_voice(&assets::model_cache_root()?, key)
     }
+}
+
+/// Where eSpeak NG is unpacked first, inside the cache root (Story 3.16);
+/// only a complete unpack is renamed to [`assets::ESPEAK_DIR`].
+const ESPEAK_STAGING_DIR: &str = "espeak-ng.tmp";
+
+/// How long `msiexec /a` may take to unpack eSpeak NG (~25 MB, 443 files).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const ESPEAK_UNPACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Remove `dir` and everything in it, if it is there.
+fn remove_dir_if_present(dir: &Path) -> Result<(), VoiceMeError> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(VoiceMeError::Other(format!(
+            "Could not remove {}: {error}",
+            dir.display()
+        ))),
+    }
+}
+
+/// The real eSpeak NG unpacker on Windows (Story 3.16, the user's
+/// Decision): an administrative install, `msiexec /a <msi> /qn
+/// TARGETDIR=<target>` — no admin prompt, no registry or PATH change — run
+/// through the one bounded runner (AD-12), so with `CREATE_NO_WINDOW` and a
+/// two-minute deadline.
+#[cfg(target_os = "windows")]
+fn unpack_espeak_msi(msi: &Path, target: &Path) -> Result<(), VoiceMeError> {
+    let (args, target_arg) = msiexec_unpack_args(msi, target);
+    voice_me_espeak::run_raw(
+        std::ffi::OsStr::new("msiexec"),
+        &args,
+        &[target_arg],
+        &[],
+        ESPEAK_UNPACK_DEADLINE,
+    )
+    .map(|_| ())
+    .map_err(|error| match error {
+        voice_me_espeak::RunError::Failed { status, .. } => {
+            VoiceMeError::Other(format!("Could not unpack eSpeak NG: msiexec {status}."))
+        }
+        other => VoiceMeError::Other(format!("Could not unpack eSpeak NG: msiexec {other}.")),
+    })
+}
+
+/// `msiexec`'s arguments for an administrative install of `msi` into
+/// `target`: the ones quoted as usual (`/a <msi> /qn`), and the one raw
+/// `TARGETDIR="<target>"`. msiexec parses `PROPERTY="value"` itself, so
+/// that one goes on the command line exactly as written, quoted for a path
+/// with spaces.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn msiexec_unpack_args(msi: &Path, target: &Path) -> (Vec<std::ffi::OsString>, std::ffi::OsString) {
+    use std::ffi::OsString;
+    let mut target_arg = OsString::from("TARGETDIR=\"");
+    target_arg.push(target.as_os_str());
+    target_arg.push("\"");
+    (
+        vec![
+            OsString::from("/a"),
+            msi.as_os_str().to_os_string(),
+            OsString::from("/qn"),
+        ],
+        target_arg,
+    )
+}
+
+/// Off Windows nothing unpacks an MSI; no pinned source asks for it.
+#[cfg(not(target_os = "windows"))]
+fn unpack_espeak_msi(_msi: &Path, _target: &Path) -> Result<(), VoiceMeError> {
+    Err(VoiceMeError::Other(
+        "voice-me cannot unpack eSpeak NG on this system.".to_string(),
+    ))
 }
 
 /// Removes its row from the in-flight set when dropped — including when the
@@ -1553,7 +1743,8 @@ mod tests {
 
     /// Story 3.15's First run row: Piper reports the shared runtime, "No
     /// Piper voice installed" (Install) and eSpeak NG — no Chatterbox
-    /// model rows, and on Linux no capability row.
+    /// model rows, and on Linux (and Windows, Story 3.16) no capability
+    /// row.
     #[test]
     fn a_piper_selection_reports_runtime_voice_and_espeak_rows() {
         let dir = tempfile::tempdir().unwrap();
@@ -1571,7 +1762,7 @@ mod tests {
             "{:?}",
             report.dependencies
         );
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
             let kinds: Vec<_> = report
                 .dependencies
@@ -1601,10 +1792,73 @@ mod tests {
                 voice_me_espeak::find_program().is_none()
             );
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         assert_eq!(
             report.dependencies[0].kind,
             DependencyKind::BackendCapability
+        );
+    }
+
+    /// Story 3.16: the Windows Piper check reports the eSpeak NG row from
+    /// voice-me's cache — Missing with Install while nothing is found, then
+    /// Ready naming the unpacked program.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn a_windows_piper_check_finds_espeak_ng_in_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::EnvGuard::new().set(assets::CACHE_ROOT_ENV, dir.path());
+        let espeak_row = || {
+            let (tx, mut rx) = futures::channel::mpsc::unbounded();
+            DepsAdapter::new()
+                .check(piper_request(Some(assets::PIPER_DEFAULT_VOICE.key)), tx)
+                .unwrap();
+            let Ok(AppEvent::DependencyCheckCompleted { report }) = rx.try_recv() else {
+                panic!("the check reports by event");
+            };
+            row(&report.dependencies, DependencyKind::SystemVoiceEngine).clone()
+        };
+
+        if voice_me_espeak::find_program().is_none() {
+            let missing = espeak_row();
+            assert!(missing.status.is_missing());
+            if cfg!(target_arch = "x86_64") {
+                assert!(missing.automatable, "Install fetches the pinned MSI");
+            }
+        }
+
+        let program = assets::espeak_program(&assets::espeak_dir(dir.path()));
+        std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+        std::fs::write(&program, b"MZ").unwrap();
+
+        let ready = espeak_row();
+        assert_eq!(ready.status, voice_me_core::DependencyStatus::Ready);
+        assert!(
+            ready.detail.contains(&program.display().to_string()),
+            "{}",
+            ready.detail
+        );
+    }
+
+    /// Story 3.16: msiexec's command line — an administrative, quiet
+    /// install, with `TARGETDIR` quoted whole for a path with a space.
+    #[test]
+    fn the_msiexec_command_line_is_admin_quiet_and_quotes_its_target() {
+        let msi = Path::new("C:/Users/Ada Lovelace/cache/espeak-ng.msi");
+        let target = Path::new("C:/Users/Ada Lovelace/cache/espeak-ng.tmp");
+
+        let (args, raw) = msiexec_unpack_args(msi, target);
+
+        assert_eq!(
+            args,
+            vec![
+                std::ffi::OsString::from("/a"),
+                msi.as_os_str().to_os_string(),
+                std::ffi::OsString::from("/qn"),
+            ]
+        );
+        assert_eq!(
+            raw,
+            std::ffi::OsString::from("TARGETDIR=\"C:/Users/Ada Lovelace/cache/espeak-ng.tmp\"")
         );
     }
 

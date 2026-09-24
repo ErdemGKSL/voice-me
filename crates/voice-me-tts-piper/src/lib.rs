@@ -8,7 +8,7 @@
 //! 1. the text is split into clauses at `, : ; . ! ?`
 //!    ([`phonemes::split_clauses`]);
 //! 2. each clause is phonemized by `espeak-ng --ipa` (through
-//!    `voice-me-espeak` on Linux — the [`Phonemizer`] here), its mark put
+//!    `voice-me-espeak` on Linux and Windows — the [`Phonemizer`] here), its mark put
 //!    back, and the result decomposed to NFD ([`phonemes::sentence_phonemes`]);
 //! 3. each sentence becomes ids ([`phonemes::to_ids`]) and one run of the
 //!    graph;
@@ -53,39 +53,65 @@ pub trait Phonemizer: Send + Sync {
 }
 
 /// The real phonemizer: the `espeak-ng` program, through `voice-me-espeak`.
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone)]
+///
+/// Story 3.16: by default the program is resolved on each call
+/// (`voice_me_espeak::find_program()`, falling back to the bare name), so
+/// an eSpeak NG installed after the engine was built — the Dependency
+/// Check's Install on Windows — is picked up without a rebuild.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[derive(Debug, Clone, Default)]
 pub struct EspeakPhonemizer {
-    program: std::ffi::OsString,
+    /// A fixed program, or `None` to resolve it on each call.
+    program: Option<std::ffi::OsString>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl EspeakPhonemizer {
-    /// `espeak-ng` by its fixed name on PATH.
+    /// `espeak-ng` wherever `voice-me-espeak` finds it, on each call.
     pub fn new() -> Self {
-        Self::with_program(voice_me_espeak::PROGRAM)
+        Self { program: None }
     }
 
     /// Another program in its place.
     pub fn with_program(program: impl Into<std::ffi::OsString>) -> Self {
         Self {
-            program: program.into(),
+            program: Some(program.into()),
         }
     }
-}
 
-#[cfg(target_os = "linux")]
-impl Default for EspeakPhonemizer {
-    fn default() -> Self {
-        Self::new()
+    /// The program this call runs.
+    fn program(&self) -> std::ffi::OsString {
+        self.program.clone().unwrap_or_else(|| {
+            voice_me_espeak::find_program()
+                .map(std::path::PathBuf::into_os_string)
+                .unwrap_or_else(|| voice_me_espeak::PROGRAM.into())
+        })
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 impl Phonemizer for EspeakPhonemizer {
     fn phonemize(&self, espeak_voice: &str, clause: &str) -> Result<String, String> {
-        voice_me_espeak::ipa(&self.program, espeak_voice, clause)
+        voice_me_espeak::ipa(&self.program(), espeak_voice, clause)
             .map_err(|error| format!("{} {error}", voice_me_espeak::PROGRAM))
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+mod espeak_phonemizer_tests {
+    use super::*;
+
+    /// Story 3.16: by default the program is resolved on each call, where
+    /// `voice-me-espeak` finds it; a fixed one is used as given.
+    #[test]
+    fn the_default_program_is_resolved_per_call_and_a_fixed_one_is_kept() {
+        assert_eq!(
+            EspeakPhonemizer::new().program(),
+            voice_me_espeak::find_program()
+                .map(PathBuf::into_os_string)
+                .unwrap_or_else(|| voice_me_espeak::PROGRAM.into())
+        );
+        assert_eq!(EspeakPhonemizer::with_program("x").program(), "x");
     }
 }
 

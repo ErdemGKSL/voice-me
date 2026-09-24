@@ -11,6 +11,9 @@ edition.workspace = true
 # user-installed `edge-tts` (from `voice-me-tts-edge`) — still one runner
 # crate. No HTTP client here (AD-8). Nothing but std.
 [dependencies]
+# Story 3.16: the Windows layout of an unpacked eSpeak NG, and (on Windows)
+# the cache root it is looked for in, are named by core.
+voice-me-core = { path = "../voice-me-core" }
 
 [dev-dependencies]
 tempfile = "3.14"

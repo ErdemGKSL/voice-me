@@ -653,12 +653,12 @@ pub enum BackendSelection {
 }
 
 /// What an unsaved selection is (Story 3.15): Piper where this OS's build
-/// has it (Linux), the bundled CPU runtime everywhere else. Only ever the
-/// answer for a profile with *no* saved selection — an explicit one is
-/// never rewritten.
+/// has it (Linux; Windows since Story 3.16), the bundled CPU runtime
+/// everywhere else. Only ever the answer for a profile with *no* saved
+/// selection — an explicit one is never rewritten.
 impl Default for BackendSelection {
     fn default() -> Self {
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "windows")) {
             Self::Piper
         } else {
             Self::BUNDLED_CPU
@@ -993,8 +993,9 @@ pub enum DependencyKind {
     /// selection that cannot run is never quietly run on CPU instead.
     BackendCapability,
     /// The OS speech engine the System voice runs (Story 3.12: the
-    /// `espeak-ng` program). Blocking, with manual steps: it is a system
-    /// package voice-me cannot install. Piper phonemizes through it too.
+    /// `espeak-ng` program). Blocking, with manual steps on Linux: it is a
+    /// system package voice-me cannot install. Piper phonemizes through it
+    /// too; on Windows (Story 3.16) Piper's row installs it with one click.
     SystemVoiceEngine,
     /// The `edge-tts` program Edge TTS runs (Story 3.17). Blocking, with
     /// manual steps only: voice-me never runs pip for the user.
@@ -1760,12 +1761,13 @@ mod tests {
         assert!(DependencyKind::PiperVoice.blocks_speech());
     }
 
-    /// The First run row at core level: with nothing saved, Linux speaks
-    /// with Piper and fahrettin; every other OS keeps the bundled CPU.
+    /// The First run row at core level: with nothing saved, Linux and
+    /// Windows (Story 3.16) speak with Piper and fahrettin; every other OS
+    /// keeps the bundled CPU.
     #[test]
     fn an_unsaved_selection_is_piper_on_linux_and_the_bundled_cpu_elsewhere() {
         let state = AppState::default();
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "windows")) {
             assert_eq!(state.backend_selection, BackendSelection::Piper);
             assert_eq!(state.speech_language(), Some("tr_TR"));
             assert_eq!(

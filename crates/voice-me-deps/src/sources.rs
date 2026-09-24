@@ -196,6 +196,10 @@ pub struct Sources {
     /// target but Linux x64 and Windows x64 (Decision 1, extended by
     /// spec 3-2 for Windows).
     pub runtime: Option<RuntimeArchive>,
+    /// Story 3.16: eSpeak NG's official `espeak-ng.msi`, which Install on
+    /// the eSpeak NG row unpacks into the cache. `None` where eSpeak NG is
+    /// not installed automatically — every target but Windows x64.
+    pub espeak: Option<Asset>,
 }
 
 impl Default for Sources {
@@ -219,6 +223,7 @@ impl Sources {
         Self {
             model_files,
             runtime: pinned_runtime(),
+            espeak: pinned_espeak(),
         }
     }
 
@@ -312,9 +317,59 @@ fn pinned_runtime() -> Option<RuntimeArchive> {
     None
 }
 
+/// The eSpeak NG release Windows' Install fetches (Story 3.16).
+pub const ESPEAK_VERSION: &str = "1.52.0";
+
+/// eSpeak NG's own release asset, pinned by URL, size and SHA-256.
+/// Whatever the target, so the pin itself is testable anywhere.
+pub fn espeak_msi() -> Asset {
+    Asset {
+        relative_path: "espeak-ng.msi".to_string(),
+        url: format!(
+            "https://github.com/espeak-ng/espeak-ng/releases/download/{ESPEAK_VERSION}/espeak-ng.msi"
+        ),
+        size: 12_765_862,
+        digest: Digest::Sha256(
+            "7f673c709ea5dd579d3b5ebb98688cc575328a6ab7438d2bc405b88cedaeafb9".to_string(),
+        ),
+    }
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn pinned_espeak() -> Option<Asset> {
+    Some(espeak_msi())
+}
+
+#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+fn pinned_espeak() -> Option<Asset> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Story 3.16: the one eSpeak NG download is the official 1.52.0 MSI,
+    /// fully pinned, and only Windows x64 installs it.
+    #[test]
+    fn espeak_ng_is_pinned_to_its_official_msi_on_windows_x64_only() {
+        let msi = espeak_msi();
+        assert_eq!(
+            msi.url,
+            "https://github.com/espeak-ng/espeak-ng/releases/download/1.52.0/espeak-ng.msi"
+        );
+        assert_eq!(msi.size, 12_765_862);
+        assert_eq!(
+            msi.digest,
+            Digest::Sha256(
+                "7f673c709ea5dd579d3b5ebb98688cc575328a6ab7438d2bc405b88cedaeafb9".to_string()
+            )
+        );
+        assert_eq!(
+            Sources::pinned().espeak.is_some(),
+            cfg!(all(target_os = "windows", target_arch = "x86_64"))
+        );
+    }
 
     fn total(plan: &[PlannedDownload]) -> u64 {
         plan.iter().map(|planned| planned.asset.size).sum()

@@ -197,3 +197,6 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-prompt-overlay-pill-bar.md`
   summary: `epics.md` UX-DR4 ("one `Input` and nothing else, popover-family elevation/shadow") and UX-DR22 ("fade/scale-in"), and EXPERIENCE.md, still describe the boxed overlay rather than the pill bar with its icon and Enter hint.
   evidence: the user asked for the pill bar (DESIGN.md was updated with it); the planning documents were left for a correct-course pass rather than edited from a review.
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-16-speak-with-piper-on-windows.md`
+  summary: On Windows, `espeak-ng.exe` reads its argv (including `--path=<cache dir>`) through the ANSI code page, so a user profile path with characters outside that code page may leave eSpeak NG unable to find its data.
+  evidence: espeak-ng 1.52.0 uses `main(argc, argv)` and narrow `fopen`. Settle it by running Piper under a profile named outside the code page, and fix it with `GetShortPathNameW` or an ASCII-only cache location for eSpeak NG.

@@ -8764,6 +8764,7 @@ name = "voice-me-espeak"
 version = "0.1.0"
 dependencies = [
  "tempfile",
+ "voice-me-core",
 ]
 
 [[package]]

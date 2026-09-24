@@ -326,6 +326,14 @@ fn verify(asset: &Asset, part: &Path, dir: &Path) -> Result<(), VoiceMeError> {
     )))
 }
 
+/// Whether the file at `path` is exactly `asset`: its pinned size, then its
+/// digest (Story 3.16: a package already on disk is reused only then).
+pub fn is_verified(asset: &Asset, path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.len() == asset.size)
+        && digest_file(&asset.digest, path)
+            .is_ok_and(|actual| actual.eq_ignore_ascii_case(asset.digest.expected()))
+}
+
 /// Lowercase hex SHA-256 of a file, read in 1 MiB pieces.
 pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     digest_file(&Digest::Sha256(String::new()), path)

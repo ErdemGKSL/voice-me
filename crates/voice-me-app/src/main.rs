@@ -600,8 +600,10 @@ fn build_engine(
     }
 }
 
-/// Piper's engine (Story 3.15), or why there is none.
-#[cfg(target_os = "linux")]
+/// Piper's engine (Story 3.15; Windows since Story 3.16), or why there is
+/// none. The phonemizer finds `espeak-ng` on each call, so one installed
+/// after the engine was built is used.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn build_piper(state: &AppState) -> Result<Arc<dyn TtsPort>, String> {
     let root = assets::model_cache_root().map_err(|error| error.to_string())?;
     let runtime_root = root.clone();
@@ -617,7 +619,7 @@ fn build_piper(state: &AppState) -> Result<Arc<dyn TtsPort>, String> {
     )))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 fn build_piper(_state: &AppState) -> Result<Arc<dyn TtsPort>, String> {
     Err(
         "Piper on this system arrives in a later voice-me release. Choose another backend under \

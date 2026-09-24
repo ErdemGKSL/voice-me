@@ -273,6 +273,7 @@ impl Fixture {
             sources: Sources {
                 model_files,
                 runtime,
+                espeak: None,
             },
             cache,
             env,
@@ -1091,4 +1092,265 @@ fn a_q4_install_through_the_tokio_bridge_lands_every_file() {
     for path in fixture.q4_files() {
         assert_eq!(std::fs::read(&path).unwrap(), fixture.served(&path));
     }
+}
+
+// Story 3.16: Install on the Windows eSpeak NG row, driven on any OS
+// through an injected MSI source and a fake unpacker.
+
+const ESPEAK_MSI: &str = "espeak-ng.msi";
+
+/// Fake MSI bytes, a few KB so progress has figures to report.
+fn fake_espeak_msi() -> Vec<u8> {
+    (0..6000).map(|n| (n * 13 % 251) as u8).collect()
+}
+
+/// A fixture serving `msi` as eSpeak NG's package, pinned to `pinned`'s
+/// SHA-256.
+fn espeak_fixture(msi: Vec<u8>, pinned: &[u8]) -> Fixture {
+    let mut fixture = Fixture::with_extra_files(vec![(ESPEAK_MSI.to_string(), msi)], None);
+    fixture.sources.espeak = Some(Asset {
+        relative_path: ESPEAK_MSI.to_string(),
+        url: format!("{}/{ESPEAK_MSI}", fixture.server.base),
+        size: pinned.len() as u64,
+        digest: crate::sources::Digest::Sha256(sha256(pinned)),
+    });
+    fixture
+}
+
+/// Install on the eSpeak NG row through `adapter`.
+fn provision_espeak_with(adapter: DepsAdapter) -> (Result<(), String>, Vec<AppEvent>) {
+    let (tx, mut rx) = futures::channel::mpsc::unbounded();
+    let result = adapter
+        .provision(
+            DependencyKind::SystemVoiceEngine,
+            voice_me_core::CheckRequest::cpu(),
+            tx,
+        )
+        .map_err(|error| error.to_string());
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    (result, events)
+}
+
+/// Lays out what `msiexec /a` leaves in `target`: the program, its data
+/// directory, and a copy of the package.
+fn fake_admin_image(target: &Path) {
+    let dir = target.join("eSpeak NG");
+    std::fs::create_dir_all(dir.join("espeak-ng-data")).unwrap();
+    std::fs::write(dir.join("espeak-ng.exe"), b"MZ").unwrap();
+    std::fs::write(dir.join("libespeak-ng.dll"), b"MZ").unwrap();
+    std::fs::write(target.join(ESPEAK_MSI), b"stripped").unwrap();
+}
+
+fn espeak_dirs(fixture: &Fixture) -> (PathBuf, PathBuf, PathBuf) {
+    (
+        assets::espeak_dir(fixture.root()),
+        fixture.root().join("espeak-ng.tmp"),
+        fixture.root().join(ESPEAK_MSI),
+    )
+}
+
+/// The Install row of the matrix: download with progress → verify →
+/// unpack → Ready, and the `.msi` is gone afterwards.
+#[test]
+fn an_espeak_install_unpacks_the_verified_msi_and_deletes_it() {
+    let msi = fake_espeak_msi();
+    let fixture = espeak_fixture(msi.clone(), &msi);
+    let (espeak_dir, staging, msi_path) = espeak_dirs(&fixture);
+    let unpacked_from = Arc::new(Mutex::new(Vec::new()));
+    let seen = unpacked_from.clone();
+    let adapter = fixture
+        .adapter()
+        .with_espeak_unpacker(move |package: &Path, target: &Path| {
+            assert!(!target.exists(), "the unpack goes into a fresh directory");
+            seen.lock()
+                .unwrap()
+                .push((std::fs::read(package).unwrap(), target.to_path_buf()));
+            fake_admin_image(target);
+            Ok(())
+        });
+
+    let (result, events) = provision_espeak_with(adapter);
+
+    assert_eq!(result, Ok(()));
+    let calls = unpacked_from.lock().unwrap().clone();
+    assert_eq!(calls, vec![(msi.clone(), staging.clone())]);
+    let program = espeak_dir.join("eSpeak NG").join("espeak-ng.exe");
+    assert!(program.is_file());
+    assert!(espeak_dir.join("eSpeak NG").join("espeak-ng-data").is_dir());
+    assert!(
+        !espeak_dir.join(ESPEAK_MSI).exists(),
+        "the image's copy is gone"
+    );
+    assert!(!staging.exists());
+    assert!(!msi_path.exists(), "the .msi is deleted afterwards");
+    assert!(!part_path(&msi_path).exists());
+
+    let total = msi.len() as u64;
+    let figures = progress(&events);
+    assert_eq!(figures.first(), Some(&(0, total)));
+    assert_eq!(figures.last(), Some(&(total, total)));
+    assert_eq!(finished(&events), vec![Ok(())]);
+    assert!(events.iter().all(|event| match event {
+        AppEvent::ProvisioningProgress { kind, .. }
+        | AppEvent::ProvisioningFinished { kind, .. } => *kind == DependencyKind::SystemVoiceEngine,
+        _ => true,
+    }));
+
+    // The row then reads Ready, found where voice-me's Windows lookup
+    // looks first.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        let found = voice_me_espeak::find_windows_program(Some(&espeak_dir), None, &[]);
+        assert_eq!(found.as_deref(), Some(program.as_path()));
+        let row = crate::capability::windows_espeak_row(found.as_deref(), true);
+        assert_eq!(row.status, DependencyStatus::Ready);
+        assert!(row.detail.contains("espeak-ng.exe"), "{}", row.detail);
+    }
+
+    // A second Install finds it there and fetches nothing.
+    let requests = fixture.server.requests().len();
+    let (again, _) =
+        provision_espeak_with(fixture.adapter().with_espeak_unpacker(|_, _| {
+            panic!("nothing to unpack when eSpeak NG is already there")
+        }));
+    assert_eq!(again, Ok(()));
+    assert_eq!(fixture.server.requests().len(), requests);
+}
+
+/// A stale `espeak-ng.msi` already in the cache (an older pin, a truncated
+/// copy) is not unpacked: it is replaced by the verified download, which
+/// is.
+#[test]
+fn a_stale_espeak_msi_in_the_cache_is_fetched_again_before_unpacking() {
+    let msi = fake_espeak_msi();
+    let fixture = espeak_fixture(msi.clone(), &msi);
+    let (espeak_dir, _, msi_path) = espeak_dirs(&fixture);
+    std::fs::write(&msi_path, b"an older espeak-ng.msi").unwrap();
+    let unpacked = Arc::new(Mutex::new(Vec::new()));
+    let seen = unpacked.clone();
+
+    let (result, _) = provision_espeak_with(fixture.adapter().with_espeak_unpacker(
+        move |package: &Path, target: &Path| {
+            seen.lock().unwrap().push(std::fs::read(package).unwrap());
+            fake_admin_image(target);
+            Ok(())
+        },
+    ));
+
+    assert_eq!(result, Ok(()));
+    assert_eq!(fixture.server.requests().len(), 1, "fetched again");
+    assert_eq!(*unpacked.lock().unwrap(), vec![msi], "the verified one");
+    assert!(assets::espeak_program(&espeak_dir).is_file());
+    assert!(!msi_path.exists());
+}
+
+/// Already unpacked, Install deletes a leftover package and fetches
+/// nothing.
+#[test]
+fn an_unpacked_espeak_ng_takes_a_leftover_msi_with_it() {
+    let msi = fake_espeak_msi();
+    let fixture = espeak_fixture(msi.clone(), &msi);
+    let (espeak_dir, _, msi_path) = espeak_dirs(&fixture);
+    fake_admin_image(&espeak_dir);
+    std::fs::write(&msi_path, &msi).unwrap();
+
+    let (result, _) = provision_espeak_with(
+        fixture
+            .adapter()
+            .with_espeak_unpacker(|_, _| panic!("nothing to unpack")),
+    );
+
+    assert_eq!(result, Ok(()));
+    assert!(!msi_path.exists());
+    assert!(fixture.server.requests().is_empty());
+}
+
+/// A package that does not match its pin is never unpacked, and nothing
+/// of it stays behind.
+#[test]
+fn an_espeak_msi_with_the_wrong_hash_installs_nothing() {
+    let msi = fake_espeak_msi();
+    let mut other = msi.clone();
+    other[10] ^= 0xff;
+    let fixture = espeak_fixture(msi, &other);
+    let (espeak_dir, staging, msi_path) = espeak_dirs(&fixture);
+
+    let (result, events) =
+        provision_espeak_with(fixture.adapter().with_espeak_unpacker(|_, _| {
+            panic!("a package that failed its check is never unpacked")
+        }));
+
+    let error = result.unwrap_err();
+    assert!(error.contains(ESPEAK_MSI), "{error}");
+    assert!(!espeak_dir.exists());
+    assert!(!staging.exists());
+    assert!(!msi_path.exists());
+    assert!(!part_path(&msi_path).exists());
+    assert_eq!(finished(&events).len(), 1);
+    assert!(finished(&events)[0].is_err());
+}
+
+/// An unpacker that fails part-way leaves no `espeak-ng` directory and no
+/// staging directory, and its reason reaches the row.
+#[test]
+fn a_failed_espeak_unpack_leaves_no_install_behind() {
+    let msi = fake_espeak_msi();
+    let fixture = espeak_fixture(msi.clone(), &msi);
+    let (espeak_dir, staging, _) = espeak_dirs(&fixture);
+
+    let (result, events) =
+        provision_espeak_with(fixture.adapter().with_espeak_unpacker(|_, target: &Path| {
+            std::fs::create_dir_all(target.join("eSpeak NG")).unwrap();
+            std::fs::write(target.join("eSpeak NG").join("espeak-ng.exe"), b"half").unwrap();
+            Err(voice_me_core::VoiceMeError::Other(
+                "Could not unpack eSpeak NG: msiexec exit code: 1603.".to_string(),
+            ))
+        }));
+
+    let error = result.unwrap_err();
+    assert!(error.contains("exit code: 1603"), "{error}");
+    assert!(!espeak_dir.exists(), "no half-installed program");
+    assert!(!staging.exists());
+    assert!(matches!(finished(&events).as_slice(), [Err(reason)] if reason.contains("1603")));
+}
+
+/// An unpack that "succeeds" without `espeak-ng.exe` is refused, and
+/// nothing is installed.
+#[test]
+fn an_espeak_unpack_without_the_program_is_refused() {
+    let msi = fake_espeak_msi();
+    let fixture = espeak_fixture(msi.clone(), &msi);
+    let (espeak_dir, staging, _) = espeak_dirs(&fixture);
+
+    let (result, _) =
+        provision_espeak_with(fixture.adapter().with_espeak_unpacker(|_, target: &Path| {
+            std::fs::create_dir_all(target.join("eSpeak NG").join("espeak-ng-data")).unwrap();
+            Ok(())
+        }));
+
+    let error = result.unwrap_err();
+    assert!(error.contains("espeak-ng.exe"), "{error}");
+    assert!(!espeak_dir.exists());
+    assert!(!staging.exists());
+}
+
+/// Linux has no eSpeak NG download: its row keeps manual steps, and
+/// Install there is still refused.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_linux_espeak_ng_provision_is_still_refused() {
+    let fixture = Fixture::new();
+    assert!(fixture.sources.espeak.is_none());
+    assert!(crate::sources::Sources::pinned().espeak.is_none());
+
+    let (result, events) = provision_espeak_with(fixture.adapter());
+
+    let error = result.unwrap_err();
+    assert!(error.contains("cannot install eSpeak NG"), "{error}");
+    assert!(fixture.server.requests().is_empty());
+    assert!(!assets::espeak_dir(fixture.root()).exists());
+    assert!(matches!(finished(&events).as_slice(), [Err(_)]));
 }

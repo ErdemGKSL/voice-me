@@ -367,10 +367,10 @@ pub fn capability_row(request: &CheckRequest, probe: &dyn GpuProbe) -> Option<De
             }
         }
         // Story 3.15: on Linux Piper's readiness is its runtime, voice and
-        // eSpeak NG rows. Elsewhere it has no engine yet (Windows is Story
-        // 3.16).
+        // eSpeak NG rows — and on Windows too since Story 3.16. Elsewhere
+        // it has no engine yet.
         BackendSelection::Piper => {
-            if cfg!(target_os = "linux") {
+            if cfg!(any(target_os = "linux", target_os = "windows")) {
                 None
             } else {
                 Some(cannot_run(
@@ -407,6 +407,35 @@ pub fn system_voice_engine_row(
             format!("The espeak-ng program is not on PATH. {used_by}"),
         )
         .manual([install_step.to_string(), "Press Check again.".to_string()]),
+    }
+}
+
+/// What the Windows eSpeak NG row says when the program is not found
+/// (Story 3.16).
+pub const ESPEAK_NOT_INSTALLED_WINDOWS: &str = "eSpeak NG is not installed. Piper reads text \
+     through it. Install downloads eSpeak NG 1.52.0 (12.8 MB) from its official release.";
+
+/// Piper's eSpeak NG row on Windows (Story 3.16): ready in
+/// [`system_voice_engine_row`]'s form, naming where `espeak-ng.exe` was
+/// found, or missing and speech-blocking. Missing, it offers Install — the
+/// official MSI, unpacked into voice-me's cache — where `installable` (a
+/// pinned download exists for this target), and manual steps otherwise.
+pub fn windows_espeak_row(found: Option<&Path>, installable: bool) -> Dependency {
+    if found.is_some() {
+        return system_voice_engine_row(found, "", "");
+    }
+    let row = Dependency::missing(
+        DependencyKind::SystemVoiceEngine,
+        SYSTEM_VOICE_ENGINE_LABEL,
+        ESPEAK_NOT_INSTALLED_WINDOWS,
+    );
+    if installable {
+        row
+    } else {
+        row.manual([
+            "Install eSpeak NG from the espeak-ng project's releases on GitHub.",
+            "Press Check again.",
+        ])
     }
 }
 
@@ -781,6 +810,65 @@ mod tests {
 
         assert_eq!(row.status, DependencyStatus::Ready);
         assert!(row.detail.contains("/usr/bin/espeak-ng"), "{}", row.detail);
+    }
+
+    /// Story 3.16: on Windows a missing eSpeak NG blocks speech and offers
+    /// Install, in the words the spec gives.
+    #[test]
+    fn a_missing_windows_espeak_ng_blocks_and_offers_install() {
+        let row = windows_espeak_row(None, true);
+
+        assert_eq!(row.kind, DependencyKind::SystemVoiceEngine);
+        assert_eq!(row.label, "eSpeak NG");
+        assert_eq!(row.status, DependencyStatus::Missing);
+        assert!(row.kind.blocks_speech());
+        assert!(row.automatable, "Install fetches the official MSI");
+        assert!(row.manual_steps.is_empty());
+        assert_eq!(
+            row.detail,
+            "eSpeak NG is not installed. Piper reads text through it. Install downloads eSpeak \
+             NG 1.52.0 (12.8 MB) from its official release."
+        );
+    }
+
+    /// The row's version and size are the pinned MSI's own.
+    #[test]
+    fn the_windows_espeak_ng_text_names_the_pinned_version_and_size() {
+        let size_mb = crate::sources::espeak_msi().size as f64 / 1_000_000.0;
+
+        assert!(
+            ESPEAK_NOT_INSTALLED_WINDOWS.contains(crate::sources::ESPEAK_VERSION),
+            "{ESPEAK_NOT_INSTALLED_WINDOWS}"
+        );
+        assert!(
+            ESPEAK_NOT_INSTALLED_WINDOWS.contains(&format!("({size_mb:.1} MB)")),
+            "{ESPEAK_NOT_INSTALLED_WINDOWS}"
+        );
+    }
+
+    /// With no pinned download for this target, the row has steps instead.
+    #[test]
+    fn a_windows_espeak_ng_with_no_download_is_manual() {
+        let row = windows_espeak_row(None, false);
+
+        assert_eq!(row.status, DependencyStatus::Missing);
+        assert!(!row.automatable);
+        assert!((2..=4).contains(&row.manual_steps.len()));
+    }
+
+    /// Found, it is ready in the System voice row's own form.
+    #[test]
+    fn a_found_windows_espeak_ng_is_ready_like_the_system_voice_row() {
+        let path = Path::new(r"C:\Program Files\eSpeak NG\espeak-ng.exe");
+
+        assert_eq!(
+            windows_espeak_row(Some(path), true),
+            system_voice_engine_row(Some(path), "", "")
+        );
+        assert_eq!(
+            windows_espeak_row(Some(path), true).status,
+            DependencyStatus::Ready
+        );
     }
 
     fn system_voice() -> CheckRequest {

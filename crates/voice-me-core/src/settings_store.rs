@@ -864,7 +864,8 @@ mod tests {
         let state = store.load().unwrap();
         assert_eq!(state.speech_languages, SpeechLanguages::default());
         assert_eq!(state.speech_languages.local, "tr");
-        // Story 3.15: the unsaved selection (Piper on Linux) reads its own.
+        // Story 3.15: the unsaved selection (Piper on Linux, and on Windows
+        // since Story 3.16) reads its own.
         assert_eq!(
             state.speech_language(),
             SpeechLanguages::default().get(BackendSelection::default().language_backend())
@@ -1081,7 +1082,8 @@ mod tests {
     }
 
     /// Story 3.15: a file with no saved selection loads as the default —
-    /// Piper on Linux, the bundled CPU runtime elsewhere.
+    /// Piper on Linux and Windows (Story 3.16), the bundled CPU runtime
+    /// elsewhere.
     #[test]
     fn a_file_from_before_story_3_5_loads_as_the_default_backend() {
         let config_dir = tempfile::tempdir().unwrap();
@@ -1095,7 +1097,7 @@ mod tests {
         let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
 
         assert_eq!(state.backend_selection, BackendSelection::default());
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "windows")) {
             assert_eq!(state.backend_selection, BackendSelection::Piper);
         } else {
             assert_eq!(state.backend_selection, BackendSelection::BUNDLED_CPU);
@@ -1199,7 +1201,8 @@ mod tests {
 
         let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
 
-        // The default — Piper on Linux since Story 3.15.
+        // The default — Piper on Linux since Story 3.15, and on Windows
+        // since Story 3.16.
         assert_eq!(state.backend_selection, BackendSelection::default());
         assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
     }

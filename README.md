@@ -93,6 +93,22 @@ open **Settings → Dependencies** and press **Install** on each missing row.
 When a row finishes, the check runs again by itself; the row turns "ready"
 and the Prompt Overlay accepts input without a restart.
 
+### Piper and eSpeak NG
+
+Piper (natural, instant stock voices) is the first-run backend on Linux and
+Windows, with the Turkish voice `tr_TR-fahrettin-medium`. It reads text
+through the `espeak-ng` program, run as a separate process; nothing of
+eSpeak NG is linked.
+
+- **Linux** — install `espeak-ng` with your package manager; the eSpeak NG
+  row shows the command.
+- **Windows** — voice-me looks for `espeak-ng.exe` in its cache, then under
+  `C:\Program Files\eSpeak NG\`, then on `PATH`. When none is found, the
+  eSpeak NG row's **Install** downloads the official eSpeak NG 1.52.0
+  `espeak-ng.msi` (12.8 MB, pinned SHA-256), unpacks it into
+  `<cache>\espeak-ng\` with `msiexec /a` (no admin prompt, no registry or
+  `PATH` change), and deletes the `.msi`. Delete that directory to remove it.
+
 For reference, the weights come from
 `onnx-community/chatterbox-multilingual-ONNX` (MIT), pinned to revision
 `452d3f434aa592098f1eedac9099f33642ab2da5` — the tokenizer and the graphs

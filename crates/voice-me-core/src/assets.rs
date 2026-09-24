@@ -208,8 +208,8 @@ pub const PIPER_CONFIG_FILE: &str = "config.json";
 /// directory. Written last, so a voice with one is a complete install.
 pub const PIPER_MANIFEST_FILE: &str = "voice.toml";
 
-/// The Piper voice a Linux profile starts with (Story 3.15): its key and
-/// its locale.
+/// The Piper voice a Linux or Windows profile starts with (Stories 3.15,
+/// 3.16): its key and its locale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PiperDefaultVoice {
     pub key: &'static str,
@@ -225,6 +225,31 @@ pub const PIPER_DEFAULT_VOICE: PiperDefaultVoice = PiperDefaultVoice {
 /// `<root>/piper`.
 pub fn piper_dir(root: &Path) -> PathBuf {
     root.join(PIPER_DIR)
+}
+
+/// Where an eSpeak NG unpacked by `voice-me-deps` lives inside the cache
+/// root on Windows (Story 3.16): the MSI's administrative image, so the
+/// program sits at `<root>/espeak-ng/eSpeak NG/espeak-ng.exe`.
+pub const ESPEAK_DIR: &str = "espeak-ng";
+
+/// `<root>/espeak-ng`.
+pub fn espeak_dir(root: &Path) -> PathBuf {
+    root.join(ESPEAK_DIR)
+}
+
+/// The directory eSpeak NG's MSI installs into, under Program Files — and,
+/// in an administrative image, under its target directory.
+pub const ESPEAK_WINDOWS_INSTALL_DIR: &str = "eSpeak NG";
+
+/// The program's file name on Windows.
+pub const ESPEAK_WINDOWS_PROGRAM: &str = "espeak-ng.exe";
+
+/// Where the program sits in an eSpeak NG unpacked into `espeak_dir` (the
+/// MSI's administrative image): `<espeak_dir>/eSpeak NG/espeak-ng.exe`.
+pub fn espeak_program(espeak_dir: &Path) -> PathBuf {
+    espeak_dir
+        .join(ESPEAK_WINDOWS_INSTALL_DIR)
+        .join(ESPEAK_WINDOWS_PROGRAM)
 }
 
 /// Whether `key` can name a voice directory: letters, digits, `_`, `-` and
@@ -357,6 +382,18 @@ pub fn installed_piper_stock_voices(root: &Path) -> Vec<StockVoice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn espeak_ng_is_unpacked_next_to_the_piper_voices() {
+        assert_eq!(
+            espeak_dir(Path::new("/cache")),
+            PathBuf::from("/cache/espeak-ng")
+        );
+        assert_eq!(
+            espeak_program(Path::new("/cache/espeak-ng")),
+            PathBuf::from("/cache/espeak-ng/eSpeak NG/espeak-ng.exe")
+        );
+    }
 
     #[test]
     fn the_tokenizer_sits_at_the_cache_root_not_under_onnx() {
