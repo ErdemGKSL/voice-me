@@ -1,13 +1,14 @@
 name: Development release
 
-# Every push builds voice-me for Linux and Windows and publishes the result
-# as a GitHub pre-release. Each branch has one rolling development release,
-# tagged `dev-<branch>`: a new push replaces it (tag, notes and assets), so
-# the Releases page holds one current build per branch, not one per commit.
+# Every push to main builds voice-me for Linux and Windows and publishes the
+# result as a GitHub pre-release, tagged `dev-main`: a new push replaces it
+# (tag, notes and assets), so the Releases page holds one current build, not
+# one per commit. Pushes to other branches build nothing; a run can still be
+# started by hand (workflow_dispatch), which publishes as `dev-<branch>`.
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   workflow_dispatch:
 
 permissions:

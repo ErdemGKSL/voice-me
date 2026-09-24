@@ -59,9 +59,11 @@ use crate::sources::{PlannedDownload, Sources};
 pub struct DepsAdapter {
     sources: Arc<Sources>,
     in_flight: Arc<Mutex<HashSet<DependencyKind>>>,
-    /// What Install on the Virtual Microphone row runs. The audio crate's
-    /// own `install()` in the app; injectable so the row's provisioning
-    /// path is testable without an audio server.
+    /// What Install on the Virtual Microphone row runs: the Linux audio
+    /// crate's own `install()`, or on Windows VB-CABLE's setup from the
+    /// unpacked driver pack (Story 2.8). Injectable so the row's
+    /// provisioning path is testable without an audio server or a UAC
+    /// prompt.
     virtual_mic_installer: Arc<VirtualMicInstaller>,
     /// What the capability row asks the hardware (Story 3.3). The real
     /// driver and Vulkan probes in the app; injectable so every capability
@@ -79,7 +81,11 @@ pub struct DepsAdapter {
     espeak_unpacker: Arc<EspeakUnpacker>,
 }
 
-type VirtualMicInstaller = dyn Fn() -> Result<(), VoiceMeError> + Send + Sync;
+/// Install on the Virtual Microphone row. Given the directory the driver
+/// pack was unpacked into when one was downloaded (Windows: VB-CABLE's
+/// pack, Story 2.8); `None` when the row downloads nothing (Linux, which
+/// ignores it).
+type VirtualMicInstaller = dyn Fn(Option<&Path>) -> Result<(), VoiceMeError> + Send + Sync;
 
 /// What Install on the Windows eSpeak NG row runs once the MSI is verified
 /// (Story 3.16): unpack `msi` into `target`, a directory that does not
@@ -189,7 +195,7 @@ impl DepsAdapter {
     /// Replace what Install on the Virtual Microphone row runs.
     pub fn with_virtual_mic_installer(
         mut self,
-        installer: impl Fn() -> Result<(), VoiceMeError> + Send + Sync + 'static,
+        installer: impl Fn(Option<&Path>) -> Result<(), VoiceMeError> + Send + Sync + 'static,
     ) -> Self {
         self.virtual_mic_installer = Arc::new(installer);
         self
@@ -209,16 +215,7 @@ impl DepsAdapter {
                 fetch(kind, &plan, events)
             }
             DependencyKind::OnnxRuntime => self.provision_runtime(backend, events),
-            DependencyKind::VirtualMicrophone => {
-                // No bytes to count; the row says "installing" with no
-                // figure until it finishes.
-                let _ = events.unbounded_send(AppEvent::ProvisioningProgress {
-                    kind,
-                    done_bytes: 0,
-                    total_bytes: 0,
-                });
-                (self.virtual_mic_installer)()
-            }
+            DependencyKind::VirtualMicrophone => self.provision_virtual_mic(events),
             DependencyKind::PiperVoice => self.provision_piper_voice(request, events),
             // Story 3.16: where eSpeak NG has a pinned download (Windows
             // x64), Install unpacks the official MSI into the cache.
@@ -319,6 +316,61 @@ impl DepsAdapter {
         Ok(())
     }
 
+    /// Install on the Virtual Microphone row.
+    ///
+    /// With no driver pack to fetch (Linux) the installer runs straight
+    /// away. On Windows (Story 2.8) VB-CABLE's pinned pack is downloaded
+    /// with progress and verified like every download, unpacked into
+    /// `<cache>/vb-cable/<pack>/`, the zip deleted, and then VB's own setup
+    /// runs behind Windows' administrator prompt. A setup that finished
+    /// leaves a marker, so the row can tell "not installed" from "installed,
+    /// waiting for a restart".
+    fn provision_virtual_mic(&self, events: &AppEventSender) -> Result<(), VoiceMeError> {
+        let kind = DependencyKind::VirtualMicrophone;
+        // No bytes to count while the installer runs; the row says
+        // "installing" with no figure until it finishes.
+        let installing = || {
+            let _ = events.unbounded_send(AppEvent::ProvisioningProgress {
+                kind,
+                done_bytes: 0,
+                total_bytes: 0,
+            });
+        };
+        let Some(pack) = self.sources.virtual_mic.as_ref() else {
+            installing();
+            return (self.virtual_mic_installer)(None);
+        };
+
+        let root = assets::model_cache_root()?;
+        let archive = pack.destination(&root);
+        // A verified pack kept by a run whose extraction or setup failed
+        // is not fetched again.
+        if !archive.exists() {
+            let plan = [PlannedDownload {
+                asset: pack.clone(),
+                destination: archive.clone(),
+            }];
+            fetch(kind, &plan, events)?;
+        }
+        let unpacked = archive.with_extension("");
+        provision::extract_zip_into_dir(&archive, &unpacked)?;
+        // A marker from an earlier attempt says nothing about this one.
+        let marker = unpacked.parent().map(|dir| dir.join(VB_CABLE_SETUP_RAN));
+        if let Some(marker) = &marker {
+            let _ = std::fs::remove_file(marker);
+        }
+
+        installing();
+        (self.virtual_mic_installer)(Some(unpacked.as_path()))?;
+        // Our own download, kept until the setup succeeded so a retry
+        // after a declined prompt re-extracts it instead of fetching.
+        let _ = std::fs::remove_file(&archive);
+        if let Some(marker) = &marker {
+            let _ = std::fs::write(marker, b"");
+        }
+        Ok(())
+    }
+
     /// Decision 1: the runtime installs automatically on Linux x64 and
     /// Windows x64 only, and only into the cache — never over a path
     /// `ORT_DYLIB_PATH` names.
@@ -409,7 +461,7 @@ impl DependencyProvisioningPort for DepsAdapter {
             capability
                 .into_iter()
                 .chain(engine_rows)
-                .chain(virtual_microphone_row())
+                .chain(virtual_microphone_row(&root))
                 .collect(),
         );
 
@@ -890,15 +942,18 @@ fn weights_label(weights: SpeechWeights) -> &'static str {
 const RUNTIME_LABEL: &str = "ONNX Runtime";
 const VIRTUAL_MIC_LABEL: &str = "Virtual Microphone";
 
-/// The Virtual Microphone row — Linux only (Decision 1).
+/// Left beside the unpacked VB-CABLE pack once VB's setup has run and
+/// returned successfully (Story 2.8).
+const VB_CABLE_SETUP_RAN: &str = "setup-ran";
+
+/// The Virtual Microphone row on Linux (Decision 1).
 ///
 /// The status is *asked of* `voice-me-audio-linux` rather than detected
 /// again here: that crate already owns every line of PipeWire knowledge in
 /// this workspace, and a second copy of it would be a second thing to be
-/// wrong. Windows gets no row at all until Story 2.8 gives the Windows
-/// driver a control surface worth reporting on.
+/// wrong.
 #[cfg(target_os = "linux")]
-fn virtual_microphone_row() -> Option<Dependency> {
+fn virtual_microphone_row(_root: &Path) -> Option<Dependency> {
     let row = match voice_me_audio_linux::virtual_microphone_available() {
         Ok(true) => Dependency::ready(
             DependencyKind::VirtualMicrophone,
@@ -933,9 +988,67 @@ fn virtual_microphone_row() -> Option<Dependency> {
     Some(row)
 }
 
-#[cfg(not(target_os = "linux"))]
-fn virtual_microphone_row() -> Option<Dependency> {
+/// The Virtual Microphone row on Windows (Story 2.8): whether VB-CABLE's
+/// "CABLE Input" is present, asked of `voice-me-audio-windows` — the crate
+/// that plays to it — rather than detected again here.
+#[cfg(target_os = "windows")]
+fn virtual_microphone_row(root: &Path) -> Option<Dependency> {
+    let marker = root.join(sources::VB_CABLE_DIR).join(VB_CABLE_SETUP_RAN);
+    let available = voice_me_audio_windows::virtual_microphone_available();
+    // Once the cable is found, the restart hint has done its job: a later
+    // uninstall must read as "not installed", not "restart".
+    if matches!(available, Ok(true)) {
+        let _ = std::fs::remove_file(&marker);
+    }
+    Some(vb_cable_row(available, marker.exists()))
+}
+
+/// Neither Linux nor Windows: no Virtual Microphone voice-me can install.
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn virtual_microphone_row(_root: &Path) -> Option<Dependency> {
     None
+}
+
+/// VB-CABLE's credit, as its licence asks: it is VB-Audio's donationware.
+const VB_CABLE_CREDIT: &str = "VB-CABLE is VB-Audio's donationware (www.vb-cable.com).";
+
+/// The Windows row from what was found: whether "CABLE Input" is present
+/// (or why Windows could not be asked), and whether VB's setup has already
+/// run from this cache. Pure, so every state is tested on any OS.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn vb_cable_row(available: Result<bool, VoiceMeError>, setup_ran: bool) -> Dependency {
+    match available {
+        Ok(true) => Dependency::ready(
+            DependencyKind::VirtualMicrophone,
+            VIRTUAL_MIC_LABEL,
+            "Other applications can select CABLE Output as their microphone.",
+        ),
+        // Setup finished but the driver is not running yet: Windows starts
+        // a new audio driver only after a restart.
+        Ok(false) if setup_ran => Dependency::missing(
+            DependencyKind::VirtualMicrophone,
+            VIRTUAL_MIC_LABEL,
+            format!(
+                "VB-CABLE's setup has run, but Windows has not started the device yet. Restart \
+                 Windows, then press Check again. {VB_CABLE_CREDIT}"
+            ),
+        ),
+        Ok(false) => Dependency::missing(
+            DependencyKind::VirtualMicrophone,
+            VIRTUAL_MIC_LABEL,
+            format!(
+                "VB-CABLE is not installed. Install downloads it from VB-Audio and runs its setup, \
+                 which Windows asks you to allow; voice chat then selects CABLE Output as its \
+                 microphone. Or download VB-CABLE yourself from www.vb-cable.com and run \
+                 VBCABLE_Setup_x64.exe as administrator. {VB_CABLE_CREDIT}"
+            ),
+        ),
+        Err(error) => Dependency::missing(
+            DependencyKind::VirtualMicrophone,
+            VIRTUAL_MIC_LABEL,
+            format!("Could not list Windows' playback devices: {error}. {VB_CABLE_CREDIT}"),
+        ),
+    }
 }
 
 /// The System voice's engine row (Story 3.12): whether `espeak-ng` is on
@@ -997,9 +1110,10 @@ fn edge_tts_rows() -> Vec<Dependency> {
 }
 
 /// Install reuses the audio crate's own idempotent `install()`: it ends
-/// with exactly one device, whatever it started with.
+/// with exactly one device, whatever it started with. Nothing is
+/// downloaded on Linux, so there is no unpacked directory to use.
 #[cfg(target_os = "linux")]
-fn install_virtual_microphone() -> Result<(), VoiceMeError> {
+fn install_virtual_microphone(_unpacked: Option<&Path>) -> Result<(), VoiceMeError> {
     voice_me_audio_linux::LinuxVirtualMicAdapter::new()
         .and_then(|adapter| adapter.install())
         .map(|_| ())
@@ -1008,8 +1122,21 @@ fn install_virtual_microphone() -> Result<(), VoiceMeError> {
         })
 }
 
-#[cfg(not(target_os = "linux"))]
-fn install_virtual_microphone() -> Result<(), VoiceMeError> {
+/// Story 2.8: run VB-CABLE's own 64-bit setup from the unpacked pack,
+/// behind Windows' administrator prompt. Never silent — the user confirms
+/// the prompt and VB's installer both.
+#[cfg(target_os = "windows")]
+fn install_virtual_microphone(unpacked: Option<&Path>) -> Result<(), VoiceMeError> {
+    let unpacked = unpacked.ok_or_else(|| {
+        VoiceMeError::Other("VB-CABLE's driver pack was not downloaded.".to_string())
+    })?;
+    voice_me_audio_windows::run_installer_elevated(
+        &unpacked.join(voice_me_audio_windows::SETUP_PROGRAM),
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn install_virtual_microphone(_unpacked: Option<&Path>) -> Result<(), VoiceMeError> {
     Err(VoiceMeError::Other(
         "voice-me cannot install a Virtual Microphone on this system yet.".to_string(),
     ))
@@ -1332,14 +1459,110 @@ mod tests {
         );
     }
 
-    /// Decision 1's other half: Windows gets no Virtual Microphone row at
-    /// all until Story 2.8 gives the driver a control surface worth
-    /// reporting on. Runs on the Windows CI job; on Linux the row above is
-    /// what is exercised instead.
+    /// Story 2.8, matrix row "Row, installed".
     #[test]
-    #[cfg(not(target_os = "linux"))]
-    fn no_virtual_microphone_row_is_reported_off_linux() {
-        assert!(virtual_microphone_row().is_none());
+    fn a_present_cable_is_ready_and_names_cable_output() {
+        let row = vb_cable_row(Ok(true), false);
+        assert_eq!(row.status, DependencyStatus::Ready);
+        assert_eq!(
+            row.detail,
+            "Other applications can select CABLE Output as their microphone."
+        );
+    }
+
+    /// Story 2.8, matrix row "Row, missing": Install (automatable, no
+    /// manual steps) and VB-CABLE's credit.
+    #[test]
+    fn a_missing_cable_offers_install_and_credits_vb_cable() {
+        let row = vb_cable_row(Ok(false), false);
+        assert_eq!(row.status, DependencyStatus::Missing);
+        assert!(row.automatable, "Install, not manual steps");
+        assert!(row.manual_steps.is_empty());
+        assert!(row.detail.contains("donationware"), "{}", row.detail);
+        assert!(row.detail.contains("www.vb-cable.com"), "{}", row.detail);
+        assert!(!row.detail.contains("Restart"), "{}", row.detail);
+        assert!(
+            row.detail.contains(
+                "Or download VB-CABLE yourself from www.vb-cable.com and run \
+                 VBCABLE_Setup_x64.exe as administrator."
+            ),
+            "{}",
+            row.detail
+        );
+    }
+
+    /// Story 2.8, matrix row "Installed, not yet active".
+    #[test]
+    fn a_cable_installed_but_not_yet_active_asks_for_a_restart() {
+        let row = vb_cable_row(Ok(false), true);
+        assert_eq!(row.status, DependencyStatus::Missing);
+        assert!(
+            row.detail
+                .contains("Restart Windows, then press Check again"),
+            "{}",
+            row.detail
+        );
+    }
+
+    #[test]
+    fn a_device_list_that_failed_is_a_missing_row_with_the_reason() {
+        let row = vb_cable_row(
+            Err(VoiceMeError::VirtualMicUnavailable(
+                "no audio service".to_string(),
+            )),
+            false,
+        );
+        assert_eq!(row.status, DependencyStatus::Missing);
+        assert!(row.detail.contains("no audio service"), "{}", row.detail);
+    }
+
+    /// The Windows row is reported on Windows: present or missing, never
+    /// absent. Runs on the Windows CI job.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_reports_a_virtual_microphone_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = virtual_microphone_row(dir.path()).expect("a row on Windows");
+        assert_eq!(row.kind, DependencyKind::VirtualMicrophone);
+    }
+
+    /// The marker `provision_virtual_mic` writes (`<cache>/vb-cable/
+    /// setup-ran`) is the one the row reads. Skipped when this machine
+    /// already has the cable, since the row is then Ready.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn the_setup_ran_marker_is_read_where_install_writes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let unpacked = crate::sources::vb_cable_pack()
+            .destination(dir.path())
+            .with_extension("");
+        let marker = unpacked.parent().unwrap().join(VB_CABLE_SETUP_RAN);
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"").unwrap();
+        assert_eq!(
+            marker,
+            dir.path().join("vb-cable").join("setup-ran"),
+            "the writer's path"
+        );
+
+        let row = virtual_microphone_row(dir.path()).expect("a row on Windows");
+        if row.status != DependencyStatus::Ready {
+            assert!(row.detail.contains("Restart Windows"), "{}", row.detail);
+        }
+    }
+
+    /// The real Windows installer hook refuses a directory with no setup in
+    /// it before PowerShell is ever started.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn the_windows_installer_needs_the_unpacked_setup() {
+        let empty = tempfile::tempdir().unwrap();
+        let message = install_virtual_microphone(Some(empty.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("VBCABLE_Setup_x64.exe"), "{message}");
+
+        assert!(install_virtual_microphone(None).is_err());
     }
 
     #[test]

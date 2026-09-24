@@ -1,9 +1,9 @@
 name: CI
 
+# Only pushes to main build; other branches and pull requests do not.
 on:
   push:
     branches: [main]
-  pull_request:
 
 jobs:
   build-ubuntu:

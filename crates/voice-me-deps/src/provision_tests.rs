@@ -274,6 +274,7 @@ impl Fixture {
                 model_files,
                 runtime,
                 espeak: None,
+                virtual_mic: None,
             },
             cache,
             env,
@@ -854,7 +855,13 @@ fn installing_the_virtual_microphone_runs_the_installer_and_reports_its_end() {
 
     let calls = Arc::new(AtomicUsize::new(0));
     let counted = calls.clone();
-    let adapter = DepsAdapter::new().with_virtual_mic_installer(move || {
+    // No driver pack to fetch: the Linux shape, on every OS.
+    let no_pack = || Sources {
+        virtual_mic: None,
+        ..Sources::pinned()
+    };
+    let adapter = DepsAdapter::with_sources(no_pack()).with_virtual_mic_installer(move |dir| {
+        assert_eq!(dir, None, "nothing was unpacked");
         counted.fetch_add(1, Ordering::SeqCst);
         Ok(())
     });
@@ -884,7 +891,7 @@ fn installing_the_virtual_microphone_runs_the_installer_and_reports_its_end() {
         }
     );
 
-    let failing = DepsAdapter::new().with_virtual_mic_installer(|| {
+    let failing = DepsAdapter::with_sources(no_pack()).with_virtual_mic_installer(|_| {
         Err(voice_me_core::VoiceMeError::Other(
             "Could not install the Virtual Microphone: connection refused".to_string(),
         ))
@@ -909,6 +916,273 @@ fn installing_the_virtual_microphone_runs_the_installer_and_reports_its_end() {
         }
         other => panic!("expected a failed finish, got {other:?}"),
     }
+}
+
+/// Where the fake VB-CABLE pack is served from and lands, relative to the
+/// cache root — the real pin's path.
+const VB_PACK: &str = "vb-cable/VBCABLE_Driver_Pack45.zip";
+
+/// A small `.zip` shaped like VB's driver pack: the 64-bit setup the
+/// installer runs, decoys beside it (the 32-bit setup, the driver files it
+/// needs) and a directory entry.
+fn fake_vb_cable_pack() -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let add_file = |writer: &mut zip::ZipWriter<_>, path: &str, bytes: &[u8]| {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    };
+    add_file(
+        &mut writer,
+        "VBCABLE_Setup_x64.exe",
+        b"MZ pretend 64-bit setup",
+    );
+    add_file(&mut writer, "VBCABLE_Setup.exe", b"MZ pretend 32-bit setup");
+    add_file(&mut writer, "vbMmeCable64_win10.sys", b"driver");
+    writer.add_directory("win10/", options).unwrap();
+    add_file(&mut writer, "win10/vbMmeCable64_win10.inf", b"[Version]");
+    writer.finish().unwrap().into_inner()
+}
+
+impl Fixture {
+    /// A fixture whose source table pins `served` as the VB-CABLE pack,
+    /// checked against `pinned` (the same bytes, unless a test wants a
+    /// mismatch).
+    fn with_vb_cable_pack(served: Vec<u8>, pinned: &[u8]) -> Self {
+        let mut fixture = Self::with_extra_files(vec![(VB_PACK.to_string(), served)], None);
+        fixture.sources.virtual_mic = Some(Asset {
+            relative_path: VB_PACK.to_string(),
+            url: format!("{}/{VB_PACK}", fixture.server.base),
+            size: pinned.len() as u64,
+            digest: crate::sources::Digest::Sha256(sha256(pinned)),
+        });
+        fixture
+    }
+
+    fn vb_pack(&self) -> PathBuf {
+        self.root()
+            .join("vb-cable")
+            .join("VBCABLE_Driver_Pack45.zip")
+    }
+
+    fn vb_unpacked(&self) -> PathBuf {
+        self.root().join("vb-cable").join("VBCABLE_Driver_Pack45")
+    }
+
+    /// Install on the Virtual Microphone row with a fake installer that
+    /// records the directory it was handed and answers `answer`.
+    fn install_vb_cable(
+        &self,
+        answer: Result<(), String>,
+    ) -> (Result<(), String>, Vec<AppEvent>, Vec<Option<PathBuf>>) {
+        let calls: Arc<Mutex<Vec<Option<PathBuf>>>> = Arc::default();
+        let recorded = calls.clone();
+        let adapter = self.adapter().with_virtual_mic_installer(move |dir| {
+            let setup_there = dir.is_some_and(|dir| dir.join("VBCABLE_Setup_x64.exe").is_file());
+            recorded.lock().unwrap().push(dir.map(Path::to_path_buf));
+            assert!(setup_there, "the setup is unpacked before it is run");
+            answer.clone().map_err(voice_me_core::VoiceMeError::Other)
+        });
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let result = adapter
+            .provision(
+                DependencyKind::VirtualMicrophone,
+                voice_me_core::CheckRequest::cpu(),
+                tx,
+            )
+            .map_err(|error| error.to_string());
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        let calls = calls.lock().unwrap().clone();
+        (result, events, calls)
+    }
+}
+
+/// Story 2.8, matrix row "Install": download with progress → verify →
+/// extract → the installer runs with the unpacked pack → the zip is gone.
+#[test]
+fn installing_vb_cable_downloads_unpacks_and_runs_its_setup() {
+    let pack = fake_vb_cable_pack();
+    let fixture = Fixture::with_vb_cable_pack(pack.clone(), &pack);
+
+    let (result, events, calls) = fixture.install_vb_cable(Ok(()));
+
+    assert_eq!(result, Ok(()));
+    assert_eq!(calls, vec![Some(fixture.vb_unpacked())]);
+    assert_eq!(
+        std::fs::read(fixture.vb_unpacked().join("VBCABLE_Setup_x64.exe")).unwrap(),
+        b"MZ pretend 64-bit setup"
+    );
+    assert_eq!(
+        std::fs::read(
+            fixture
+                .vb_unpacked()
+                .join("win10")
+                .join("vbMmeCable64_win10.inf")
+        )
+        .unwrap(),
+        b"[Version]"
+    );
+    assert!(
+        !fixture.vb_pack().exists(),
+        "the zip is deleted once unpacked"
+    );
+    assert!(
+        walk(fixture.root())
+            .iter()
+            .all(|path| path.extension().is_none_or(|ext| ext != "part")),
+        "no .part left behind"
+    );
+    assert!(
+        fixture.root().join("vb-cable").join("setup-ran").exists(),
+        "a finished setup is remembered for the restart hint"
+    );
+
+    let size = pack.len() as u64;
+    let figures = progress(&events);
+    assert_eq!(figures.first(), Some(&(0, size)), "{figures:?}");
+    assert!(figures.contains(&(size, size)), "{figures:?}");
+    assert_eq!(
+        figures.last(),
+        Some(&(0, 0)),
+        "then \"installing\" while VB's setup runs"
+    );
+    assert_eq!(finished(&events), vec![Ok(())]);
+}
+
+/// Matrix row "Admin prompt declined": the installer's refusal is the row's
+/// error, and no "setup ran" marker is left.
+#[test]
+fn a_declined_admin_prompt_is_the_rows_error() {
+    let pack = fake_vb_cable_pack();
+    let fixture = Fixture::with_vb_cable_pack(pack.clone(), &pack);
+
+    let (result, events, calls) = fixture.install_vb_cable(Err(
+        "Windows did not allow the installer to run.".to_string(),
+    ));
+
+    assert_eq!(
+        result,
+        Err("Windows did not allow the installer to run.".to_string())
+    );
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        finished(&events),
+        vec![Err(
+            "Windows did not allow the installer to run.".to_string()
+        )]
+    );
+    assert!(!fixture.root().join("vb-cable").join("setup-ran").exists());
+    assert!(
+        fixture.vb_pack().exists(),
+        "the verified pack is kept for a retry"
+    );
+}
+
+/// A retry after a failed setup re-extracts the kept pack instead of
+/// downloading it again, and only a setup that succeeded deletes the pack
+/// and leaves the marker.
+#[test]
+fn a_retry_after_a_failed_setup_does_not_download_again() {
+    let pack = fake_vb_cable_pack();
+    let fixture = Fixture::with_vb_cable_pack(pack.clone(), &pack);
+
+    let (result, _, _) = fixture.install_vb_cable(Err(
+        "VB-CABLE's setup did not finish (exit code 1).".to_string(),
+    ));
+    assert!(result.is_err());
+    assert!(fixture.vb_pack().exists(), "kept after the failure");
+    assert!(!fixture.root().join("vb-cable").join("setup-ran").exists());
+    let fetched = requests_for(&fixture, VB_PACK).len();
+    assert!(fetched >= 1, "the first attempt downloaded the pack");
+
+    let (result, events, calls) = fixture.install_vb_cable(Ok(()));
+    assert_eq!(result, Ok(()));
+    assert_eq!(calls, vec![Some(fixture.vb_unpacked())]);
+    assert_eq!(
+        requests_for(&fixture, VB_PACK).len(),
+        fetched,
+        "the retry fetched nothing"
+    );
+    assert!(progress(&events).iter().all(|figure| *figure == (0, 0)));
+    assert!(
+        !fixture.vb_pack().exists(),
+        "deleted once the setup succeeded"
+    );
+    assert!(fixture.root().join("vb-cable").join("setup-ran").exists());
+}
+
+/// A marker left by an earlier successful setup does not survive a new
+/// attempt that fails.
+#[test]
+fn a_failed_setup_clears_an_earlier_marker() {
+    let pack = fake_vb_cable_pack();
+    let fixture = Fixture::with_vb_cable_pack(pack.clone(), &pack);
+    let marker = fixture.root().join("vb-cable").join("setup-ran");
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, b"").unwrap();
+
+    let (result, _, _) = fixture.install_vb_cable(Err(
+        "Windows did not allow the installer to run.".to_string(),
+    ));
+
+    assert!(result.is_err());
+    assert!(!marker.exists());
+}
+
+/// Matrix row "Install", hash mismatch: nothing keeps the pack's name, no
+/// `.part` is left, nothing is unpacked and no installer runs.
+#[test]
+fn a_vb_cable_pack_that_fails_its_checksum_keeps_no_pack() {
+    let pack = fake_vb_cable_pack();
+    // Pinned: bytes of the same size that differ in one place.
+    let mut expected = pack.clone();
+    expected[0] ^= 0xff;
+    let fixture = Fixture::with_vb_cable_pack(pack, &expected);
+
+    let (result, events, calls) = fixture.install_vb_cable(Ok(()));
+
+    let message = result.expect_err("a mismatched pack is refused");
+    assert!(
+        message.contains("VBCABLE_Driver_Pack45.zip did not match its expected checksum"),
+        "{message}"
+    );
+    assert!(calls.is_empty(), "no installer runs");
+    assert!(!fixture.vb_pack().exists());
+    assert!(!part_path(&fixture.vb_pack()).exists());
+    assert!(!fixture.vb_unpacked().exists());
+    assert_eq!(finished(&events).len(), 1);
+}
+
+/// Zip entries are extracted only by their enclosed names: a pack holding
+/// `../` is refused whole, before anything is written.
+#[test]
+fn a_vb_cable_pack_with_an_escaping_entry_is_refused() {
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    writer.start_file("VBCABLE_Setup_x64.exe", options).unwrap();
+    writer.write_all(b"MZ setup").unwrap();
+    writer.start_file("../escaped.txt", options).unwrap();
+    writer.write_all(b"outside").unwrap();
+    let pack = writer.finish().unwrap().into_inner();
+    let fixture = Fixture::with_vb_cable_pack(pack.clone(), &pack);
+
+    let (result, _, calls) = fixture.install_vb_cable(Ok(()));
+
+    let message = result.expect_err("an escaping entry is refused");
+    assert!(message.contains("unsafe name"), "{message}");
+    assert!(message.contains("../escaped.txt"), "{message}");
+    assert!(calls.is_empty(), "no installer runs");
+    assert!(!fixture.root().join("vb-cable").join("escaped.txt").exists());
+    assert!(!fixture.root().join("escaped.txt").exists());
+    assert!(
+        !fixture.vb_unpacked().join("VBCABLE_Setup_x64.exe").exists(),
+        "nothing is written from a refused archive"
+    );
 }
 
 fn speech_encoder_data(fixture: &Fixture) -> PathBuf {

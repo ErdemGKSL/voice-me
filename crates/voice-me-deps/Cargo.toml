@@ -62,6 +62,10 @@ voice-me-tts-edge = { path = "../voice-me-tts-edge" }
 # Story 3.16: where `espeak-ng.exe` is, asked of the crate that runs it, and
 # the one bounded runner Install's `msiexec /a` goes through (AD-12).
 voice-me-espeak = { path = "../voice-me-espeak" }
+# Story 2.8: whether VB-CABLE's "CABLE Input" is present, and the elevated
+# launch of VB's own setup, are *asked of* the crate that plays to it —
+# the same rule as the Linux audio crate above.
+voice-me-audio-windows = { path = "../voice-me-audio-windows" }
 
 [dev-dependencies]
 tempfile = "3.14"

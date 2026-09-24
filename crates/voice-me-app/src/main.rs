@@ -37,9 +37,11 @@
 //!
 //! Story 2.9 closes the loop: the per-OS `VirtualMicPort` adapter is built
 //! here and handed to `speak`, which plays the generated buffer through the
-//! Virtual Microphone instead of dropping it. The device itself is ensured
-//! once at startup, in the background, so a fresh machine needs no manual
-//! setup step (spec-2-9 Decision 1).
+//! Virtual Microphone instead of dropping it. On Linux the device itself is
+//! ensured once at startup, in the background, so a fresh machine needs no
+//! manual setup step (spec-2-9 Decision 1). On Windows (Story 2.8) the
+//! Virtual Microphone is VB-CABLE, which needs the user's administrator
+//! consent to install, so it is installed only from its Dependencies row.
 //!
 //! Story 3.3 makes the backend a choice. The selection is persisted through
 //! `SettingsStore` and resolved here into the AD-9 backend on every read;
@@ -950,7 +952,8 @@ fn notify_engine_unavailable(notifications: &dyn NotificationPort, reason: Optio
 /// its original reason, and travels the one path that is already tested.
 ///
 /// Linux-only because it is the only OS whose adapter has a fallible
-/// constructor; `WindowsVirtualMicAdapter` says the same thing itself.
+/// constructor; `WindowsVirtualMicAdapter` reports a missing cable from
+/// `play` itself.
 #[cfg(target_os = "linux")]
 struct UnavailableVirtualMic(String);
 
@@ -2535,11 +2538,13 @@ fn main() {
                 (Arc::new(UnavailableVirtualMic(error.to_string())), None)
             }
         };
-        // Story 2.8 implements this; until then `play` returns a domain
-        // error naming itself rather than panicking on the first Speak
-        // Action (spec-2-9 Decision 2).
+        // Story 2.8: VB-CABLE. Each utterance plays to its "CABLE Input",
+        // and voice chat selects "CABLE Output" as its microphone. No
+        // startup ensure on Windows: installing the driver needs the user's
+        // administrator consent, so it happens only from Install on the
+        // Dependencies row; until then `play` reports the missing cable.
         #[cfg(target_os = "windows")]
-        let virtual_mic_port: Arc<dyn VirtualMicPort> = Arc::new(WindowsVirtualMicAdapter);
+        let virtual_mic_port: Arc<dyn VirtualMicPort> = Arc::new(WindowsVirtualMicAdapter::new());
 
         // Decision 1: the device is ensured at launch, off the main thread —
         // `cx.background_spawn` rather than the Tokio bridge, because this
