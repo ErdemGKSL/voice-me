@@ -44,6 +44,7 @@ voice-me lets you "speak" in your own cloned voice without speaking out loud. A 
 - **Sidecar Process** — the local background process that hosts the TTS Engine's Python/PyTorch runtime, managed and provisioned automatically by the main app (detailed in `addendum.md`). *(Superseded 2026-09-21: there is no Sidecar Process — the model runs in-process on ONNX Runtime. See `addendum.md` § Superseded and Architecture Spine AD-12.)*
 - **Dependency Check** — the app's on-demand scan for whatever the selected backend needs and this machine is missing (the ONNX Runtime distribution, execution-provider libraries, model weights, the Virtual Microphone driver; for a remote backend, a key and a reachable provider), surfaced in-app rather than as a setup wizard.
 - **Preset Phrase** — (v2+, not in v1) a fixed phrase bound directly to a hotkey, spoken with no Prompt Overlay shown at all.
+- **Edge TTS** — Microsoft's Edge "Read Aloud" neural voices, reached through the separately installed `edge-tts` program; free and keyless, but online and unofficial; a stock voice (added 2026-09-24).
 - **Piper** — an on-device neural text-to-speech voice (VITS, one ONNX file per voice) that voice-me runs on the CPU through its own ONNX Runtime; a stock voice, not the user's cloned one (added 2026-09-24).
 - **GPUI** — the underlying Rust GPU-accelerated UI framework (Zed Industries) the app's interface is built on.
 - **gpui-kit** — the component/design-system layer built on top of GPUI (`gpui_kit::component`, `gpui_kit::base`, `gpui_kit::assets`) that voice-me's UI is implemented with, rather than raw GPUI primitives.
@@ -94,7 +95,7 @@ Pressing the configured hotkey opens a minimal, borderless, always-on-top single
 - Escape or losing focus without pressing Enter discards the typed text and does not trigger playback.
 
 #### FR-5: Text-to-speech generation via the TTS Engine
-On a Speak Action, the typed text plus the selected backend's speech language are handed to the **selected speech backend** — a local ONNX backend running in-process, or a remote speech API (FR-10). A voice-cloning backend also receives the active Reference Voice Sample and produces audio in the user's cloned voice; a stock-voice backend — Piper (local neural voices), the local instant system voice (eSpeak NG on Linux, the Windows speech engine on Windows) or Azure Neural TTS — produces audio in the stock voice the user selected, and never receives the sample.
+On a Speak Action, the typed text plus the selected backend's speech language are handed to the **selected speech backend** — a local ONNX backend running in-process, or a remote speech API (FR-10). A voice-cloning backend also receives the active Reference Voice Sample and produces audio in the user's cloned voice; a stock-voice backend — Piper (local neural voices), the local instant system voice (eSpeak NG on Linux, the Windows speech engine on Windows), Azure Neural TTS or Edge TTS (Linux) — produces audio in the stock voice the user selected, and never receives the sample.
 
 **Consequences (testable):**
 - Generated audio is in the speech language the user selected **for the active backend** (independent of UI language), from that backend's own supported set; each backend remembers its own choice.
@@ -114,7 +115,7 @@ Generated audio plays out through the Virtual Microphone device rather than the 
 **Description:** Keeps the "single executable, no visible installer" promise honest without silently failing when something's missing.
 
 #### FR-7: In-app Dependency Check and guided/one-click setup
-On first run and on demand, the app checks for locally required components (the ONNX Runtime shared library, the execution-provider libraries the selected backend needs, the Chatterbox model weights, the selected Piper voice, the chosen Virtual Microphone driver) and, where feasible, offers a one-click action to install or provision what's missing, inside the app UI. There is no bundled Python runtime — inference runs in-process (Architecture AD-12).
+On first run and on demand, the app checks for locally required components (the ONNX Runtime shared library, the execution-provider libraries the selected backend needs, the Chatterbox model weights, the selected Piper voice, the `edge-tts` program when Edge TTS is selected (manual install), the chosen Virtual Microphone driver) and, where feasible, offers a one-click action to install or provision what's missing, inside the app UI. There is no bundled Python runtime — inference runs in-process (Architecture AD-12).
 
 **What gets checked depends on which backends this install has, and which one is selected.** v1 ships one artefact per OS carrying every local backend (Architecture AD-7, revised 2026-09-22). The Dependency Check is therefore **backend-aware**: each local backend declares its own required assets — its ONNX Runtime distribution, its execution-provider libraries, its language-model weights — and only the selected backend's missing assets block a Speak Action. A GPU backend additionally reports the candidate devices it can drive on this machine. The remote backend's readiness is not a file check at all: it is whether a key is present and the provider is reachable.
 
@@ -152,7 +153,7 @@ The UI is implemented using gpui-kit components (`gpui_kit::component`, `gpui_ki
 **Description:** Which engine generates the speech is the user's choice, local or remote. Added 2026-09-22 with PRD Open Question 7's resolution.
 
 #### FR-10: Backend selection and remote disclosure
-The user selects which speech backend generates their voice, from Settings → Backend: first Local or Remote, then the specific backend. Local backends run entirely on the machine: Chatterbox in the user's cloned voice (CPU, CUDA, WebGPU); Piper, natural neural stock voices on the CPU, each a single small voice download; and an instant system voice (eSpeak NG on Linux, the Windows speech engine on Windows) that needs no model download. Remote backends generate through a third-party API using a key the user supplies: voice-cloning providers (DeepInfra `ResembleAI/chatterbox-multilingual`, fal.ai) and one stock-voice provider (Azure Neural TTS, standard neural voices). Only the selected backend's options are shown, including its speech language and, for Azure, its region and voice.
+The user selects which speech backend generates their voice, from Settings → Backend: first Local or Remote, then the specific backend. Local backends run entirely on the machine: Chatterbox in the user's cloned voice (CPU, CUDA, WebGPU); Piper, natural neural stock voices on the CPU, each a single small voice download; and an instant system voice (eSpeak NG on Linux, the Windows speech engine on Windows) that needs no model download. Remote backends generate through a third-party API using a key the user supplies: voice-cloning providers (DeepInfra `ResembleAI/chatterbox-multilingual`, fal.ai) and stock-voice providers (Azure Neural TTS, standard neural voices; and Edge TTS, which needs no key and sends only the typed text, after the same one-time disclosure — Linux only, through the user-installed `edge-tts` program). Only the selected backend's options are shown, including its speech language and, for Azure, its region and voice.
 
 **Consequences (testable):**
 - A local backend is the default on first run — Piper, where this OS has it (Linux; Windows from Story 3.16), otherwise Chatterbox on the CPU; no network call is possible until the user selects a remote backend and enters a key. (Downloading the selected local voice or weights is dependency provisioning, FR-7, not generation.) Revised 2026-09-24.
@@ -183,6 +184,7 @@ The user selects which speech backend generates their voice, from Settings → B
 - A Settings → Backend tab with per-backend options and per-backend speech language (FR-5, FR-10)
 - An instant local system-voice backend: eSpeak NG on Linux, the Windows speech engine on Windows (FR-5, FR-10)
 - Piper on-device neural voices, CPU-only, the first-run default (FR-5, FR-7, FR-10) — added 2026-09-24 (`sprint-change-proposal-2026-09-24-piper.md`)
+- Edge TTS on Linux via the `edge-tts` program (FR-5, FR-7, FR-10) — added 2026-09-24 (`sprint-change-proposal-2026-09-24-edge-tts.md`)
 - Turkish/English UI (FR-8)
 - Modern, clean visual design built with gpui-kit components, per gpui-kit's Design Guides (FR-9)
 - Rust workspace structured as multiple crates (binary, lib(s), tests) — see `addendum.md` for the proposed breakdown
@@ -193,6 +195,7 @@ The user selects which speech backend generates their voice, from Settings → B
 - Stock-voice-only providers other than Azure Neural TTS, and Azure Personal Voice (it requires Microsoft's limited-access approval) — revised 2026-09-23, product-owner decision (`sprint-change-proposal-2026-09-23.md`)
 - A macOS system-voice backend — follows macOS support itself (deferred)
 - GPU acceleration for Piper — not needed at its speed
+- Edge TTS on Windows; installing `edge-tts` for the user; rate/pitch/volume controls
 - Training or importing custom Piper voices — only voices in voice-me's pinned voice table
 - A voice-me-hosted proxy, shared keys, or any billing relationship — the user brings their own provider account
 - Accounts, licensing, monetization

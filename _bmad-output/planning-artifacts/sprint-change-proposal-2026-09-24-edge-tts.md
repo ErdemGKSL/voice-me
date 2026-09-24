@@ -4,7 +4,7 @@
 **Author:** Developer (implementation plan), for Erdem (product owner)
 **Mode:** Batch
 **Builds on:** Story 3.12 (eSpeak NG, the child-process pattern), Story 3.14 (Azure, the stock-voice list and disclosure), `sprint-change-proposal-2026-09-24-piper.md` (the shared runner)
-**Status:** E4 (Remote + one-time disclosure) and the order (after 3.15 Piper) approved by Erdem, 2026-09-24. The PRD, architecture, epics and sprint-status edits in §5 are not applied yet.
+**Status:** E4 (Remote + one-time disclosure) and the order (after 3.15 Piper) approved by Erdem, 2026-09-24. §5 applied to the PRD, architecture spine, EXPERIENCE.md, epics.md and sprint-status.yaml on 2026-09-24.
 
 ---
 

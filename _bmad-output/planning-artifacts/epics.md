@@ -633,6 +633,23 @@ So that Windows gets the same natural, instant default as Linux.
 **And** the first-run default on Windows becomes Piper (AD-9)
 **And** the crates compile and their unit tests pass on CI's Windows job; manual verification waits until the Windows app can start (Story 2.8, tray)
 
+### Story 3.17: Speak With Edge TTS on Linux
+
+As Erdem,
+I want to pick Microsoft's free Edge voices through the edge-tts program,
+So that I get natural neural voices in many languages without an API key or a model download.
+
+**Acceptance Criteria:**
+
+**Given** Remote → Edge TTS is selectable in Settings → Backend on every OS, whether or not `edge-tts` is installed
+**When** it is selected on Linux and `edge-tts` is not on PATH or in ~/.local/bin
+**Then** a speech-blocking Dependencies row says "edge-tts is not installed. Please install it: pipx install edge-tts" with the distro's pipx command, and the overlay is blocked (Story 3.4)
+**And** with the program present and the disclosure confirmed, a Speak Action runs `edge-tts --voice=<id> -f - --write-media -` with the text on stdin (no shell, 30 s deadline), decodes the 24 kHz mono MP3 and plays it through the Virtual Microphone (AD-11, AD-12)
+**And** the speech languages and voices come from `edge-tts --list-voices` (default language tr-TR, default voice the language's first); an unlisted language or voice is refused by name
+**And** it is a stock voice: no Reference Voice Sample, no API key, the Stock voice tag
+**And** a failure (exit ≠ 0, timeout, no audio, program gone) is one notification naming Edge TTS and the reason
+**And** on non-Linux the selection's capability row says it isn't available on this OS yet
+
 ## Epic 4: Use It In Your Language
 
 The interface is available in Turkish and English, switchable instantly without a restart, independent of the TTS speech language.
