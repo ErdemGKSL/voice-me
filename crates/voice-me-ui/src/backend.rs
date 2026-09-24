@@ -6,7 +6,8 @@
 //! *saved* backend's options: the provider's masked key and held voice
 //! sample for a remote one, each below that backend's speech language
 //! (Story 3.11), and for the System voice a voice picker when its language
-//! has several voices (Story 3.12). Last come the *Selected* and *Active* lines,
+//! has several voices (Story 3.12). Azure (Story 3.14) adds its region, and
+//! a locale and voice picker fed from its live voice list. Last come the *Selected* and *Active* lines,
 //! kept as two separate facts, the "CPU mode" tag and the restart line.
 //!
 //! Flipping Local ↔ Remote only changes what the tab shows (Decision 1):
@@ -47,8 +48,8 @@ use gpui_kit::{
 };
 use voice_me_core::{
     ActiveBackend, ApiKeys, BackendSelection, CheckRequest, LanguageBackend, LocalRuntime,
-    RemoteProvider, RemoteSample, SpeechLanguages, SpeechVoices, SystemVoice, backend_choices,
-    system_voices_of,
+    RemoteProvider, RemoteSample, SpeechLanguages, SpeechVoices, StockVoice, backend_choices,
+    parse_azure_region, stock_voices_of,
 };
 
 /// Something the user asked of the backend. The views only *ask*; the
@@ -77,6 +78,9 @@ pub enum BackendAction {
     /// Save this backend's voice, or `None` for its language's top-priority
     /// one (Story 3.12).
     SetSpeechVoice(LanguageBackend, Option<String>),
+    /// Save (`Some`, already `[a-z0-9]+`) or remove (`None`) the Azure
+    /// region (Story 3.14).
+    SaveAzureRegion(Option<String>),
 }
 
 /// Written by hand so a key typed into a key field can never reach a log
@@ -109,6 +113,10 @@ impl std::fmt::Debug for BackendAction {
                 .field(backend)
                 .field(voice)
                 .finish(),
+            // Not a secret, but written out like the others.
+            BackendAction::SaveAzureRegion(region) => {
+                f.debug_tuple("SaveAzureRegion").field(region).finish()
+            }
         }
     }
 }
@@ -131,6 +139,8 @@ pub enum BackendArea {
     SpeechLanguage,
     /// The saved backend's voice (Story 3.12).
     SpeechVoice,
+    /// The Azure region (Story 3.14).
+    AzureRegion,
 }
 
 /// Everything the Backend and Dependencies tabs show about the backend, as
@@ -160,7 +170,24 @@ pub struct BackendPanel {
     pub speech_voices: SpeechVoices,
     /// The voices the System voice's engine listed at the last check that
     /// had it selected (Story 3.12). Not persisted; held by the root.
-    pub system_voices: Vec<SystemVoice>,
+    pub system_voices: Vec<StockVoice>,
+    /// The saved Azure region (Story 3.14).
+    pub azure_region: Option<String>,
+    /// Azure's voice list as the root last fetched it (Story 3.14). Not
+    /// persisted; cached by the root for the session.
+    pub azure_voices: Vec<StockVoice>,
+}
+
+impl BackendPanel {
+    /// The run-time voice list `backend`'s languages and voices come from:
+    /// the System voice's engine list, Azure's voice list, or nothing.
+    fn stock_voices(&self, backend: LanguageBackend) -> &[StockVoice] {
+        match backend {
+            LanguageBackend::SystemVoice => &self.system_voices,
+            LanguageBackend::Remote(RemoteProvider::Azure) => &self.azure_voices,
+            _ => &[],
+        }
+    }
 }
 
 impl Default for BackendPanel {
@@ -179,9 +206,18 @@ impl Default for BackendPanel {
             speech_languages: SpeechLanguages::default(),
             speech_voices: SpeechVoices::default(),
             system_voices: Vec::new(),
+            azure_region: None,
+            azure_voices: Vec::new(),
         }
     }
 }
+
+/// The line under Azure's options (Story 3.14): a stock voice, not the
+/// user's.
+pub const AZURE_STOCK_VOICE_NOTE: &str = "Speech will be in this Microsoft voice, not yours.";
+
+/// What the Backend tab says while Azure has no voice saved (D4).
+pub const AZURE_PICK_A_VOICE: &str = "Pick a voice for Azure";
 
 /// The plaintext notice shown beside a key field (Decision 4).
 pub const API_KEY_STORAGE_NOTICE: &str = "Keys are stored in plain text in voice-me's settings file, readable by anyone with access \
@@ -279,14 +315,11 @@ impl gpui_kit::component::searchable_list::SearchableListItem for LanguageChoice
     }
 }
 
-/// The speech languages `backend` lists, in its own order — for the System
-/// voice, the languages of the voices its engine listed.
-fn language_choices(
-    backend: LanguageBackend,
-    system_voices: &[SystemVoice],
-) -> Vec<LanguageChoice> {
+/// The speech languages `backend` lists, in its own order — for a backend
+/// with a voice list, the languages of the voices it listed.
+fn language_choices(backend: LanguageBackend, voices: &[StockVoice]) -> Vec<LanguageChoice> {
     backend
-        .language_options(system_voices)
+        .language_options(voices)
         .into_iter()
         .map(|language| LanguageChoice {
             code: language.code,
@@ -302,7 +335,7 @@ fn saved_language_code(panel: &BackendPanel, backend: LanguageBackend) -> Option
     panel
         .speech_languages
         .get(backend)
-        .and_then(|saved| backend.resolve_language(saved, &panel.system_voices))
+        .and_then(|saved| backend.resolve_language(saved, panel.stock_voices(backend)))
 }
 
 /// One entry of the voice `Select` (Story 3.12).
@@ -324,25 +357,28 @@ impl gpui_kit::component::searchable_list::SearchableListItem for VoiceChoice {
     }
 }
 
-/// What the voice picker shows for the saved System voice language: its
-/// voices, top priority first, and which one is in effect — the stored one
-/// if it is one of them, the top-priority one when none is stored, and
-/// `None` (the placeholder) for a stored voice that is not the language's.
-/// `None` altogether when the saved language is not one listed.
+/// What the voice picker shows for the saved backend's language, when that
+/// backend has a voice choice (the System voice, Azure): its voices, top
+/// priority first, and which one is in effect — the stored one if it is one
+/// of them, with none stored the top-priority one (the System voice) or
+/// none at all (Azure, D4), and `None` (the placeholder) for a stored voice
+/// that is not the language's. `None` altogether when the saved language is
+/// not one listed.
 struct VoicePick {
     choices: Vec<VoiceChoice>,
     selected: Option<String>,
 }
 
 fn voice_pick(panel: &BackendPanel) -> Option<VoicePick> {
-    let backend = LanguageBackend::SystemVoice;
-    if panel.selection.language_backend() != backend {
+    let backend = panel.selection.language_backend();
+    if !backend.has_voice_choice() {
         return None;
     }
     let code = saved_language_code(panel, backend)?;
-    let voices = system_voices_of(&panel.system_voices, &code);
+    let voices = stock_voices_of(panel.stock_voices(backend), &code);
     let stored = panel.speech_voices.get(backend);
     let selected = match stored {
+        None if backend.requires_voice() => None,
         None => voices.first().map(|voice| voice.id.clone()),
         Some(id) => voices
             .iter()
@@ -387,14 +423,18 @@ pub struct BackendView {
     /// Whose languages `language_select` currently lists.
     language_backend: LanguageBackend,
     /// The System voice's voice (Story 3.12), shown when its language has
-    /// several voices.
+    /// several voices, and Azure's (Story 3.14).
     voice_select: Entity<SelectState<Vec<VoiceChoice>>>,
     key_inputs: Vec<(RemoteProvider, Entity<InputState>)>,
+    /// The Azure region field (Story 3.14).
+    region_input: Entity<InputState>,
     /// A panel (or kind) change since the last render that still has to
     /// reach the `Select` and the inputs — which need the window, and so
     /// are synced at the next render.
     panel_stale: bool,
     keys_stale: bool,
+    /// The saved Azure region changed, so the field is overwritten.
+    region_stale: bool,
     items_stale: bool,
     /// The language `Select` needs its items or value brought in line with
     /// the panel at the next render.
@@ -431,7 +471,8 @@ impl BackendView {
         });
 
         let language_backend = panel.selection.language_backend();
-        let language_items = language_choices(language_backend, &panel.system_voices);
+        let language_items =
+            language_choices(language_backend, panel.stock_voices(language_backend));
         let language_selected = saved_language_code(&panel, language_backend).and_then(|code| {
             language_items
                 .iter()
@@ -482,10 +523,8 @@ impl BackendView {
                 return;
             }
             if pick.selected.as_ref() != Some(id) {
-                this.act(
-                    BackendAction::SetSpeechVoice(LanguageBackend::SystemVoice, Some(id.clone())),
-                    cx,
-                );
+                let backend = this.panel.selection.language_backend();
+                this.act(BackendAction::SetSpeechVoice(backend, Some(id.clone())), cx);
             }
         });
 
@@ -503,6 +542,12 @@ impl BackendView {
             })
             .collect();
 
+        let region_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Azure region, like westeurope")
+                .default_value(panel.azure_region.clone().unwrap_or_default())
+        });
+
         Self {
             panel,
             actions,
@@ -512,8 +557,10 @@ impl BackendView {
             language_backend,
             voice_select,
             key_inputs,
+            region_input,
             panel_stale: false,
             keys_stale: false,
+            region_stale: false,
             items_stale: false,
             language_stale: false,
             language_items_stale: false,
@@ -536,7 +583,9 @@ impl BackendView {
         let selection_failed = panel.errors.contains_key(&BackendArea::Selection);
         // The same for the language `Select`: a failed save leaves the
         // picked language showing until it is resynced to the saved one.
-        let voices_changed = panel.system_voices != self.panel.system_voices;
+        let voices_changed = panel.system_voices != self.panel.system_voices
+            || panel.azure_voices != self.panel.azure_voices;
+        let region_changed = panel.azure_region != self.panel.azure_region;
         self.language_items_stale |= voices_changed;
         self.language_stale |= panel.speech_languages != self.panel.speech_languages
             || panel.selection.language_backend() != self.language_backend
@@ -557,9 +606,13 @@ impl BackendView {
             self.kind = kind;
         }
 
-        self.panel_stale |=
-            keys_changed || runtimes_changed || selection_failed || selection_changed;
+        self.panel_stale |= keys_changed
+            || region_changed
+            || runtimes_changed
+            || selection_failed
+            || selection_changed;
         self.keys_stale |= keys_changed;
+        self.region_stale |= region_changed;
         self.items_stale |= runtimes_changed;
         self.panel = panel;
         cx.notify();
@@ -603,7 +656,7 @@ impl BackendView {
         let backend = self.panel.selection.language_backend();
         let rebuild =
             backend != self.language_backend || std::mem::take(&mut self.language_items_stale);
-        let items = rebuild.then(|| language_choices(backend, &self.panel.system_voices));
+        let items = rebuild.then(|| language_choices(backend, self.panel.stock_voices(backend)));
         self.language_backend = backend;
         let saved = saved_language_code(&self.panel, backend);
         self.language_select.update(cx, |select, cx| {
@@ -617,8 +670,8 @@ impl BackendView {
         });
     }
 
-    /// Bring the voice `Select` in line with the panel: the saved System
-    /// voice language's voices, with the one in effect chosen.
+    /// Bring the voice `Select` in line with the panel: the saved backend's
+    /// language's voices, with the one in effect chosen.
     fn sync_voice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !std::mem::take(&mut self.voice_stale) {
             return;
@@ -636,16 +689,22 @@ impl BackendView {
         });
     }
 
-    /// Whether the voice picker is shown: the System voice is the saved
-    /// backend, its kind is shown, and its language has several voices —
+    /// Whether the voice picker is shown: a backend with a voice choice is
+    /// the saved one, its kind is shown, and its language is listed. The
+    /// System voice shows it only when the language has several voices —
     /// or a stored voice that is not the language's, which has to be
-    /// fixable from here.
+    /// fixable from here; Azure always does, since its voice must be
+    /// chosen (D4).
     fn shows_voice_picker(&self) -> bool {
-        if self.shown_language_backend() != Some(LanguageBackend::SystemVoice) {
+        let Some(backend) = self
+            .shown_language_backend()
+            .filter(|backend| backend.has_voice_choice())
+        else {
             return false;
-        }
-        voice_pick(&self.panel)
-            .is_some_and(|pick| pick.choices.len() > 1 || pick.selected.is_none())
+        };
+        voice_pick(&self.panel).is_some_and(|pick| {
+            backend.requires_voice() || pick.choices.len() > 1 || pick.selected.is_none()
+        })
     }
 
     /// Bring the `Select` and the key inputs in line with the panel.
@@ -683,6 +742,15 @@ impl BackendView {
                     }
                 });
             }
+        }
+
+        if std::mem::take(&mut self.region_stale) {
+            let saved = self.panel.azure_region.clone().unwrap_or_default();
+            self.region_input.update(cx, |input, cx| {
+                if input.value().as_ref() != saved {
+                    input.set_value(saved, window, cx);
+                }
+            });
         }
     }
 
@@ -727,6 +795,22 @@ impl BackendView {
         let value = input.read(cx).value().trim().to_string();
         let key = (!value.is_empty()).then_some(value);
         self.act(BackendAction::SaveApiKey(provider, key), cx);
+    }
+
+    /// Story 3.14: the region is checked here first, so a bad one is an
+    /// inline error and is never sent; the root checks it again.
+    fn save_region(&mut self, cx: &mut Context<Self>) {
+        let value = self.region_input.read(cx).value().to_string();
+        match parse_azure_region(&value) {
+            Ok(region) => {
+                self.panel.errors.remove(&BackendArea::AzureRegion);
+                self.act(BackendAction::SaveAzureRegion(region), cx);
+            }
+            Err(reason) => {
+                self.panel.errors.insert(BackendArea::AzureRegion, reason);
+                cx.notify();
+            }
+        }
     }
 
     /// Step one and two: the kind, then a backend of that kind.
@@ -817,6 +901,29 @@ impl BackendView {
                 if saved.is_none() && others.is_empty() && language.is_none() {
                     return None;
                 }
+                // Story 3.14: Azure's key, then its region, then the locale
+                // and voice its list offers, and what it speaks in.
+                if saved == Some(RemoteProvider::Azure) {
+                    return Some(
+                        v_flex()
+                            .gap_6()
+                            .child(self.api_key_section(RemoteProvider::Azure, cx))
+                            .child(self.azure_region_section(cx))
+                            .children(language)
+                            .children(voice)
+                            .child(self.azure_voice_status(cx))
+                            .when(!others.is_empty(), |el| {
+                                el.child(
+                                    v_flex()
+                                        .id("backend-other-providers")
+                                        .test_support()
+                                        .gap_2()
+                                        .children(others),
+                                )
+                            })
+                            .into_any_element(),
+                    );
+                }
                 Some(
                     v_flex()
                         .gap_6()
@@ -887,16 +994,19 @@ impl BackendView {
             .into_any_element()
     }
 
-    /// Story 3.12: the System voice's voice for its saved language, with a
-    /// note when the stored voice is not one of that language's, and a
-    /// failed save inline.
+    /// Stories 3.12, 3.14: the saved backend's voice for its saved
+    /// language, with a note when the stored voice is not one of that
+    /// language's, and a failed save inline.
     fn speech_voice_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let stored = self
             .panel
             .speech_voices
-            .get(LanguageBackend::SystemVoice)
+            .get(self.panel.selection.language_backend())
             .map(str::to_string);
-        let unknown = voice_pick(&self.panel).is_some_and(|pick| pick.selected.is_none());
+        // No stored voice is not a stale one: Azure's "Pick a voice" line
+        // says that instead.
+        let unknown =
+            stored.is_some() && voice_pick(&self.panel).is_some_and(|pick| pick.selected.is_none());
 
         v_flex()
             .id("backend-speech-voice")
@@ -928,6 +1038,63 @@ impl BackendView {
             .when_some(
                 self.panel.errors.get(&BackendArea::SpeechVoice).cloned(),
                 |el, error| el.child(error_line("backend-speech-voice-error", error, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// Story 3.14: the Azure region field, with Save, and an inline error.
+    fn azure_region_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        v_flex()
+            .id("backend-azure-region")
+            .test_support()
+            .gap_1()
+            .child(div().font_weight(FontWeight::MEDIUM).child("Azure region"))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().w(px(360.)).child(Input::new(&self.region_input)))
+                    .child(
+                        Button::new("azure-region-save")
+                            .label("Save")
+                            .on_click(cx.listener(|this, _, _window, cx| this.save_region(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child("The region of your Azure Speech resource, like westeurope."),
+            )
+            .when_some(
+                self.panel.errors.get(&BackendArea::AzureRegion).cloned(),
+                |el, error| el.child(error_line("azure-region-error", error, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// Story 3.14: "Pick a voice for Azure" while none is saved, and that
+    /// the speech is a Microsoft voice, not the user's.
+    fn azure_voice_status(&self, cx: &mut Context<Self>) -> AnyElement {
+        let backend = LanguageBackend::Remote(RemoteProvider::Azure);
+        let no_voice = self.panel.speech_voices.get(backend).is_none();
+        v_flex()
+            .gap_1()
+            .when(no_voice, |el| {
+                el.child(
+                    div()
+                        .id("backend-azure-pick-voice")
+                        .test_support()
+                        .child(AZURE_PICK_A_VOICE),
+                )
+            })
+            .child(
+                div()
+                    .id("backend-azure-stock-note")
+                    .test_support()
+                    .text_size(px(12.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(AZURE_STOCK_VOICE_NOTE),
             )
             .into_any_element()
     }
@@ -1316,9 +1483,14 @@ impl BackendView {
 
 /// The note beside a speech language the saved backend cannot speak.
 fn speech_language_note(panel: &BackendPanel, backend: LanguageBackend) -> String {
+    // Nothing listed is not the same as a wrong value.
     if backend == LanguageBackend::SystemVoice && panel.system_voices.is_empty() {
-        // Nothing listed is not the same as a wrong value.
         return "The System voice has not listed its voices yet. See Settings → Backend."
+            .to_string();
+    }
+    if backend == LanguageBackend::Remote(RemoteProvider::Azure) && panel.azure_voices.is_empty() {
+        return "Azure's voices have not been listed yet. They are fetched once its key and \
+                region are saved."
             .to_string();
     }
     let saved = panel.speech_languages.get(backend).unwrap_or_default();
@@ -1364,6 +1536,7 @@ fn provider_slug(provider: RemoteProvider) -> &'static str {
     match provider {
         RemoteProvider::DeepInfra => "deepinfra",
         RemoteProvider::FalAi => "fal-ai",
+        RemoteProvider::Azure => "azure",
     }
 }
 
@@ -2334,10 +2507,11 @@ mod tests {
         .unwrap();
     }
 
-    fn espeak_voice(id: &str, language: &str, name: &str) -> SystemVoice {
-        SystemVoice {
+    fn espeak_voice(id: &str, language: &str, name: &str) -> StockVoice {
+        StockVoice {
             id: id.to_string(),
             language: language.to_string(),
+            language_label: name.to_string(),
             name: name.to_string(),
             priority: 5,
         }
@@ -2354,6 +2528,7 @@ mod tests {
             },
             speech_voices: SpeechVoices {
                 system_voice: voice.map(str::to_string),
+                ..SpeechVoices::default()
             },
             system_voices: vec![
                 espeak_voice("gmw/en-US", "en-us", "English (America)"),
@@ -2585,6 +2760,227 @@ mod tests {
                 view.read(cx).language_select.read(cx).selected_value(),
                 Some(&"tr".to_string())
             );
+        })
+        .unwrap();
+    }
+
+    fn azure_voice(short_name: &str, locale: &str, locale_name: &str, local: &str) -> StockVoice {
+        StockVoice {
+            id: short_name.to_string(),
+            language: locale.to_string(),
+            language_label: locale_name.to_string(),
+            name: format!("{local} (Female)"),
+            priority: 0,
+        }
+    }
+
+    const EMEL: &str = "tr-TR-EmelNeural";
+    const AZURE: LanguageBackend = LanguageBackend::Remote(RemoteProvider::Azure);
+
+    /// Azure saved with a key and `westeurope`, speaking `locale` with
+    /// `voice` stored, against a small fetched list.
+    fn azure_panel(locale: &str, voice: Option<&str>) -> BackendPanel {
+        let mut api_keys = ApiKeys::default();
+        api_keys.set(RemoteProvider::Azure, Some("az-key".to_string()));
+        BackendPanel {
+            selection: BackendSelection::Remote(RemoteProvider::Azure),
+            api_keys,
+            azure_region: Some("westeurope".to_string()),
+            speech_languages: SpeechLanguages {
+                azure: locale.to_string(),
+                ..SpeechLanguages::default()
+            },
+            speech_voices: SpeechVoices {
+                azure: voice.map(str::to_string),
+                ..SpeechVoices::default()
+            },
+            azure_voices: vec![
+                azure_voice(EMEL, "tr-TR", "Turkish (Türkiye)", "Emel"),
+                azure_voice("tr-TR-AhmetNeural", "tr-TR", "Turkish (Türkiye)", "Ahmet"),
+                azure_voice(
+                    "en-US-JennyNeural",
+                    "en-US",
+                    "English (United States)",
+                    "Jenny",
+                ),
+            ],
+            ..BackendPanel::default()
+        }
+    }
+
+    /// Story 3.14: Azure's options — key, region, locale, voice, the
+    /// Microsoft-voice line and the Stock voice tag — and no sample line.
+    #[gpui_kit::test]
+    fn azure_shows_its_region_locale_and_voice_and_no_sample_line(cx: &mut TestAppContext) {
+        let (window, view, recorded) = open_backend_tab(cx, azure_panel("tr-TR", Some(EMEL)));
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).kind, BackendKind::Remote);
+            assert!(window.try_find("api-key-save-azure").is_some());
+            assert!(window.try_find("backend-azure-region").is_some());
+            assert!(window.try_find("azure-region-save").is_some());
+            assert!(window.try_find("backend-speech-language").is_some());
+            assert_eq!(
+                view.read(cx).language_select.read(cx).selected_value(),
+                Some(&"tr-TR".to_string())
+            );
+            assert!(window.try_find("backend-speech-voice").is_some());
+            assert_eq!(
+                view.read(cx).voice_select.read(cx).selected_value(),
+                Some(&EMEL.to_string())
+            );
+            assert!(window.try_find("backend-azure-stock-note").is_some());
+            assert!(window.try_find("backend-azure-pick-voice").is_none());
+            assert!(window.try_find("backend-stock-voice").is_some());
+            assert!(window.try_find("remote-sample-state-azure").is_none());
+            assert!(window.try_find("backend-remote-samples").is_none());
+            assert_eq!(
+                view.read(cx).region_input.read(cx).value().as_ref(),
+                "westeurope"
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(recorded.borrow().is_empty());
+    }
+
+    /// The No voice row in the tab: the picker is on its placeholder, with
+    /// "Pick a voice for Azure" and no stale-voice note.
+    #[gpui_kit::test]
+    fn azure_with_no_voice_says_pick_a_voice(cx: &mut TestAppContext) {
+        let (window, view, _recorded) = open_backend_tab(cx, azure_panel("tr-TR", None));
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("backend-speech-voice").is_some());
+            assert_eq!(view.read(cx).voice_select.read(cx).selected_value(), None);
+            assert!(window.try_find("backend-azure-pick-voice").is_some());
+            assert!(window.try_find("backend-speech-voice-note").is_none());
+        })
+        .unwrap();
+    }
+
+    /// Picking a voice asks the root once, under Azure.
+    #[gpui_kit::test]
+    fn picking_an_azure_voice_asks_the_root(cx: &mut TestAppContext) {
+        let (window, view, recorded) = open_backend_tab(cx, azure_panel("tr-TR", None));
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let voice = view.read(cx).voice_select.clone();
+            voice.update(cx, |_, cx| {
+                cx.emit(SelectEvent::Confirm(Some(EMEL.to_string())))
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            *recorded.borrow(),
+            vec![BackendAction::SetSpeechVoice(AZURE, Some(EMEL.to_string()))]
+        );
+    }
+
+    /// The Change locale row: only the language action is sent; once the
+    /// root saved it with the voice cleared, the tab says to pick a voice.
+    #[gpui_kit::test]
+    fn an_azure_locale_change_sends_only_the_language_action(cx: &mut TestAppContext) {
+        let (window, view, recorded) = open_backend_tab(cx, azure_panel("tr-TR", Some(EMEL)));
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let language = view.read(cx).language_select.clone();
+            language.update(cx, |_, cx| {
+                cx.emit(SelectEvent::Confirm(Some("en-US".to_string())))
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            *recorded.borrow(),
+            vec![BackendAction::SetSpeechLanguage(AZURE, "en-US".to_string())]
+        );
+
+        cx.update_window(window.into(), |_, window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_backend_panel(azure_panel("en-US", None), cx)
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("backend-azure-pick-voice").is_some());
+            assert_eq!(view.read(cx).voice_select.read(cx).selected_value(), None);
+            assert_eq!(
+                view.read(cx).language_select.read(cx).selected_value(),
+                Some(&"en-US".to_string())
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(recorded.borrow().len(), 1, "the resync sends nothing");
+    }
+
+    /// The Stale voice row in the tab: placeholder and note.
+    #[gpui_kit::test]
+    fn a_stale_azure_voice_shows_the_placeholder_and_a_note(cx: &mut TestAppContext) {
+        let (window, view, _recorded) =
+            open_backend_tab(cx, azure_panel("tr-TR", Some("tr-TR-GoneNeural")));
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).voice_select.read(cx).selected_value(), None);
+            assert!(window.try_find("backend-speech-voice-note").is_some());
+        })
+        .unwrap();
+    }
+
+    /// The Bad region row: an invalid region is an inline error and is
+    /// never sent; a valid one is sent trimmed and lowercased.
+    #[gpui_kit::test]
+    fn the_azure_region_is_checked_before_it_is_saved(cx: &mut TestAppContext) {
+        let (window, view, recorded) = open_backend_tab(cx, azure_panel("tr-TR", Some(EMEL)));
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let input = view.read(cx).region_input.clone();
+            input.update(cx, |input, cx| input.set_value("west europe!", window, cx));
+            window.render_frame(cx);
+            window.click("azure-region-save", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("azure-region-error").is_some());
+
+            input.update(cx, |input, cx| input.set_value(" NorthEurope ", window, cx));
+            window.render_frame(cx);
+            window.click("azure-region-save", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("azure-region-error").is_none());
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            *recorded.borrow(),
+            vec![BackendAction::SaveAzureRegion(Some(
+                "northeurope".to_string()
+            ))]
+        );
+    }
+
+    /// No list yet: the language note says so, and there is no picker.
+    #[gpui_kit::test]
+    fn azure_with_no_list_yet_says_so(cx: &mut TestAppContext) {
+        let panel = BackendPanel {
+            azure_voices: Vec::new(),
+            ..azure_panel("tr-TR", None)
+        };
+        let (window, view, _recorded) = open_backend_tab(cx, panel);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("backend-speech-language-note").is_some());
+            assert!(window.try_find("backend-speech-voice").is_none());
+            assert!(window.try_find("backend-azure-pick-voice").is_some());
+            let note = speech_language_note(&view.read(cx).panel, AZURE);
+            assert!(note.contains("Azure"), "{note}");
         })
         .unwrap();
     }

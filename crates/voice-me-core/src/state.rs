@@ -13,6 +13,34 @@ pub const DEFAULT_UI_LANGUAGE: &str = "en";
 /// with a speech language its own saved value, and each of them starts here.
 pub const DEFAULT_SPEECH_LANGUAGE: &str = "tr";
 
+/// Azure's speech language when nothing has been saved yet (Story 3.14):
+/// Azure names its languages by locale, and Turkish is the default here as
+/// everywhere else.
+pub const DEFAULT_AZURE_LOCALE: &str = "tr-TR";
+
+/// Why an Azure region was not saved (Story 3.14).
+pub const AZURE_REGION_INVALID: &str =
+    "An Azure region is letters and digits only, like westeurope.";
+
+/// The Azure region `input` names, trimmed and lowercased (Story 3.14):
+/// `Ok(None)` for a blank input (no region), `Err` with the reason for
+/// anything but `[a-z0-9]+` — so a region can never change the host it
+/// is put into.
+pub fn parse_azure_region(input: &str) -> Result<Option<String>, String> {
+    let region = input.trim().to_ascii_lowercase();
+    if region.is_empty() {
+        return Ok(None);
+    }
+    if region
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
+        Ok(Some(region))
+    } else {
+        Err(AZURE_REGION_INVALID.to_string())
+    }
+}
+
 /// Which execution provider the speech engine is placed on (AD-9).
 ///
 /// Core-side vocabulary on purpose: `voice-me-core` must never name an `ort`
@@ -128,25 +156,38 @@ impl SpeechBackend {
 /// A remote speech provider the user can select (Stories 3.5–3.7).
 ///
 /// DeepInfra generates since Story 3.6; fal.ai is selectable, and generates
-/// with Story 3.7.
+/// with Story 3.7. Azure (Story 3.14) speaks in a stock Microsoft voice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteProvider {
     #[serde(rename = "deepinfra")]
     DeepInfra,
     FalAi,
+    Azure,
 }
 
 impl RemoteProvider {
     /// Every provider, in the order the UI lists them.
-    pub const ALL: [RemoteProvider; 2] = [RemoteProvider::DeepInfra, RemoteProvider::FalAi];
+    pub const ALL: [RemoteProvider; 3] = [
+        RemoteProvider::DeepInfra,
+        RemoteProvider::FalAi,
+        RemoteProvider::Azure,
+    ];
 
     /// How the provider is named to the user.
     pub fn label(self) -> &'static str {
         match self {
             RemoteProvider::DeepInfra => "DeepInfra",
             RemoteProvider::FalAi => "fal.ai",
+            RemoteProvider::Azure => "Azure",
         }
+    }
+
+    /// Whether this provider speaks in a stock voice rather than cloning
+    /// the user's (Story 3.14): it never receives the Reference Voice
+    /// Sample.
+    pub fn is_stock_voice(self) -> bool {
+        self == RemoteProvider::Azure
     }
 }
 
@@ -184,29 +225,48 @@ impl LanguageBackend {
         match self {
             LanguageBackend::Local => LOCAL_SPEECH_LANGUAGES,
             LanguageBackend::Remote(RemoteProvider::DeepInfra) => DEEPINFRA_SPEECH_LANGUAGES,
-            LanguageBackend::Remote(RemoteProvider::FalAi) | LanguageBackend::SystemVoice => &[],
+            LanguageBackend::Remote(RemoteProvider::FalAi | RemoteProvider::Azure)
+            | LanguageBackend::SystemVoice => &[],
         }
     }
 
-    /// Whether this backend has a speech language at all. The System voice
-    /// always does, even while its voice list is empty or not loaded yet.
+    /// Whether this backend's languages and voices come from a list read
+    /// at run time rather than a static table: the System voice's engine
+    /// (Story 3.12) and Azure's voice list (Story 3.14).
+    pub fn has_voice_list(self) -> bool {
+        matches!(
+            self,
+            LanguageBackend::SystemVoice | LanguageBackend::Remote(RemoteProvider::Azure)
+        )
+    }
+
+    /// Whether this backend has a speech language at all. A backend with a
+    /// voice list always does, even while its list is empty or not loaded
+    /// yet.
     pub fn has_speech_language(self) -> bool {
-        self == LanguageBackend::SystemVoice || !self.speech_languages().is_empty()
+        self.has_voice_list() || !self.speech_languages().is_empty()
     }
 
     /// Whether this backend speaks in a stock voice chosen from a list
-    /// rather than the user's cloned one (Story 3.12).
+    /// rather than the user's cloned one (Stories 3.12, 3.14).
     pub fn has_voice_choice(self) -> bool {
-        self == LanguageBackend::SystemVoice
+        self.has_voice_list()
+    }
+
+    /// Whether this backend's voice must be chosen before it can speak
+    /// (Story 3.14, D4): Azure has no "top-priority" default voice, while
+    /// the System voice falls back to its language's top-priority one.
+    pub fn requires_voice(self) -> bool {
+        self == LanguageBackend::Remote(RemoteProvider::Azure)
     }
 
     /// The sibling of [`Self::speech_languages`] that also covers the
-    /// System voice: its languages come from `system_voices`, the engine's
-    /// own list (see [`system_voice_languages`]). Every other backend
-    /// ignores `system_voices` and lists its static set.
-    pub fn language_options(self, system_voices: &[SystemVoice]) -> Vec<LanguageOption> {
+    /// backends with a voice list: their languages come from `voices`, the
+    /// list read at run time (see [`stock_voice_languages`]). Every other
+    /// backend ignores `voices` and lists its static set.
+    pub fn language_options(self, voices: &[StockVoice]) -> Vec<LanguageOption> {
         match self {
-            LanguageBackend::SystemVoice => system_voice_languages(system_voices),
+            backend if backend.has_voice_list() => stock_voice_languages(voices),
             _ => self
                 .speech_languages()
                 .iter()
@@ -219,15 +279,15 @@ impl LanguageBackend {
     }
 
     /// The canonical code of the language `saved` names, if this backend
-    /// speaks it — [`Self::speech_language`] for a static set, and for the
-    /// System voice the listed `Language` value it matches (trimmed,
+    /// speaks it — [`Self::speech_language`] for a static set, and for a
+    /// backend with a voice list the listed language it matches (trimmed,
     /// compared without regard to ASCII case). `None` outside the set,
     /// never a default.
-    pub fn resolve_language(self, saved: &str, system_voices: &[SystemVoice]) -> Option<String> {
+    pub fn resolve_language(self, saved: &str, voices: &[StockVoice]) -> Option<String> {
         match self {
-            LanguageBackend::SystemVoice => {
+            backend if backend.has_voice_list() => {
                 let saved = saved.trim();
-                system_voices
+                voices
                     .iter()
                     .find(|voice| voice.language.eq_ignore_ascii_case(saved))
                     .map(|voice| voice.language.clone())
@@ -258,106 +318,145 @@ pub struct LanguageOption {
     pub label: String,
 }
 
-/// One voice the System voice's engine lists (Story 3.12), as parsed from
-/// `espeak-ng --voices`.
+/// One stock voice a backend lists at run time: a voice the System
+/// voice's engine lists (Story 3.12, parsed from `espeak-ng --voices`) or
+/// one of Azure's (Story 3.14, from its voice list).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SystemVoice {
-    /// What the engine is told to use (`trk/tr`). Unique in a list.
+pub struct StockVoice {
+    /// What the engine or provider is told to use (`trk/tr`,
+    /// `tr-TR-EmelNeural`). Unique in a list.
     pub id: String,
-    /// The language code the voice speaks (`tr`, `en-gb`, `yue`). Each
-    /// distinct code is its own speech language.
+    /// The language the voice speaks (`tr`, `en-gb`, `tr-TR`). Each
+    /// distinct value, compared without regard to ASCII case, is its own
+    /// speech language.
     pub language: String,
-    /// The name the user reads ("Chinese (Cantonese)").
+    /// How the voice's language is named to the user, when this voice is
+    /// its language's top-priority one: eSpeak's voice name, Azure's
+    /// `LocaleName` ("Turkish (Türkiye)").
+    pub language_label: String,
+    /// The name the user reads ("Chinese (Cantonese)", "Emel (Female)").
     pub name: String,
-    /// The engine's priority: lower is preferred.
+    /// The priority within the language: lower is preferred.
     pub priority: u32,
 }
 
-/// The distinct languages `voices` speak, each labelled with its
-/// top-priority voice's name, sorted by label.
-pub fn system_voice_languages(voices: &[SystemVoice]) -> Vec<LanguageOption> {
+/// The distinct languages `voices` speak (compared without regard to ASCII
+/// case), each labelled with its top-priority voice's language label,
+/// sorted by label.
+pub fn stock_voice_languages(voices: &[StockVoice]) -> Vec<LanguageOption> {
     let mut languages: Vec<LanguageOption> = Vec::new();
     for voice in voices {
         if languages
             .iter()
-            .any(|language| language.code == voice.language)
+            .any(|language| language.code.eq_ignore_ascii_case(&voice.language))
         {
             continue;
         }
-        let top = system_voices_of(voices, &voice.language)[0];
+        let top = stock_voices_of(voices, &voice.language)[0];
         languages.push(LanguageOption {
             code: voice.language.clone(),
-            label: top.name.clone(),
+            label: top.language_label.clone(),
         });
     }
     languages.sort_by(|a, b| a.label.cmp(&b.label).then_with(|| a.code.cmp(&b.code)));
     languages
 }
 
-/// The voices that speak exactly `language`, top priority first: lowest
-/// priority number, then list order.
-pub fn system_voices_of<'a>(voices: &'a [SystemVoice], language: &str) -> Vec<&'a SystemVoice> {
-    let mut of: Vec<&SystemVoice> = voices
+/// The voices that speak `language` (compared without regard to ASCII
+/// case), top priority first: lowest priority number, then list order.
+pub fn stock_voices_of<'a>(voices: &'a [StockVoice], language: &str) -> Vec<&'a StockVoice> {
+    let mut of: Vec<&StockVoice> = voices
         .iter()
-        .filter(|voice| voice.language == language)
+        .filter(|voice| voice.language.eq_ignore_ascii_case(language))
         .collect();
     // A stable sort keeps list order among equal priorities.
     of.sort_by_key(|voice| voice.priority);
     of
 }
 
-/// Why a stored System voice language or voice cannot be used (Story 3.12).
+/// Why a stored stock-voice language or voice cannot be used (Stories
+/// 3.12, 3.14). Each names the backend it is about.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SystemVoiceRefusal {
-    /// No voice list has been read from the engine yet.
-    NoVoices,
+pub enum StockVoiceRefusal {
+    /// No voice list has been read yet.
+    NoVoices(LanguageBackend),
     /// No listed voice speaks the stored language.
-    Language(String),
+    Language {
+        backend: LanguageBackend,
+        language: String,
+    },
     /// The stored voice is not one of the language's voices.
-    Voice { language: String, voice: String },
+    Voice {
+        backend: LanguageBackend,
+        language: String,
+        voice: String,
+    },
+    /// The backend needs a voice and none is stored (Story 3.14).
+    NoVoice(LanguageBackend),
 }
 
-impl std::fmt::Display for SystemVoiceRefusal {
+impl std::fmt::Display for StockVoiceRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SystemVoiceRefusal::NoVoices => {
-                f.write_str("System voice has no voices listed yet — check Settings → Backend")
-            }
-            SystemVoiceRefusal::Language(language) => write!(
+            StockVoiceRefusal::NoVoices(backend) => write!(
                 f,
-                "System voice can't speak the speech language {language:?} — choose one in \
-                 Settings → Backend"
+                "{} has no voices listed yet — check Settings → Backend",
+                backend.label()
             ),
-            SystemVoiceRefusal::Voice { language, voice } => write!(
+            StockVoiceRefusal::Language { backend, language } => write!(
                 f,
-                "System voice has no voice {voice:?} for {language:?} — choose one in Settings → \
-                 Backend"
+                "{} can't speak the speech language {language:?} — choose one in Settings → \
+                 Backend",
+                backend.label()
+            ),
+            StockVoiceRefusal::Voice {
+                backend,
+                language,
+                voice,
+            } => write!(
+                f,
+                "{} has no voice {voice:?} for {language:?} — choose one in Settings → Backend",
+                backend.label()
+            ),
+            StockVoiceRefusal::NoVoice(backend) => write!(
+                f,
+                "{} has no voice selected — pick one in Settings → Backend",
+                backend.label()
             ),
         }
     }
 }
 
-/// The voice a System voice Speak Action uses: the stored `voice` if it is
+/// The voice a stock-voice Speak Action uses: the stored `voice` if it is
 /// one of `language`'s, or with none stored, the language's top-priority
-/// voice. Refused by name otherwise — never a substitute.
-pub fn resolve_system_voice<'a>(
-    voices: &'a [SystemVoice],
+/// voice — unless `backend` requires a stored voice (Azure, D4). Refused
+/// by name otherwise — never a substitute.
+pub fn resolve_stock_voice<'a>(
+    backend: LanguageBackend,
+    voices: &'a [StockVoice],
     language: &str,
     voice: Option<&str>,
-) -> Result<&'a SystemVoice, SystemVoiceRefusal> {
-    if voices.is_empty() {
-        return Err(SystemVoiceRefusal::NoVoices);
+) -> Result<&'a StockVoice, StockVoiceRefusal> {
+    if voice.is_none() && backend.requires_voice() {
+        return Err(StockVoiceRefusal::NoVoice(backend));
     }
-    let Some(code) = LanguageBackend::SystemVoice.resolve_language(language, voices) else {
-        return Err(SystemVoiceRefusal::Language(language.trim().to_string()));
+    if voices.is_empty() {
+        return Err(StockVoiceRefusal::NoVoices(backend));
+    }
+    let Some(code) = backend.resolve_language(language, voices) else {
+        return Err(StockVoiceRefusal::Language {
+            backend,
+            language: language.trim().to_string(),
+        });
     };
-    let of = system_voices_of(voices, &code);
+    let of = stock_voices_of(voices, &code);
     match voice {
         None => Ok(of[0]),
         Some(id) => of
             .into_iter()
             .find(|candidate| candidate.id == id)
-            .ok_or_else(|| SystemVoiceRefusal::Voice {
+            .ok_or_else(|| StockVoiceRefusal::Voice {
+                backend,
                 language: code,
                 voice: id.to_string(),
             }),
@@ -418,6 +517,9 @@ pub struct SpeechLanguages {
     pub deepinfra: String,
     /// Story 3.12. Defaults to `tr`; the legacy key never seeds it.
     pub system_voice: String,
+    /// Story 3.14: an Azure locale. Defaults to `tr-TR`; the legacy key
+    /// never seeds it.
+    pub azure: String,
 }
 
 impl Default for SpeechLanguages {
@@ -426,15 +528,19 @@ impl Default for SpeechLanguages {
             local: DEFAULT_SPEECH_LANGUAGE.to_string(),
             deepinfra: DEFAULT_SPEECH_LANGUAGE.to_string(),
             system_voice: DEFAULT_SPEECH_LANGUAGE.to_string(),
+            azure: DEFAULT_AZURE_LOCALE.to_string(),
         }
     }
 }
 
-/// The saved voice of each backend that has a voice choice (Story 3.12).
-/// Persisted. `None` is the language's top-priority voice.
+/// The saved voice of each backend that has a voice choice (Stories 3.12,
+/// 3.14). Persisted. For the System voice `None` is the language's
+/// top-priority voice; for Azure it is no voice at all (D4).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SpeechVoices {
     pub system_voice: Option<String>,
+    /// Azure's `ShortName` (`tr-TR-EmelNeural`).
+    pub azure: Option<String>,
 }
 
 impl SpeechVoices {
@@ -442,6 +548,7 @@ impl SpeechVoices {
     pub fn get(&self, backend: LanguageBackend) -> Option<&str> {
         match backend {
             LanguageBackend::SystemVoice => self.system_voice.as_deref(),
+            LanguageBackend::Remote(RemoteProvider::Azure) => self.azure.as_deref(),
             _ => None,
         }
     }
@@ -454,6 +561,7 @@ impl SpeechLanguages {
             LanguageBackend::Local => Some(&self.local),
             LanguageBackend::Remote(RemoteProvider::DeepInfra) => Some(&self.deepinfra),
             LanguageBackend::Remote(RemoteProvider::FalAi) => None,
+            LanguageBackend::Remote(RemoteProvider::Azure) => Some(&self.azure),
             LanguageBackend::SystemVoice => Some(&self.system_voice),
         }
     }
@@ -506,8 +614,20 @@ impl BackendSelection {
     }
 
     /// Whether this backend speaks in a stock voice rather than the user's
-    /// cloned one — and so needs no Reference Voice Sample (Story 3.12).
+    /// cloned one — and so needs no Reference Voice Sample (Stories 3.12,
+    /// 3.14): the System voice and Azure.
     pub fn is_stock_voice(&self) -> bool {
+        match self {
+            BackendSelection::SystemVoice => true,
+            BackendSelection::Remote(provider) => provider.is_stock_voice(),
+            BackendSelection::Local { .. } => false,
+        }
+    }
+
+    /// Whether this is the OS's own speech engine (Story 3.12) — what the
+    /// eSpeak NG row and voice listing are about. Azure is a stock voice,
+    /// but not this.
+    pub fn is_system_voice(&self) -> bool {
         matches!(self, BackendSelection::SystemVoice)
     }
 
@@ -633,6 +753,9 @@ pub struct ApiKeys {
     pub deepinfra: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fal_ai: Option<String>,
+    /// Story 3.14.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub azure: Option<String>,
 }
 
 impl ApiKeys {
@@ -641,6 +764,7 @@ impl ApiKeys {
         match provider {
             RemoteProvider::DeepInfra => self.deepinfra.as_deref(),
             RemoteProvider::FalAi => self.fal_ai.as_deref(),
+            RemoteProvider::Azure => self.azure.as_deref(),
         }
         .filter(|key| !key.trim().is_empty())
     }
@@ -659,6 +783,7 @@ impl ApiKeys {
         match provider {
             RemoteProvider::DeepInfra => self.deepinfra = key,
             RemoteProvider::FalAi => self.fal_ai = key,
+            RemoteProvider::Azure => self.azure = key,
         }
     }
 }
@@ -675,6 +800,7 @@ impl std::fmt::Debug for ApiKeys {
         f.debug_struct("ApiKeys")
             .field("deepinfra", &redact(&self.deepinfra))
             .field("fal_ai", &redact(&self.fal_ai))
+            .field("azure", &redact(&self.azure))
             .finish()
     }
 }
@@ -997,7 +1123,14 @@ pub struct AppState {
     /// Check that had it selected (Story 3.12). Not persisted: like
     /// [`Self::dependencies`], it describes this machine as it was a moment
     /// ago, and the composition root merges it in.
-    pub system_voices: Vec<SystemVoice>,
+    pub system_voices: Vec<StockVoice>,
+    /// The Azure region (`westeurope`), saved next to the key (Story 3.14).
+    /// Persisted; not a secret. Always `[a-z0-9]+` when set.
+    pub azure_region: Option<String>,
+    /// Azure's voice list as fetched at the last Dependency Check with
+    /// Azure selected (Story 3.14, D1). Cached by the composition root for
+    /// the session and never persisted.
+    pub azure_voices: Vec<StockVoice>,
 }
 
 /// Hand-written rather than derived so the two language fields default to
@@ -1021,6 +1154,8 @@ impl Default for AppState {
             active_backend: ActiveBackend::default(),
             dependencies: DependencyOutcome::default(),
             system_voices: Vec::new(),
+            azure_region: None,
+            azure_voices: Vec::new(),
         }
     }
 }
@@ -1031,6 +1166,17 @@ impl AppState {
     pub fn speech_language(&self) -> Option<&str> {
         self.speech_languages
             .get(self.backend_selection.language_backend())
+    }
+
+    /// The run-time voice list `backend` resolves its languages and voices
+    /// against: the System voice's engine list, Azure's voice list, and
+    /// nothing for a backend with a static set.
+    pub fn stock_voices(&self, backend: LanguageBackend) -> &[StockVoice] {
+        match backend {
+            LanguageBackend::SystemVoice => &self.system_voices,
+            LanguageBackend::Remote(RemoteProvider::Azure) => &self.azure_voices,
+            _ => &[],
+        }
     }
 
     /// Whether `provider`'s disclosure has been confirmed.
@@ -1074,6 +1220,7 @@ mod tests {
             RemoteProvider::DeepInfra,
             Some("sk-secret-deepinfra".to_string()),
         );
+        keys.set(RemoteProvider::Azure, Some("sk-secret-azure".to_string()));
         let state = AppState {
             api_keys: keys.clone(),
             ..AppState::default()
@@ -1140,9 +1287,9 @@ mod tests {
         assert_eq!(choices[0].label(), "CPU (bundled runtime)");
         assert_eq!(
             choices.last(),
-            Some(&BackendSelection::Remote(RemoteProvider::FalAi))
+            Some(&BackendSelection::Remote(RemoteProvider::Azure))
         );
-        assert_eq!(choices.len(), 5);
+        assert_eq!(choices.len(), 6);
         // The System voice comes after the local runtimes, before remote.
         assert_eq!(choices[2], BackendSelection::SystemVoice);
     }
@@ -1242,16 +1389,17 @@ mod tests {
         assert!(DependencyKind::BackendCapability.blocks_speech());
     }
 
-    fn voice(id: &str, language: &str, name: &str, priority: u32) -> SystemVoice {
-        SystemVoice {
+    fn voice(id: &str, language: &str, name: &str, priority: u32) -> StockVoice {
+        StockVoice {
             id: id.to_string(),
             language: language.to_string(),
+            language_label: name.to_string(),
             name: name.to_string(),
             priority,
         }
     }
 
-    fn some_voices() -> Vec<SystemVoice> {
+    fn some_voices() -> Vec<StockVoice> {
         vec![
             voice("gmw/en", "en-gb", "English (Great Britain)", 2),
             voice("gmw/en-US", "en-us", "English (America)", 5),
@@ -1268,7 +1416,7 @@ mod tests {
 
     #[test]
     fn each_system_voice_language_code_is_its_own_language_sorted_by_label() {
-        let languages = system_voice_languages(&some_voices());
+        let languages = stock_voice_languages(&some_voices());
         let codes: Vec<_> = languages.iter().map(|l| l.code.as_str()).collect();
         assert_eq!(codes, vec!["yue", "en-us", "en-gb", "tr"]);
         assert_eq!(languages[0].label, "Chinese (Cantonese)");
@@ -1290,37 +1438,48 @@ mod tests {
             voice("a/low", "xx", "Second choice", 5),
             voice("a/high", "xx", "First choice", 2),
         ];
-        assert_eq!(system_voice_languages(&voices)[0].label, "First choice");
-        assert_eq!(system_voices_of(&voices, "xx")[0].id, "a/high");
+        assert_eq!(stock_voice_languages(&voices)[0].label, "First choice");
+        assert_eq!(stock_voices_of(&voices, "xx")[0].id, "a/high");
     }
 
     #[test]
     fn the_system_voice_resolves_the_stored_voice_or_the_top_priority_one() {
         let voices = some_voices();
         assert_eq!(
-            resolve_system_voice(&voices, "yue", None).unwrap().id,
+            resolve_stock_voice(LanguageBackend::SystemVoice, &voices, "yue", None)
+                .unwrap()
+                .id,
             "sit/yue"
         );
         assert_eq!(
-            resolve_system_voice(&voices, " YUE ", Some("sit/yue-Latn-jyutping"))
-                .unwrap()
-                .id,
+            resolve_stock_voice(
+                LanguageBackend::SystemVoice,
+                &voices,
+                " YUE ",
+                Some("sit/yue-Latn-jyutping")
+            )
+            .unwrap()
+            .id,
             "sit/yue-Latn-jyutping"
         );
         assert_eq!(
-            resolve_system_voice(&voices, "xx", None),
-            Err(SystemVoiceRefusal::Language("xx".to_string()))
+            resolve_stock_voice(LanguageBackend::SystemVoice, &voices, "xx", None),
+            Err(StockVoiceRefusal::Language {
+                backend: LanguageBackend::SystemVoice,
+                language: "xx".to_string()
+            })
         );
         assert_eq!(
-            resolve_system_voice(&voices, "tr", Some("sit/yue")),
-            Err(SystemVoiceRefusal::Voice {
+            resolve_stock_voice(LanguageBackend::SystemVoice, &voices, "tr", Some("sit/yue")),
+            Err(StockVoiceRefusal::Voice {
+                backend: LanguageBackend::SystemVoice,
                 language: "tr".to_string(),
                 voice: "sit/yue".to_string()
             })
         );
         assert_eq!(
-            resolve_system_voice(&[], "tr", None),
-            Err(SystemVoiceRefusal::NoVoices)
+            resolve_stock_voice(LanguageBackend::SystemVoice, &[], "tr", None),
+            Err(StockVoiceRefusal::NoVoices(LanguageBackend::SystemVoice))
         );
     }
 
@@ -1334,5 +1493,99 @@ mod tests {
         assert!(selection.label().contains("stock voice"));
         assert_eq!(selection.language_backend(), LanguageBackend::SystemVoice);
         assert!(DependencyKind::SystemVoiceEngine.blocks_speech());
+    }
+
+    fn azure_voice(short_name: &str, locale: &str, locale_name: &str, local: &str) -> StockVoice {
+        StockVoice {
+            id: short_name.to_string(),
+            language: locale.to_string(),
+            language_label: locale_name.to_string(),
+            name: format!("{local} (Female)"),
+            priority: 0,
+        }
+    }
+
+    fn azure_voices() -> Vec<StockVoice> {
+        vec![
+            azure_voice("tr-TR-EmelNeural", "tr-TR", "Turkish (Türkiye)", "Emel"),
+            azure_voice(
+                "en-US-JennyNeural",
+                "en-US",
+                "English (United States)",
+                "Jenny",
+            ),
+            azure_voice(
+                "en-US-AriaNeural",
+                "en-us",
+                "English (United States)",
+                "Aria",
+            ),
+        ]
+    }
+
+    #[test]
+    fn azure_is_a_stock_voice_with_a_voice_list_and_a_required_voice() {
+        let azure = BackendSelection::Remote(RemoteProvider::Azure);
+        assert!(azure.is_stock_voice());
+        assert!(!azure.is_system_voice());
+        assert!(BackendSelection::SystemVoice.is_system_voice());
+        assert!(!BackendSelection::Remote(RemoteProvider::DeepInfra).is_stock_voice());
+        let backend = azure.language_backend();
+        assert!(backend.has_voice_list() && backend.has_voice_choice());
+        assert!(backend.requires_voice());
+        assert!(!LanguageBackend::SystemVoice.requires_voice());
+        assert!(backend.has_speech_language(), "even with no list yet");
+        assert_eq!(backend.label(), "Azure");
+        assert_eq!(SpeechLanguages::default().get(backend), Some("tr-TR"));
+        assert_eq!(SpeechVoices::default().get(backend), None);
+    }
+
+    #[test]
+    fn azure_locales_are_distinct_case_insensitively_and_labelled_by_locale_name() {
+        let languages =
+            LanguageBackend::Remote(RemoteProvider::Azure).language_options(&azure_voices());
+        let codes: Vec<_> = languages.iter().map(|l| l.code.as_str()).collect();
+        assert_eq!(codes, vec!["en-US", "tr-TR"]);
+        assert_eq!(languages[1].label, "Turkish (Türkiye)");
+        assert_eq!(stock_voices_of(&azure_voices(), "EN-us").len(), 2);
+    }
+
+    #[test]
+    fn an_azure_voice_is_required_and_never_substituted() {
+        let backend = LanguageBackend::Remote(RemoteProvider::Azure);
+        let voices = azure_voices();
+        assert_eq!(
+            resolve_stock_voice(backend, &voices, "tr-tr", Some("tr-TR-EmelNeural"))
+                .unwrap()
+                .id,
+            "tr-TR-EmelNeural"
+        );
+        assert_eq!(
+            resolve_stock_voice(backend, &voices, "tr-TR", None),
+            Err(StockVoiceRefusal::NoVoice(backend))
+        );
+        let stale =
+            resolve_stock_voice(backend, &voices, "tr-TR", Some("tr-TR-AhmetNeural")).unwrap_err();
+        let message = stale.to_string();
+        assert!(
+            message.contains("Azure") && message.contains("tr-TR-AhmetNeural"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_azure_region_is_trimmed_lowercased_and_letters_and_digits_only() {
+        assert_eq!(
+            parse_azure_region("  WestEurope\n"),
+            Ok(Some("westeurope".to_string()))
+        );
+        assert_eq!(
+            parse_azure_region("eastus2"),
+            Ok(Some("eastus2".to_string()))
+        );
+        assert_eq!(parse_azure_region("   "), Ok(None));
+        for bad in ["west europe!", "evil.com/", "a-b", "westeurope.attacker"] {
+            assert!(parse_azure_region(bad).is_err(), "{bad}");
+        }
     }
 }

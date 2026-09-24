@@ -222,7 +222,7 @@ impl DependencyProvisioningPort for DepsAdapter {
             ),
             // Story 3.12: the System voice's one engine row. It is not an
             // ONNX target, so it has no runtime or model rows.
-            None if request.selection.is_stock_voice() => system_voice_rows(),
+            None if request.selection.is_system_voice() => system_voice_rows(),
             None => Vec::new(),
         };
 
@@ -1011,6 +1011,8 @@ mod tests {
                 backend: SpeechBackend::for_target(SpeechExecutionTarget::Cuda),
                 selection,
                 has_api_key: false,
+                has_region: false,
+                has_voice: false,
             },
             dir.path(),
         );
@@ -1068,6 +1070,8 @@ mod tests {
                     voice_me_core::RemoteProvider::DeepInfra,
                 ),
                 has_api_key: false,
+                has_region: false,
+                has_voice: false,
             },
             dir.path(),
         );
@@ -1098,6 +1102,8 @@ mod tests {
                 backend: SpeechBackend::CPU,
                 selection: voice_me_core::BackendSelection::SystemVoice,
                 has_api_key: false,
+                has_region: false,
+                has_voice: false,
             },
             dir.path(),
         );
@@ -1149,6 +1155,46 @@ mod tests {
         assert!(
             gpu_runtime_unavailable(SpeechBackend::for_target(SpeechExecutionTarget::Cuda))
                 .contains("CUDA")
+        );
+    }
+
+    /// Story 3.14: Azure is a stock voice, but gets no eSpeak row and no
+    /// ONNX rows — only its capability row.
+    #[test]
+    fn an_azure_selection_reports_no_espeak_or_engine_rows() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let report = check_with(
+            CheckRequest {
+                backend: SpeechBackend::CPU,
+                selection: voice_me_core::BackendSelection::Remote(
+                    voice_me_core::RemoteProvider::Azure,
+                ),
+                has_api_key: true,
+                has_region: true,
+                has_voice: false,
+            },
+            dir.path(),
+        );
+
+        assert!(
+            !report.dependencies.iter().any(|row| matches!(
+                row.kind,
+                DependencyKind::OnnxRuntime
+                    | DependencyKind::ModelWeights
+                    | DependencyKind::SystemVoiceEngine
+            )),
+            "{:?}",
+            report.dependencies
+        );
+        assert_eq!(
+            report.speech_engine_blocker().map(|row| row.kind),
+            Some(DependencyKind::BackendCapability)
+        );
+        assert!(
+            report.dependencies[0].detail.contains("no voice selected"),
+            "{}",
+            report.dependencies[0].detail
         );
     }
 }

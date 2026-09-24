@@ -1,6 +1,6 @@
 //! `espeak-ng --voices`, parsed.
 
-use voice_me_core::SystemVoice;
+use voice_me_core::StockVoice;
 
 /// Every voice in `espeak-ng --voices` output.
 ///
@@ -8,7 +8,7 @@ use voice_me_core::SystemVoice;
 /// header, `variant` lines and anything that does not have that shape are
 /// skipped. The id is `File` (`gmw/en-US`), which is unique and is what
 /// `-v` takes; the name is `VoiceName` with `_` read as a space.
-pub fn parse_voices(text: &str) -> Vec<SystemVoice> {
+pub fn parse_voices(text: &str) -> Vec<StockVoice> {
     text.lines()
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
@@ -20,10 +20,12 @@ pub fn parse_voices(text: &str) -> Vec<SystemVoice> {
             if language == "variant" {
                 return None;
             }
-            Some(SystemVoice {
+            let name = name.replace('_', " ").trim().to_string();
+            Some(StockVoice {
                 id: file.to_string(),
                 language: language.to_string(),
-                name: name.replace('_', " ").trim().to_string(),
+                language_label: name.clone(),
+                name,
                 priority,
             })
         })

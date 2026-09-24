@@ -77,14 +77,16 @@ use voice_me_core::{
     ActiveBackend, AppEvent, AppState, BackendSelection, CheckRequest, DependencyKind,
     DependencyOutcome, DependencyProvisioningPort, DependencyReport, FileSettingsStore, HotkeyPort,
     LocalRuntime, NotificationPort, RemoteProvider, SettingsStore, SpeechBackend,
-    SpeechExecutionTarget, SystemVoice, TtsPort, VirtualMicPort, tokio_bridge,
+    SpeechExecutionTarget, StockVoice, TtsPort, VirtualMicPort, tokio_bridge,
 };
 use voice_me_deps::DepsAdapter;
 use voice_me_tts::TtsAdapter;
-use voice_me_tts_remote::{DeepInfra, RemoteTtsAdapter, SharedSettingsStore};
+use voice_me_tts_remote::{
+    Azure, AzureTtsAdapter, DeepInfra, RemoteTtsAdapter, SharedSettingsStore,
+};
 use voice_me_ui::{
     BackendAction, BackendActions, BackendArea, BackendPanel, ConfirmDisclosure, DependenciesTab,
-    PromptOverlayView, RowProvisioning, SettingsView, blocker_notice,
+    DisclosureText, PromptOverlayView, RowProvisioning, SettingsView, blocker_notice,
 };
 
 #[cfg(target_os = "linux")]
@@ -342,6 +344,12 @@ fn check_request(state: &AppState) -> CheckRequest {
             BackendSelection::Remote(provider) => state.api_keys.has(*provider),
             BackendSelection::Local { .. } | BackendSelection::SystemVoice => false,
         },
+        // Story 3.14: only Azure has a region; only its voice is required.
+        has_region: state.azure_region.is_some(),
+        has_voice: state
+            .speech_voices
+            .get(state.backend_selection.language_backend())
+            .is_some(),
     }
 }
 
@@ -443,6 +451,15 @@ fn build_engine(
             generation,
         };
     }
+    // Story 3.14: Azure reads its key and region from the store per line,
+    // so neither needs a rebuild.
+    if let BackendSelection::Remote(RemoteProvider::Azure) = &state.backend_selection {
+        return Engine {
+            port: Some(Arc::new(AzureTtsAdapter::new(Azure::new(), store.clone()))),
+            unavailable: None,
+            generation,
+        };
+    }
     // Story 3.12: the System voice is eSpeak NG as a child process on
     // Linux, and has no engine elsewhere yet.
     if let BackendSelection::SystemVoice = &state.backend_selection {
@@ -482,13 +499,13 @@ fn build_engine(
 /// The remote provider whose disclosure the hotkey press has to ask about
 /// first (Story 3.6, Decision 1): DeepInfra, when it is selected, has a key
 /// and has not been confirmed. With no key the capability row blocks
-/// instead. Only DeepInfra can generate yet, so fal.ai is never asked
-/// about — Story 3.7 widens this.
+/// instead. Only DeepInfra and Azure (Story 3.14) can generate yet, so
+/// fal.ai is never asked about — Story 3.7 widens this.
 fn disclosure_needed(state: &AppState) -> Option<RemoteProvider> {
     match &state.backend_selection {
-        BackendSelection::Remote(provider @ RemoteProvider::DeepInfra)
-            if state.api_keys.has(*provider) && !state.disclosure_confirmed(*provider) =>
-        {
+        BackendSelection::Remote(
+            provider @ (RemoteProvider::DeepInfra | RemoteProvider::Azure),
+        ) if state.api_keys.has(*provider) && !state.disclosure_confirmed(*provider) => {
             Some(*provider)
         }
         _ => None,
@@ -617,7 +634,8 @@ fn retain_missing_rows(
 fn current_state(
     settings_store: &Arc<dyn SettingsStore>,
     dependencies: &DependencyOutcome,
-    system_voices: &[SystemVoice],
+    system_voices: &[StockVoice],
+    azure_voices: &[StockVoice],
 ) -> AppState {
     let mut state = settings_store.load().unwrap_or_else(|error| {
         // Falling back to defaults keeps the Speak Action reaching a real
@@ -636,7 +654,43 @@ fn current_state(
     // Story 3.12: held beside the report for the same reason — it is what
     // the engine listed on this machine a moment ago, not a preference.
     state.system_voices = system_voices.to_vec();
+    // Story 3.14: Azure's voice list, cached for the session (D1).
+    state.azure_voices = azure_voices.to_vec();
     state
+}
+
+/// How a failed Azure voice-list fetch starts its message beside the
+/// speech language (Story 3.14).
+const AZURE_LIST_ERROR: &str = "Couldn't list Azure's voices: ";
+
+/// Remove the speech-language error only if it is a failed Azure voice
+/// listing, so a failed language save is never cleared by a fetch.
+fn clear_azure_list_error(errors: &mut HashMap<BackendArea, String>) {
+    if errors
+        .get(&BackendArea::SpeechLanguage)
+        .is_some_and(|message| message.starts_with(AZURE_LIST_ERROR))
+    {
+        errors.remove(&BackendArea::SpeechLanguage);
+    }
+}
+
+/// What the disclosure for `provider` lists (Story 3.14, D2): for Azure,
+/// the saved language and the voice — by name, when the fetched list has
+/// it — and for a cloning provider the fixed items.
+fn disclosure_text(state: &AppState, provider: RemoteProvider) -> DisclosureText {
+    let backend = state.backend_selection.language_backend();
+    let language = state.speech_language().unwrap_or_default();
+    let voice = state.speech_voices.get(backend).map(|id| {
+        match state
+            .stock_voices(backend)
+            .iter()
+            .find(|voice| voice.id == id)
+        {
+            Some(listed) => format!("{} ({id})", listed.name),
+            None => id.to_string(),
+        }
+    });
+    DisclosureText::for_provider(provider, language, voice.as_deref())
 }
 
 /// The body of the notification a Speak Action gets when there is no engine
@@ -929,6 +983,10 @@ mod tests {
             unimplemented!("not exercised by these tests")
         }
 
+        fn save_azure_region(&self, _region: Option<&str>) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
         fn save_disclosure_confirmed(
             &self,
             _provider: voice_me_core::RemoteProvider,
@@ -990,13 +1048,13 @@ mod tests {
         });
 
         assert!(
-            current_state(&store, &DependencyOutcome::Pending, &[])
+            current_state(&store, &DependencyOutcome::Pending, &[], &[])
                 .reference_voice_sample
                 .is_none(),
             "nothing recorded yet at launch"
         );
         assert!(
-            current_state(&store, &DependencyOutcome::Pending, &[])
+            current_state(&store, &DependencyOutcome::Pending, &[], &[])
                 .reference_voice_sample
                 .is_some(),
             "a sample recorded in Settings since launch has to count — \
@@ -1010,17 +1068,22 @@ mod tests {
         let store: Arc<dyn SettingsStore> = Arc::new(SampleAppearsLater {
             loads: AtomicUsize::new(0),
         });
-        let voices = vec![SystemVoice {
+        let voices = vec![StockVoice {
             id: "trk/tr".to_string(),
             language: "tr".to_string(),
+            language_label: "Turkish".to_string(),
             name: "Turkish".to_string(),
             priority: 5,
         }];
 
         assert_eq!(
-            current_state(&store, &DependencyOutcome::Pending, &voices).system_voices,
+            current_state(&store, &DependencyOutcome::Pending, &voices, &[]).system_voices,
             voices
         );
+        // Story 3.14: Azure's cached list is merged the same way.
+        let state = current_state(&store, &DependencyOutcome::Pending, &[], &voices);
+        assert_eq!(state.azure_voices, voices);
+        assert!(state.system_voices.is_empty());
     }
 
     #[test]
@@ -1030,7 +1093,7 @@ mod tests {
         });
 
         assert_eq!(
-            current_state(&store, &DependencyOutcome::Pending, &[]).speech_backend,
+            current_state(&store, &DependencyOutcome::Pending, &[], &[]).speech_backend,
             SpeechBackend::CPU,
             "AD-9: the engine reads its backend off AppState, so it has to be written there"
         );
@@ -1429,6 +1492,131 @@ mod tests {
             assert!(port.is_ready(), "a remote engine has no sessions to build");
         }
 
+        /// Story 3.14: Azure gets its own remote engine, not the "later
+        /// release" sentence; its key and region are read per line.
+        #[test]
+        fn azure_gets_the_remote_engine() {
+            let (tx, _rx) = mpsc::unbounded();
+            let state = AppState {
+                backend_selection: BackendSelection::Remote(RemoteProvider::Azure),
+                ..AppState::default()
+            };
+
+            let engine = build_engine(&state, None, &tx, &unused_store());
+
+            assert!(engine.unavailable.is_none());
+            let port = engine.port.expect("an engine in the slot");
+            assert!(port.is_ready(), "a remote engine has no sessions to build");
+        }
+
+        /// Story 3.14: an Azure selection, keyed and with a voice list.
+        fn azure_state() -> AppState {
+            let mut keys = ApiKeys::default();
+            keys.set(RemoteProvider::Azure, Some("az-secret".to_string()));
+            AppState {
+                backend_selection: BackendSelection::Remote(RemoteProvider::Azure),
+                api_keys: keys,
+                azure_region: Some("westeurope".to_string()),
+                speech_languages: voice_me_core::SpeechLanguages {
+                    azure: "tr-TR".to_string(),
+                    ..Default::default()
+                },
+                speech_voices: voice_me_core::SpeechVoices {
+                    azure: Some("tr-TR-EmelNeural".to_string()),
+                    ..Default::default()
+                },
+                azure_voices: vec![StockVoice {
+                    id: "tr-TR-EmelNeural".to_string(),
+                    language: "tr-TR".to_string(),
+                    language_label: "Turkish (Türkiye)".to_string(),
+                    name: "Emel (Female)".to_string(),
+                    priority: 0,
+                }],
+                ..AppState::default()
+            }
+        }
+
+        /// Story 3.14: the check learns whether Azure has a region and a
+        /// voice of its own — another backend's voice does not count.
+        #[test]
+        fn the_check_request_carries_azures_region_and_voice() {
+            let request = check_request(&azure_state());
+            assert!(request.has_api_key && request.has_region && request.has_voice);
+            assert!(!format!("{request:?}").contains("az-secret"));
+
+            let bare = AppState {
+                azure_region: None,
+                speech_voices: voice_me_core::SpeechVoices {
+                    system_voice: Some("tr".to_string()),
+                    ..Default::default()
+                },
+                ..azure_state()
+            };
+            let request = check_request(&bare);
+            assert!(!request.has_region);
+            assert!(!request.has_voice, "the System voice's voice is its own");
+        }
+
+        /// Story 3.14: Azure's disclosure is asked for until confirmed.
+        #[test]
+        fn azures_disclosure_is_asked_once() {
+            let state = azure_state();
+            assert_eq!(disclosure_needed(&state), Some(RemoteProvider::Azure));
+            let confirmed = AppState {
+                confirmed_disclosures: vec![RemoteProvider::Azure],
+                ..state
+            };
+            assert_eq!(disclosure_needed(&confirmed), None);
+        }
+
+        /// Story 3.14 (D2): the disclosure names the saved locale and the
+        /// voice — by name when the list has it, else by its id.
+        #[test]
+        fn azures_disclosure_names_the_locale_and_voice() {
+            let text = disclosure_text(&azure_state(), RemoteProvider::Azure);
+            assert!(text.items.iter().any(|item| item.contains("tr-TR")));
+            assert!(
+                text.items
+                    .iter()
+                    .any(|item| item.contains("Emel (Female) (tr-TR-EmelNeural)")),
+                "{:?}",
+                text.items
+            );
+
+            let unlisted = AppState {
+                azure_voices: Vec::new(),
+                ..azure_state()
+            };
+            let text = disclosure_text(&unlisted, RemoteProvider::Azure);
+            assert!(
+                text.items
+                    .iter()
+                    .any(|item| item.ends_with(": tr-TR-EmelNeural")),
+                "{:?}",
+                text.items
+            );
+        }
+
+        /// Story 3.14: a voice-list fetch clears only its own error, never
+        /// a failed language save.
+        #[test]
+        fn the_azure_list_clears_only_its_own_error() {
+            let mut errors = HashMap::new();
+            errors.insert(
+                BackendArea::SpeechLanguage,
+                "Couldn't save the speech language: disk full".to_string(),
+            );
+            clear_azure_list_error(&mut errors);
+            assert!(errors.contains_key(&BackendArea::SpeechLanguage));
+
+            errors.insert(
+                BackendArea::SpeechLanguage,
+                format!("{AZURE_LIST_ERROR}Azure rejected the API key."),
+            );
+            clear_azure_list_error(&mut errors);
+            assert!(errors.is_empty());
+        }
+
         /// Story 3.12: the System voice is never an ONNX target — it
         /// resolves to the CPU placeholder, needs no key, no library and no
         /// restart — and on Linux gets the eSpeak NG engine.
@@ -1710,7 +1898,7 @@ fn main() {
         // cause is exactly the unactionable message the rest of this story
         // works to avoid.
         let engine: Rc<RefCell<Engine>> = Rc::new(RefCell::new(build_engine(
-            &current_state(&settings_store, &DependencyOutcome::Pending, &[]),
+            &current_state(&settings_store, &DependencyOutcome::Pending, &[], &[]),
             runtime_error.as_deref(),
             &event_tx,
             &remote_store,
@@ -1841,7 +2029,14 @@ fn main() {
         // Story 3.12: the voices eSpeak NG listed at the last check run with
         // the System voice selected. Held here, never persisted, and merged
         // into `AppState` and the panel like the dependency outcome.
-        let system_voices: Rc<RefCell<Vec<SystemVoice>>> = Rc::new(RefCell::new(Vec::new()));
+        let system_voices: Rc<RefCell<Vec<StockVoice>>> = Rc::new(RefCell::new(Vec::new()));
+        // Story 3.14 (D1): Azure's voice list, fetched at every check run
+        // with Azure selected and a key and region saved. Cached for the
+        // session, never persisted; saving a new key or region drops it.
+        // The generation is bumped on every drop, so a fetch that was
+        // already in flight for the old key or region is discarded.
+        let azure_voices: Rc<RefCell<Vec<StockVoice>>> = Rc::new(RefCell::new(Vec::new()));
+        let azure_generation: Rc<Cell<u64>> = Rc::new(Cell::new(0));
 
         // What the backend section shows, from the settings file and the
         // state above.
@@ -1853,6 +2048,7 @@ fn main() {
             let backend_errors = backend_errors.clone();
             let deleting_samples = deleting_samples.clone();
             let system_voices = system_voices.clone();
+            let azure_voices = azure_voices.clone();
             move || {
                 let state = settings_store.load().unwrap_or_default();
                 BackendPanel {
@@ -1869,6 +2065,8 @@ fn main() {
                     speech_languages: state.speech_languages,
                     speech_voices: state.speech_voices,
                     system_voices: system_voices.borrow().clone(),
+                    azure_region: state.azure_region,
+                    azure_voices: azure_voices.borrow().clone(),
                 }
             }
         });
@@ -1903,7 +2101,7 @@ fn main() {
             move |cx: &mut App| {
                 let selected = settings_store
                     .load()
-                    .is_ok_and(|state| state.backend_selection.is_stock_voice());
+                    .is_ok_and(|state| state.backend_selection.is_system_voice());
                 if !selected {
                     return;
                 }
@@ -1941,6 +2139,87 @@ fn main() {
             }
         });
 
+        // Story 3.14 (D1): with Azure selected and a key and region saved,
+        // every Dependency Check also fetches Azure's voice list in the
+        // background — the key only, no text, the one Azure call allowed
+        // before the disclosure — and pushes it into an open Backend tab. A
+        // failed fetch leaves the list empty and says why beside the speech
+        // language. A list already held is for the saved key and region
+        // (saving either drops it), so it is kept and not fetched again.
+        // The fetch only ever clears the error it set itself.
+        let refresh_azure_voices: Rc<dyn Fn(&mut App)> = Rc::new({
+            let settings_store = settings_store.clone();
+            let azure_voices = azure_voices.clone();
+            let azure_generation = azure_generation.clone();
+            let backend_errors = backend_errors.clone();
+            let push_panel = push_panel.clone();
+            move |cx: &mut App| {
+                let Ok(state) = settings_store.load() else {
+                    return;
+                };
+                if state.backend_selection != BackendSelection::Remote(RemoteProvider::Azure) {
+                    return;
+                }
+                let credentials = (
+                    state
+                        .api_keys
+                        .get(RemoteProvider::Azure)
+                        .map(str::to_string),
+                    state.azure_region.clone(),
+                );
+                let (Some(key), Some(region)) = credentials else {
+                    clear_azure_list_error(&mut backend_errors.borrow_mut());
+                    return;
+                };
+                if !azure_voices.borrow().is_empty() {
+                    return;
+                }
+                let generation = azure_generation.get();
+                let list = cx.background_spawn(async move {
+                    voice_me_tts_remote::list_azure_voices(&key, &region)
+                });
+                let azure_voices = azure_voices.clone();
+                let azure_generation = azure_generation.clone();
+                let backend_errors = backend_errors.clone();
+                let push_panel = push_panel.clone();
+                cx.spawn(async move |cx| {
+                    let result = list.await;
+                    // A key or region saved since: this list is not for it.
+                    if azure_generation.get() != generation {
+                        return;
+                    }
+                    let voices = match result {
+                        Ok(voices) => {
+                            clear_azure_list_error(&mut backend_errors.borrow_mut());
+                            voices
+                        }
+                        Err(error) => {
+                            eprintln!("could not list Azure's voices: {error}");
+                            backend_errors.borrow_mut().insert(
+                                BackendArea::SpeechLanguage,
+                                format!("{AZURE_LIST_ERROR}{error}"),
+                            );
+                            Vec::new()
+                        }
+                    };
+                    *azure_voices.borrow_mut() = voices;
+                    cx.update(|cx| (*push_panel)(cx));
+                })
+                .detach();
+            }
+        });
+
+        // Saving a new Azure key or region drops the cached list, and any
+        // fetch still in flight for the old one.
+        let drop_azure_voices: Rc<dyn Fn()> = Rc::new({
+            let azure_voices = azure_voices.clone();
+            let azure_generation = azure_generation.clone();
+            move || {
+                azure_voices.borrow_mut().clear();
+                azure_generation.set(azure_generation.get() + 1);
+            }
+        });
+
         // Re-run the Dependency Check for whatever is selected now, in the
         // background. A check that ran reports by event; only one that
         // could not run lands here.
@@ -1952,11 +2231,14 @@ fn main() {
             let settings_view_slot = settings_view_slot.clone();
             let provisioning = provisioning.clone();
             let refresh_system_voices = refresh_system_voices.clone();
+            let refresh_azure_voices = refresh_azure_voices.clone();
             move |cx: &mut App| {
                 (*refresh_system_voices)(cx);
+                (*refresh_azure_voices)(cx);
                 let request = check_request(&current_state(
                     &settings_store,
                     &dependency_outcome.borrow(),
+                    &[],
                     &[],
                 ));
                 let events = event_tx.clone();
@@ -2024,8 +2306,12 @@ fn main() {
                             restart_pending.set(true);
                         } else {
                             restart_pending.set(false);
-                            let state =
-                                current_state(&settings_store, &dependency_outcome.borrow(), &[]);
+                            let state = current_state(
+                                &settings_store,
+                                &dependency_outcome.borrow(),
+                                &[],
+                                &[],
+                            );
                             *engine.borrow_mut() = build_engine(
                                 &state,
                                 runtime_error.as_deref(),
@@ -2055,6 +2341,7 @@ fn main() {
             let apply_selection = apply_selection.clone();
             let remote_store = remote_store.clone();
             let deleting_samples = deleting_samples.clone();
+            let drop_azure_voices = drop_azure_voices.clone();
             move |action: BackendAction, cx: &mut App| match action {
                 BackendAction::Select(selection) => {
                     (*apply_selection)(selection, BackendArea::Selection, cx)
@@ -2144,11 +2431,34 @@ fn main() {
                             backend_errors
                                 .borrow_mut()
                                 .remove(&BackendArea::ApiKey(provider));
+                            if provider == RemoteProvider::Azure {
+                                (*drop_azure_voices)();
+                            }
                         }
                         Err(error) => {
                             backend_errors.borrow_mut().insert(
                                 BackendArea::ApiKey(provider),
                                 format!("Couldn't save the key: {error}"),
+                            );
+                        }
+                    }
+                    (*run_check)(cx);
+                    (*push_panel)(cx);
+                }
+                // Story 3.14: the same shape for Azure's region, which also
+                // drops the cached voice list; the check re-fetches it.
+                BackendAction::SaveAzureRegion(region) => {
+                    match settings_store.save_azure_region(region.as_deref()) {
+                        Ok(_) => {
+                            backend_errors
+                                .borrow_mut()
+                                .remove(&BackendArea::AzureRegion);
+                            (*drop_azure_voices)();
+                        }
+                        Err(error) => {
+                            backend_errors.borrow_mut().insert(
+                                BackendArea::AzureRegion,
+                                format!("Couldn't save the region: {error}"),
                             );
                         }
                     }
@@ -2194,9 +2504,10 @@ fn main() {
                     })
                     .detach();
                 }
-                // Story 3.11: saved and pushed back, nothing else. The
-                // language is read from settings on every Speak Action, so
-                // there is no check to re-run and no engine to rebuild.
+                // Story 3.11: saved and pushed back. The language is read
+                // from settings on every Speak Action, so there is no engine
+                // to rebuild. Story 3.14: the check is re-run, because a new
+                // Azure locale clears its voice, which the check requires.
                 BackendAction::SetSpeechLanguage(backend, code) => {
                     match settings_store.save_speech_language(backend, &code) {
                         Ok(_) => {
@@ -2213,6 +2524,7 @@ fn main() {
                             );
                         }
                     }
+                    (*run_check)(cx);
                     (*push_panel)(cx);
                 }
                 // Story 3.12: the same, for the System voice's voice.
@@ -2230,6 +2542,7 @@ fn main() {
                             );
                         }
                     }
+                    (*run_check)(cx);
                     (*push_panel)(cx);
                 }
                 BackendAction::Restart => match relaunch() {
@@ -2345,6 +2658,7 @@ fn main() {
 
         let open_overlay = {
             let overlay_slot = overlay_slot.clone();
+            let azure_voices = azure_voices.clone();
             let event_tx = event_tx.clone();
             let dependency_outcome = dependency_outcome.clone();
             let settings_store = settings_store.clone();
@@ -2356,15 +2670,19 @@ fn main() {
                 // Story 3.6: an unconfirmed remote provider opens the
                 // confirm-first shape. A blocker wins — there is nothing to
                 // confirm for a selection that cannot run.
+                let state = current_state(
+                    &settings_store,
+                    &dependency_outcome.borrow(),
+                    &[],
+                    &azure_voices.borrow(),
+                );
                 let disclosure = if blocker.is_none() {
-                    disclosure_needed(&current_state(
-                        &settings_store,
-                        &dependency_outcome.borrow(),
-                        &[],
-                    ))
+                    disclosure_needed(&state)
                 } else {
                     None
                 };
+                // Story 3.14: what the disclosure lists is the provider's own.
+                let disclosure_items = disclosure.map(|provider| disclosure_text(&state, provider));
                 let on_confirm: Option<ConfirmDisclosure> = disclosure.map(|provider| {
                     let settings_store = settings_store.clone();
                     Rc::new(move |_cx: &mut App| {
@@ -2436,6 +2754,9 @@ fn main() {
                                     PromptOverlayView::confirm_disclosure(
                                         event_tx.clone(),
                                         provider.label(),
+                                        disclosure_items.clone().unwrap_or_else(|| {
+                                            DisclosureText::for_provider(provider, "", None)
+                                        }),
                                         on_confirm,
                                         window,
                                         cx,
@@ -2506,9 +2827,11 @@ fn main() {
         // even on a run where the Tokio runtime would not start.
         {
             (*refresh_system_voices)(cx);
+            (*refresh_azure_voices)(cx);
             let request = check_request(&current_state(
                 &settings_store,
                 &DependencyOutcome::Pending,
+                &[],
                 &[],
             ));
             let events = event_tx.clone();
@@ -2588,8 +2911,13 @@ fn main() {
                         // not start a warm-up for the current one.
                         let for_current_selection = report.backend
                             == resolve_backend(
-                                &current_state(&settings_store, &DependencyOutcome::Pending, &[])
-                                    .backend_selection,
+                                &current_state(
+                                    &settings_store,
+                                    &DependencyOutcome::Pending,
+                                    &[],
+                                    &[],
+                                )
+                                .backend_selection,
                             );
                         // A row the check now calls ready has nothing left
                         // to install; whatever was held against it goes.
@@ -2747,6 +3075,7 @@ fn main() {
                                 &settings_store,
                                 &dependency_outcome.borrow(),
                                 &system_voices.borrow(),
+                                &azure_voices.borrow(),
                             );
                             let work = tokio_bridge::spawn_blocking(cx, move || {
                                 // Generation *and* playback, on the blocking

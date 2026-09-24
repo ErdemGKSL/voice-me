@@ -1,4 +1,4 @@
-//! A loopback HTTP/1.1 server the tests point DeepInfra at — a `tokio`
+//! A loopback HTTP/1.1 server the tests point DeepInfra and Azure at — a `tokio`
 //! listener on `127.0.0.1`, no mock crate, no real network.
 
 use std::sync::{Arc, Mutex};
@@ -33,7 +33,8 @@ impl Recorded {
 #[derive(Debug, Clone)]
 pub struct Reply {
     pub status: u16,
-    pub body: String,
+    pub content_type: &'static str,
+    pub body: Vec<u8>,
     pub delay: Duration,
 }
 
@@ -41,7 +42,18 @@ impl Reply {
     pub fn json(status: u16, body: impl Into<String>) -> Self {
         Self {
             status,
-            body: body.into(),
+            content_type: "application/json",
+            body: body.into().into_bytes(),
+            delay: Duration::ZERO,
+        }
+    }
+
+    /// A binary body — a RIFF WAV, say.
+    pub fn bytes(status: u16, content_type: &'static str, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            content_type,
+            body,
             delay: Duration::ZERO,
         }
     }
@@ -90,14 +102,16 @@ impl MockServer {
                         recorded.lock().unwrap().push(request.clone());
                         let reply = route(&request);
                         tokio::time::sleep(reply.delay).await;
-                        let response = format!(
-                            "HTTP/1.1 {} X\r\ncontent-type: application/json\r\n\
-                             content-length: {}\r\nconnection: close\r\n\r\n{}",
+                        let head = format!(
+                            "HTTP/1.1 {} X\r\ncontent-type: {}\r\n\
+                             content-length: {}\r\nconnection: close\r\n\r\n",
                             reply.status,
+                            reply.content_type,
                             reply.body.len(),
-                            reply.body
                         );
-                        let _ = stream.write_all(response.as_bytes()).await;
+                        let mut response = head.into_bytes();
+                        response.extend_from_slice(&reply.body);
+                        let _ = stream.write_all(&response).await;
                         let _ = stream.shutdown().await;
                     });
                 }

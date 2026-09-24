@@ -18,7 +18,10 @@ use std::sync::Mutex;
 use crate::audio::AudioBuffer;
 use crate::error::VoiceMeError;
 use crate::ports::{NotificationPort, TtsPort, VirtualMicPort};
-use crate::state::{AppState, BackendSelection, LanguageBackend, resolve_system_voice};
+use crate::state::{
+    AppState, BackendSelection, LanguageBackend, RemoteProvider, StockVoiceRefusal,
+    resolve_stock_voice,
+};
 
 /// Held across [`VirtualMicPort::play`], so one utterance finishes draining
 /// before the next one starts.
@@ -130,13 +133,40 @@ fn speak_inner(
     // never substituted — and there is no sample to check and nothing to
     // disclose: the engine runs on this machine.
     if backend == LanguageBackend::SystemVoice {
-        let voice = resolve_system_voice(
+        let voice = resolve_stock_voice(
+            backend,
             &state.system_voices,
             stored,
             state.speech_voices.get(backend),
         )
         .map_err(|refusal| VoiceMeError::Other(refusal.to_string()))?;
         let audio = tts.generate(text, None, &voice.language, Some(&voice.id))?;
+        return play(virtual_mic, audio);
+    }
+
+    // Story 3.14: Azure speaks in a stock Microsoft voice. A voice has to
+    // be chosen (D4). With the voice list fetched, the stored locale and
+    // voice are checked against it — refused by name, never substituted;
+    // without it, they are sent as stored and Azure's own answer is the
+    // check. Then the disclosure, and never a sample.
+    if backend == LanguageBackend::Remote(RemoteProvider::Azure) {
+        let refuse = |refusal: StockVoiceRefusal| VoiceMeError::Other(refusal.to_string());
+        let Some(voice) = state.speech_voices.get(backend) else {
+            return Err(refuse(StockVoiceRefusal::NoVoice(backend)));
+        };
+        let (locale, voice) = if state.azure_voices.is_empty() {
+            (stored.trim().to_string(), voice.to_string())
+        } else {
+            let listed = resolve_stock_voice(backend, &state.azure_voices, stored, Some(voice))
+                .map_err(refuse)?;
+            (listed.language.clone(), listed.id.clone())
+        };
+        if !state.disclosure_confirmed(RemoteProvider::Azure) {
+            return Err(VoiceMeError::DisclosureNotConfirmed(
+                RemoteProvider::Azure.label().to_string(),
+            ));
+        }
+        let audio = tts.generate(text, None, &locale, Some(&voice))?;
         return play(virtual_mic, audio);
     }
 
@@ -822,10 +852,11 @@ mod tests {
         assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
     }
 
-    fn system_voice(id: &str, language: &str, name: &str) -> crate::state::SystemVoice {
-        crate::state::SystemVoice {
+    fn system_voice(id: &str, language: &str, name: &str) -> crate::state::StockVoice {
+        crate::state::StockVoice {
             id: id.to_string(),
             language: language.to_string(),
+            language_label: name.to_string(),
             name: name.to_string(),
             priority: 5,
         }
@@ -842,6 +873,7 @@ mod tests {
             },
             speech_voices: crate::state::SpeechVoices {
                 system_voice: voice.map(str::to_string),
+                ..Default::default()
             },
             system_voices: vec![
                 system_voice("gmw/en-US", "en-us", "English (America)"),
@@ -1008,5 +1040,172 @@ mod tests {
                 None
             )
         );
+    }
+
+    fn azure_voice(short_name: &str, locale: &str) -> crate::state::StockVoice {
+        crate::state::StockVoice {
+            id: short_name.to_string(),
+            language: locale.to_string(),
+            language_label: locale.to_string(),
+            name: short_name.to_string(),
+            priority: 0,
+        }
+    }
+
+    /// Azure selected, key and region saved (the check guarantees those),
+    /// speaking `locale` in `voice`, disclosure confirmed — and no sample.
+    fn azure_state(locale: &str, voice: Option<&str>) -> AppState {
+        AppState {
+            backend_selection: BackendSelection::Remote(RemoteProvider::Azure),
+            confirmed_disclosures: vec![RemoteProvider::Azure],
+            azure_region: Some("westeurope".to_string()),
+            speech_languages: SpeechLanguages {
+                azure: locale.to_string(),
+                ..SpeechLanguages::default()
+            },
+            speech_voices: crate::state::SpeechVoices {
+                azure: voice.map(str::to_string),
+                ..Default::default()
+            },
+            azure_voices: vec![
+                azure_voice("tr-TR-EmelNeural", "tr-TR"),
+                azure_voice("tr-TR-AhmetNeural", "tr-TR"),
+                azure_voice("en-US-JennyNeural", "en-US"),
+            ],
+            ..AppState::default()
+        }
+    }
+
+    /// The matrix's Speak row: the locale and voice reach `generate`, no
+    /// clip does, and the buffer is played.
+    #[test]
+    fn azure_speaks_the_stored_voice_with_no_sample() {
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+
+        speak(
+            "Merhaba",
+            &azure_state("tr-TR", Some("tr-TR-EmelNeural")),
+            &tts,
+            &mic,
+            &notifier,
+        )
+        .unwrap();
+
+        assert_eq!(tts.calls.lock().unwrap()[0].2, "tr-TR");
+        assert_eq!(
+            tts.voices.lock().unwrap()[0],
+            (None, Some("tr-TR-EmelNeural".to_string()))
+        );
+        assert_eq!(mic.played().len(), 1);
+        assert!(notifier.summaries().is_empty());
+    }
+
+    /// The First line row: nothing is sent until the disclosure is
+    /// confirmed.
+    #[test]
+    fn azure_is_refused_before_generate_until_its_disclosure_is_confirmed() {
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+        let state = AppState {
+            confirmed_disclosures: vec![RemoteProvider::DeepInfra],
+            ..azure_state("tr-TR", Some("tr-TR-EmelNeural"))
+        };
+
+        let error = speak("Merhaba", &state, &tts, &mic, &notifier).unwrap_err();
+
+        assert!(matches!(error, VoiceMeError::DisclosureNotConfirmed(ref name) if name == "Azure"));
+        assert!(tts.calls.lock().unwrap().is_empty());
+        assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
+    }
+
+    /// The No voice row: refused by name, whatever the list says.
+    #[test]
+    fn azure_with_no_voice_is_refused_before_generate() {
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+
+        let error = speak(
+            "Merhaba",
+            &azure_state("tr-TR", None),
+            &tts,
+            &mic,
+            &notifier,
+        )
+        .unwrap_err();
+
+        assert!(tts.calls.lock().unwrap().is_empty());
+        assert!(
+            error.to_string().contains("Azure has no voice selected"),
+            "{error}"
+        );
+    }
+
+    /// The Stale voice row, and the Change locale row at this level: a
+    /// stored voice that is not one of the locale's is refused by name,
+    /// once, before any request.
+    #[test]
+    fn a_stale_azure_voice_is_refused_by_name_before_any_request() {
+        for state in [
+            azure_state("tr-TR", Some("tr-TR-GoneNeural")),
+            azure_state("en-US", Some("tr-TR-EmelNeural")),
+        ] {
+            let tts = FakeTts::default();
+            let notifier = FakeNotifier::default();
+            let mic = FakeMic::default();
+
+            let error = speak("Merhaba", &state, &tts, &mic, &notifier).unwrap_err();
+
+            assert!(tts.calls.lock().unwrap().is_empty());
+            let message = error.to_string();
+            assert!(
+                message.contains("Azure") && message.contains("Neural"),
+                "{message}"
+            );
+            assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
+        }
+    }
+
+    /// The List not fetched row: the stored locale and voice are spoken as
+    /// stored; a listed one is sent in the list's own spelling.
+    #[test]
+    fn azure_with_no_list_speaks_the_stored_locale_and_voice() {
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+        let unlisted = AppState {
+            azure_voices: Vec::new(),
+            ..azure_state("tr-TR", Some("tr-TR-GoneNeural"))
+        };
+
+        speak("Bir", &unlisted, &tts, &mic, &notifier).unwrap();
+        speak(
+            "Iki",
+            &azure_state(" tr-tr ", Some("tr-TR-AhmetNeural")),
+            &tts,
+            &mic,
+            &notifier,
+        )
+        .unwrap();
+
+        let calls: Vec<_> = tts
+            .voices
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, voice)| voice.clone().unwrap())
+            .collect();
+        assert_eq!(calls, vec!["tr-TR-GoneNeural", "tr-TR-AhmetNeural"]);
+        let locales: Vec<_> = tts
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| call.2.clone())
+            .collect();
+        assert_eq!(locales, vec!["tr-TR", "tr-TR"]);
     }
 }

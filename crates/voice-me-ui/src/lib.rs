@@ -9,11 +9,12 @@ mod settings;
 mod voice_setup;
 
 pub use backend::{
-    API_KEY_STORAGE_NOTICE, BackendAction, BackendActions, BackendArea, BackendPanel, BackendView,
+    API_KEY_STORAGE_NOTICE, AZURE_PICK_A_VOICE, AZURE_STOCK_VOICE_NOTE, BackendAction,
+    BackendActions, BackendArea, BackendPanel, BackendView,
 };
 pub use dependencies::{DependenciesView, OpenBackendTab, RowProvisioning, blocker_notice};
 pub use hotkey::{CaptureOutcome, HotkeyView, capture_keystroke, display_hotkey};
-pub use prompt_overlay::{ConfirmDisclosure, DISCLOSURE_ITEMS, PromptOverlayView};
+pub use prompt_overlay::{ConfirmDisclosure, DISCLOSURE_ITEMS, DisclosureText, PromptOverlayView};
 pub use settings::{DependenciesTab, SettingsView};
 pub use voice_setup::{
     MAX_RECORDING_SECS, MIN_RECORDING_SECS, VoiceSetupView, recording_meets_minimum_duration,
