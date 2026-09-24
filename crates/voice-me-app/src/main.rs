@@ -71,7 +71,6 @@ use gpui_kit::{
     App, AppContext as _, QuitMode, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
     WindowHandle, WindowKind, WindowOptions, px, size,
 };
-#[cfg(target_os = "linux")]
 use voice_me_core::VoiceMeError;
 use voice_me_core::{
     ActiveBackend, AppEvent, AppState, BackendSelection, CheckRequest, DependencyKind,
