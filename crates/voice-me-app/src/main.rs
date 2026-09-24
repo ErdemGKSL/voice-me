@@ -196,14 +196,13 @@ fn overlay_window_bounds(
 
 /// Always-on-top is a two-tier capability, mirroring Story 2.3's two hotkey
 /// backends. `WindowKind::PopUp` is a real override-redirect, taskbar-less,
-/// above-everything window under X11. Wayland has no equivalent in this GPUI
-/// version — `PopUp` falls through to a plain xdg_toplevel and the
-/// compositor places it itself — so a Wayland session gets an ordinary
-/// focused window that may sit below a fullscreen game. `LayerShell` is
-/// deliberately not used: GNOME/Mutter does not implement
-/// `zwlr_layer_shell_v1`, so it would add a second unverifiable path for no
-/// gain. The difference is documented in the README rather than worked
-/// around.
+/// above-everything window under X11. On Wayland the overlay first asks for
+/// a `zwlr_layer_shell_v1` surface ([`overlay_layer_shell`]): it sits above
+/// every window on the overlay layer, is never tiled (Hyprland, Sway and
+/// KDE otherwise tile a plain toplevel), and honours the vertical position.
+/// GNOME/Mutter has no layer shell; there the open fails with
+/// `LayerShellNotSupportedError` and the overlay falls back to an ordinary
+/// toplevel that the compositor places itself.
 #[cfg(target_os = "linux")]
 fn overlay_window_kind() -> WindowKind {
     overlay_window_kind_for(voice_me_hotkey_linux::session_kind())
@@ -221,6 +220,45 @@ fn overlay_window_kind_for(session: voice_me_hotkey_linux::SessionKind) -> Windo
         // this session actually gets.
         voice_me_hotkey_linux::SessionKind::Wayland => WindowKind::Normal,
     }
+}
+
+/// Set once the compositor has refused a layer-shell overlay (GNOME), so
+/// later summons go straight to an ordinary window.
+#[cfg(target_os = "linux")]
+static LAYER_SHELL_REFUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The overlay as a Wayland layer-shell surface: on the overlay layer,
+/// anchored to the top edge only (so the compositor centres it
+/// horizontally), `top_margin` below that edge, and holding the keyboard
+/// while it is open so the prompt takes typing at once.
+#[cfg(target_os = "linux")]
+fn overlay_layer_shell(top_margin: f32) -> gpui_kit::layer_shell::LayerShellOptions {
+    use gpui_kit::layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellOptions};
+    LayerShellOptions {
+        namespace: "voice-me-overlay".to_string(),
+        layer: Layer::Overlay,
+        anchor: Anchor::TOP,
+        exclusive_zone: None,
+        exclusive_edge: None,
+        margin: Some((px(top_margin.max(0.)), px(0.), px(0.), px(0.))),
+        keyboard_interactivity: KeyboardInteractivity::Exclusive,
+    }
+}
+
+/// How far below the top of the display a layer-shell overlay sits: the
+/// same percentage placement as [`overlay_bounds_in`], measured from the
+/// display's own top edge (a layer surface's margin is relative to it).
+fn overlay_top_margin(bounds: &WindowBounds, cx: &App) -> f32 {
+    let WindowBounds::Windowed(bounds) = bounds else {
+        return 0.;
+    };
+    let top = cx
+        .primary_display()
+        .or_else(|| cx.displays().into_iter().next())
+        .map(|display| f32::from(display.bounds().origin.y))
+        .unwrap_or(0.);
+    f32::from(bounds.origin.y) - top
 }
 
 /// Whether this is a Wayland session, where the compositor places the
@@ -1945,6 +1983,24 @@ mod tests {
 
     /// A visible area narrower than the overlay keeps the window's left
     /// edge on it rather than off-screen to the left.
+    /// The Wayland overlay is a layer surface on the overlay layer,
+    /// anchored to the top only (centred horizontally by the compositor),
+    /// with the keyboard, and never a negative margin.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_wayland_overlay_is_a_top_anchored_layer_surface() {
+        use gpui_kit::layer_shell::{Anchor, KeyboardInteractivity, Layer};
+        let options = overlay_layer_shell(240.);
+        assert_eq!(options.layer, Layer::Overlay);
+        assert_eq!(options.anchor, Anchor::TOP);
+        assert_eq!(
+            options.keyboard_interactivity,
+            KeyboardInteractivity::Exclusive
+        );
+        assert_eq!(options.margin, Some((px(240.), px(0.), px(0.), px(0.))));
+        assert_eq!(overlay_layer_shell(-5.).margin.unwrap().0, px(0.));
+    }
+
     #[test]
     fn the_overlay_stays_on_a_display_narrower_than_itself() {
         let visible = Bounds {
@@ -4318,7 +4374,23 @@ fn main() {
 
                 let event_tx = event_tx.clone();
                 let overlay_slot_on_close = overlay_slot.clone();
-                let options = WindowOptions {
+                let window_bounds = overlay_window_bounds(
+                    size(
+                        px(OVERLAY_WIDTH),
+                        px(if disclosure.is_some() {
+                            OVERLAY_DISCLOSURE_HEIGHT
+                        } else if blocker.is_some() {
+                            OVERLAY_BLOCKED_HEIGHT
+                        } else {
+                            PROMPT_BAR_HEIGHT
+                        }),
+                    ),
+                    state.overlay_position,
+                    cx,
+                );
+                #[cfg(target_os = "linux")]
+                let top_margin = overlay_top_margin(&window_bounds, cx);
+                let options_with = |kind: WindowKind| WindowOptions {
                     titlebar: None,
                     // Client-side decorations are what make a borderless
                     // window possible at all on Linux.
@@ -4326,21 +4398,8 @@ fn main() {
                     window_background: WindowBackgroundAppearance::Transparent,
                     // Read from settings at every open, so a slider moved
                     // in Settings applies to the next summon.
-                    window_bounds: Some(overlay_window_bounds(
-                        size(
-                            px(OVERLAY_WIDTH),
-                            px(if disclosure.is_some() {
-                                OVERLAY_DISCLOSURE_HEIGHT
-                            } else if blocker.is_some() {
-                                OVERLAY_BLOCKED_HEIGHT
-                            } else {
-                                PROMPT_BAR_HEIGHT
-                            }),
-                        ),
-                        state.overlay_position,
-                        cx,
-                    )),
-                    kind: overlay_window_kind(),
+                    window_bounds: Some(window_bounds),
+                    kind,
                     focus: true,
                     is_resizable: false,
                     is_movable: false,
@@ -4348,42 +4407,82 @@ fn main() {
                     ..Default::default()
                 };
 
-                let handle = match cx.open_window(options, move |window, cx| {
-                    // Windows draws its own frame around every top-level
-                    // window, which showed as a dark rectangle around the
-                    // overlay's rounded card.
-                    #[cfg(target_os = "windows")]
-                    remove_dwm_frame(window);
-                    let view =
-                        cx.new(
-                            |cx| match (blocker.clone(), disclosure, on_confirm.clone()) {
-                                (Some(blocker), _, _) => PromptOverlayView::blocked(
-                                    event_tx.clone(),
-                                    blocker,
-                                    window,
-                                    cx,
-                                ),
-                                (None, Some(provider), Some(on_confirm)) => {
-                                    PromptOverlayView::confirm_disclosure(
+                // A fresh build closure per attempt: the layer-shell open may
+                // be refused and retried as an ordinary window.
+                let make_build = {
+                    let event_tx = event_tx.clone();
+                    let overlay_slot_on_close = overlay_slot_on_close.clone();
+                    move || {
+                        let event_tx = event_tx.clone();
+                        let overlay_slot_on_close = overlay_slot_on_close.clone();
+                        let blocker = blocker.clone();
+                        let disclosure = disclosure.clone();
+                        let disclosure_items = disclosure_items.clone();
+                        let on_confirm = on_confirm.clone();
+                        move |window: &mut gpui_kit::Window, cx: &mut App| {
+                            // Windows draws its own frame around every top-level
+                            // window, which showed as a dark rectangle around the
+                            // overlay's rounded card.
+                            #[cfg(target_os = "windows")]
+                            remove_dwm_frame(window);
+                            let view = cx.new(|cx| {
+                                match (blocker.clone(), disclosure.clone(), on_confirm.clone()) {
+                                    (Some(blocker), _, _) => PromptOverlayView::blocked(
                                         event_tx.clone(),
-                                        provider.label(),
-                                        disclosure_items.clone().unwrap_or_else(|| {
-                                            DisclosureText::for_provider(provider, "", None)
-                                        }),
-                                        on_confirm,
+                                        blocker,
                                         window,
                                         cx,
-                                    )
+                                    ),
+                                    (None, Some(provider), Some(on_confirm)) => {
+                                        PromptOverlayView::confirm_disclosure(
+                                            event_tx.clone(),
+                                            provider.label(),
+                                            disclosure_items.clone().unwrap_or_else(|| {
+                                                DisclosureText::for_provider(provider, "", None)
+                                            }),
+                                            on_confirm,
+                                            window,
+                                            cx,
+                                        )
+                                    }
+                                    _ => PromptOverlayView::new(event_tx.clone(), window, cx),
                                 }
-                                _ => PromptOverlayView::new(event_tx.clone(), window, cx),
-                            },
-                        );
-                    window.on_window_should_close(cx, move |_window, _cx| {
-                        *overlay_slot_on_close.borrow_mut() = None;
-                        true
-                    });
-                    cx.new(|cx| PromptOverlayView::root(view, window, cx))
-                }) {
+                            });
+                            window.on_window_should_close(cx, move |_window, _cx| {
+                                *overlay_slot_on_close.borrow_mut() = None;
+                                true
+                            });
+                            cx.new(|cx| PromptOverlayView::root(view, window, cx))
+                        }
+                    }
+                };
+
+                #[cfg(target_os = "linux")]
+                let first_kind = if is_wayland_session()
+                    && !LAYER_SHELL_REFUSED.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    WindowKind::LayerShell(overlay_layer_shell(top_margin))
+                } else {
+                    overlay_window_kind()
+                };
+                #[cfg(not(target_os = "linux"))]
+                let first_kind = overlay_window_kind();
+                #[cfg(target_os = "linux")]
+                let tried_layer_shell = matches!(first_kind, WindowKind::LayerShell(_));
+
+                let opened = cx.open_window(options_with(first_kind), make_build());
+                #[cfg(target_os = "linux")]
+                let opened = match opened {
+                    Err(error) if tried_layer_shell => {
+                        // GNOME has no layer shell: an ordinary toplevel,
+                        // placed by the compositor, from now on.
+                        LAYER_SHELL_REFUSED.store(true, std::sync::atomic::Ordering::Relaxed);
+                        eprintln!("overlay: no layer shell ({error}); using a window");
+                        cx.open_window(options_with(WindowKind::Normal), make_build())
+                    }
+                    other => other,
+                };
+                let handle = match opened {
                     Ok(handle) => handle,
                     Err(error) => {
                         // The app stays tray-resident: a window that would

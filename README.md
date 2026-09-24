@@ -17,8 +17,8 @@ with a single focused field. Type a line and press `Enter` to send it;
 the overlay never quits the app — it stays in the tray either way.
 Settings → Hotkey → "Overlay position" sets how high it opens (0% top,
 100% bottom, default 50% centred in the free area; saved as
-`overlay_position` in `settings.toml`) — on Wayland the compositor may
-ignore it.
+`overlay_position` in `settings.toml`) — on GNOME/Wayland the compositor
+may ignore it.
 
 A confirmed line is now actually generated (Story 2.6), in the speech
 language from `settings.toml` (`speech_language`, default `tr`), in the voice
@@ -247,14 +247,14 @@ backend does:
 | Session | Overlay window | Above a fullscreen window? |
 |---------|----------------|----------------------------|
 | X11 | always-on-top, taskbar-less popup | expected — **not yet verified on real hardware** |
-| Wayland | ordinary focused window | no — and the compositor, not voice-me, decides where it appears |
+| Wayland with layer shell (Hyprland, Sway, KDE, …) | a layer-shell surface on the overlay layer, never tiled, at the chosen position | yes, above normal windows — **not yet verified on real hardware** |
+| Wayland without layer shell (GNOME) | ordinary focused window | no — and the compositor, not voice-me, decides where it appears |
 
-This is a platform limitation, not a bug. The GPUI version this app is built
-on has no always-on-top window type that works under Wayland, and the one
-mechanism that could provide it — `zwlr_layer_shell_v1` — is not implemented
-by GNOME/Mutter, so it is deliberately not used. Under Wayland the overlay
-still opens, focuses, and accepts typing normally; it may simply sit behind a
-fullscreen game instead of over it.
+On Wayland the overlay first asks for a `zwlr_layer_shell_v1` surface, so
+tiling compositors such as Hyprland never tile it and it opens at the chosen
+height. GNOME/Mutter does not implement layer shell; there it falls back to
+an ordinary window that still opens, focuses, and accepts typing normally,
+but may sit behind a fullscreen game instead of over it.
 
 ## Linux: global hotkey setup
 

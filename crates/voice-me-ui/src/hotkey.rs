@@ -49,8 +49,7 @@ const CONFLICT_MESSAGE: &str = "This combination is already in use. Try another.
 const NO_HOTKEY_LABEL: &str = "None set";
 const OVERLAY_POSITION_HELP: &str =
     "How high the prompt overlay opens: 0% is the top of the screen, 100% the bottom.";
-const OVERLAY_POSITION_WAYLAND_NOTE: &str =
-    "On Wayland the compositor decides where windows open, so this may have no effect.";
+const OVERLAY_POSITION_WAYLAND_NOTE: &str = "Without layer-shell support (GNOME on Wayland) the compositor decides where windows open, so this may have no effect there.";
 
 /// The slider's reading as a whole percentage, 0–100.
 fn slider_percent(value: f32) -> u8 {
