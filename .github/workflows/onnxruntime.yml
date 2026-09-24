@@ -127,7 +127,9 @@ jobs:
           path: dist/*
 
   build-windows:
-    runs-on: windows-latest
+    # CUDA 12.8's nvcc supports Visual Studio 2022 as its host compiler;
+    # windows-latest has moved past it.
+    runs-on: windows-2022
     timeout-minutes: 355
     steps:
       - uses: actions/setup-python@v5
