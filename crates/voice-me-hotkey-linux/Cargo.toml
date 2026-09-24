@@ -17,6 +17,10 @@ global-hotkey = "0.8"
 # `Device`/`fetch_events` API, so the optional `tokio`/`stream-trait` async
 # stack stays out of the build.
 evdev = { version = "0.13", default-features = false }
+# The crate body is `#![cfg(target_os = "linux")]`, but its dependencies
+# are still built on Windows (`cargo test --workspace`). These three only
+# serve the Linux-only code, and `ashpd` does not compile off Unix.
+[target.'cfg(target_os = "linux")'.dependencies]
 # GNOME/KDE native path (spec-native-gnome-kde-hotkey): the D-Bus summon
 # service the GNOME shortcut's `gdbus call` reaches, and the kglobalaccel
 # client. The locked 5.x with exactly the features gpui-tray already
