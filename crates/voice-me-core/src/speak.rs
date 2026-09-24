@@ -950,7 +950,7 @@ mod tests {
                     system_voices: Vec::new(),
                     ..system_voice_state("tr", None)
                 },
-                "eSpeak NG",
+                "Settings → Backend",
             ),
         ] {
             let tts = FakeTts::default();

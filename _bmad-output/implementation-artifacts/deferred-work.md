@@ -164,3 +164,9 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-3-2-install-the-onnx-runtime-on-windows.md`
   summary: The ONNX Runtime row reports "ready" once the library file exists, without checking that it loads; on Windows `onnxruntime.dll` also needs the Visual C++ Redistributable (MSVC runtime).
   evidence: `runtime_row` in `crates/voice-me-deps/src/lib.rs` checks only `resolved.path.exists()`. On a clean Windows machine without the VC++ runtime, Install succeeds and the row turns ready, but the engine then fails to load the DLL. The fix is a load probe (the capability `--probe-runtime` helper may already cover it; check) or a VC++ Redistributable dependency row with steps. It was pre-existing for manually copied runtimes; the Windows auto-install makes it easier to reach.
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-12-speak-instantly-with-espeak-ng-on-linux.md`
+  summary: A late SystemVoice or Remote Dependency Check report that arrives after a switch to CPU can start the ONNX warm-up before the runtime is verified.
+  evidence: `resolve_backend` in `crates/voice-me-app/src/main.rs` maps SystemVoice and Remote selections to the CPU placeholder, so a stale report passes `for_current_selection`. This was already true for Remote selections before 3.12. The fix is to tag each report with the selection it was run for.
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-12-speak-instantly-with-espeak-ng-on-linux.md`
+  summary: Nothing tests the root's Speak Action state assembly (`refresh_system_voices` → `current_state(…, &system_voices)` → `speak`).
+  evidence: It is built inline in `fn main`, so dropping the voice list from `current_state` would pass CI. The fix is to move the assembly into a testable function, alongside 3.11's `backend_actions` deferral.

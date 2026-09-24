@@ -1654,11 +1654,14 @@ fn main() {
     // load failure is treated the same as "no sample" — falling back to the
     // empty-state copy is safe, whereas silently treating an unreadable
     // store as "has a sample" would hide the first-run prompt from someone
-    // who actually needs it.
-    let has_active_sample = settings_store
-        .load()
-        .ok()
+    // who actually needs it. Story 3.12: the System voice speaks without a
+    // sample, so a user who selected it is not a first run either.
+    let startup_state = settings_store.load().ok();
+    let has_active_sample = startup_state
+        .as_ref()
         .is_some_and(|state| state.reference_voice_sample.is_some());
+    let skip_first_run_open = has_active_sample
+        || startup_state.is_some_and(|state| state.backend_selection.is_stock_voice());
 
     // Tray residency (Story 2.2) only holds under an explicit quit mode.
     // gpui's default quits the process the moment the last window closes on
@@ -1890,10 +1893,12 @@ fn main() {
         // Story 3.12: with the System voice selected, every Dependency Check
         // also re-reads eSpeak NG's voice list, in the background, and
         // pushes it into an open Backend tab. A list that cannot be read is
-        // an empty one — the engine row already says why.
+        // an empty one, and the tab says why beside the speech language:
+        // the engine row can be Ready while the listing itself failed.
         let refresh_system_voices: Rc<dyn Fn(&mut App)> = Rc::new({
             let settings_store = settings_store.clone();
             let system_voices = system_voices.clone();
+            let backend_errors = backend_errors.clone();
             let push_panel = push_panel.clone();
             move |cx: &mut App| {
                 let selected = settings_store
@@ -1907,19 +1912,32 @@ fn main() {
                     let list = cx
                         .background_spawn(async move { voice_me_tts_system_linux::list_voices() });
                     let system_voices = system_voices.clone();
+                    let backend_errors = backend_errors.clone();
                     let push_panel = push_panel.clone();
                     cx.spawn(async move |cx| {
-                        let voices = list.await.unwrap_or_else(|error| {
-                            eprintln!("could not list the System voice's voices: {error}");
-                            Vec::new()
-                        });
+                        let voices = match list.await {
+                            Ok(voices) => {
+                                backend_errors
+                                    .borrow_mut()
+                                    .remove(&BackendArea::SpeechLanguage);
+                                voices
+                            }
+                            Err(error) => {
+                                eprintln!("could not list the System voice's voices: {error}");
+                                backend_errors.borrow_mut().insert(
+                                    BackendArea::SpeechLanguage,
+                                    format!("Couldn't list the System voice's voices: {error}"),
+                                );
+                                Vec::new()
+                            }
+                        };
                         *system_voices.borrow_mut() = voices;
                         cx.update(|cx| (*push_panel)(cx));
                     })
                     .detach();
                 }
                 #[cfg(not(target_os = "linux"))]
-                let _ = (&system_voices, &push_panel, cx);
+                let _ = (&system_voices, &backend_errors, &push_panel, cx);
             }
         });
 
@@ -2474,7 +2492,7 @@ fn main() {
         // starts tray-only. Safe to call even if the tray-failure fallback
         // above already opened the window — `open_settings` activates the
         // existing window instead of duplicating it.
-        if !has_active_sample {
+        if !skip_first_run_open {
             (*open_settings)(cx);
         }
 
