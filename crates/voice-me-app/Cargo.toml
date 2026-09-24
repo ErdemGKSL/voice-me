@@ -47,3 +47,8 @@ voice-me-tray-windows = { path = "../voice-me-tray-windows" }
 voice-me-hotkey-windows = { path = "../voice-me-hotkey-windows" }
 voice-me-notify-windows = { path = "../voice-me-notify-windows" }
 voice-me-audio-windows = { path = "../voice-me-audio-windows" }
+# The overlay's borderless look: DWM's own 1px border, shadow and corner
+# rounding are switched off on its window. The `windows` 0.62 gpui already
+# locks, and the window's HWND comes from gpui through raw-window-handle.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+raw-window-handle = "0.6"

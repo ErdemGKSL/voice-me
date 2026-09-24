@@ -8725,6 +8725,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "gpui-kit",
+ "raw-window-handle",
  "voice-me-audio-linux",
  "voice-me-audio-windows",
  "voice-me-core",
@@ -8742,6 +8743,7 @@ dependencies = [
  "voice-me-tts-remote",
  "voice-me-tts-system-linux",
  "voice-me-ui",
+ "windows 0.62.2",
 ]
 
 [[package]]

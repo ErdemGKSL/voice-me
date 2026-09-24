@@ -178,6 +178,56 @@ fn overlay_window_kind_for(session: voice_me_hotkey_linux::SessionKind) -> Windo
     }
 }
 
+/// Switch off DWM's 1px border, drop shadow and corner rounding on the
+/// overlay window. The overlay is a transparent, undecorated window whose
+/// card draws its own edge, but Windows 11 still frames every top-level
+/// window, and that frame showed as a dark rectangle around the card.
+/// Failures are ignored: an older Windows without these attributes simply
+/// keeps its frame.
+#[cfg(target_os = "windows")]
+fn remove_dwm_frame(window: &gpui_kit::Window) {
+    use raw_window_handle::RawWindowHandle;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{
+        DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_NCRENDERING_POLICY,
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DwmSetWindowAttribute,
+    };
+    // `DWMWA_COLOR_NONE`: no border at all.
+    const COLOR_NONE: u32 = 0xFFFF_FFFE;
+
+    let Ok(handle) = raw_window_handle::HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = HWND(win32.hwnd.get() as *mut core::ffi::c_void);
+    let corner = DWMWCP_DONOTROUND;
+    let policy = DWMNCRP_DISABLED;
+    // SAFETY: `hwnd` is this live window's handle, and each pointer is to a
+    // local of exactly the size passed with it.
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            (&COLOR_NONE as *const u32).cast::<core::ffi::c_void>(),
+            size_of::<u32>() as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &corner as *const _ as *const core::ffi::c_void,
+            size_of_val(&corner) as u32,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_NCRENDERING_POLICY,
+            &policy as *const _ as *const core::ffi::c_void,
+            size_of_val(&policy) as u32,
+        );
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 fn overlay_window_kind() -> WindowKind {
     WindowKind::PopUp
@@ -3723,6 +3773,11 @@ fn main() {
                 };
 
                 let handle = match cx.open_window(options, move |window, cx| {
+                    // Windows draws its own frame around every top-level
+                    // window, which showed as a dark rectangle around the
+                    // overlay's rounded card.
+                    #[cfg(target_os = "windows")]
+                    remove_dwm_frame(window);
                     let view =
                         cx.new(
                             |cx| match (blocker.clone(), disclosure, on_confirm.clone()) {
