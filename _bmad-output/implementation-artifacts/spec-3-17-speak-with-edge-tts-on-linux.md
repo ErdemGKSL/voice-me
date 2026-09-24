@@ -2,7 +2,7 @@
 title: 'Speak with Edge TTS on Linux (Story 3.17)'
 type: 'feature'
 created: '2026-09-24'
-status: 'in-progress'
+status: 'in-review'
 route: 'dispatch'
 review_loop_iteration: 0
 baseline_commit: 'a12c688e87f1eb7b0ef625382cfa15420bbc74d2'
@@ -30,7 +30,7 @@ context: ['{project-root}/_bmad-output/implementation-artifacts/epic-3-context.m
   - Language label = the locale. Priority = list order.
   - Zero voices is an error.
 - **Language and voice:** defaults are `tr-TR` and the language's first listed voice (`requires_voice` = false). Values are validated through `resolve_stock_voice` and refused by name. Persistence is `edge_tts` in `[speech_languages]`/`[speech_voices]`. The voice list is held in `AppState.edge_tts_voices`, not persisted, and refreshed in the background on each check when Edge TTS is selected and the program is found.
-- **Disclosure:** before the first request, and before any process is spawned. It lists the typed text, the language and the voice. Its note says: "Edge TTS sends the text to Microsoft's Edge Read Aloud service. It is free, needs no account, and is not an official API: it may stop working at any time."
+- **Disclosure:** before the first speech request, and before any speech process is spawned. **Decision (Erdem, 2026-09-24):** the voice listing (`--list-voices`) may run before the disclosure is confirmed. It sends none of the user's text, which is the same exception Azure's voice list has. It lists the typed text, the language and the voice. Its note says: "Edge TTS sends the text to Microsoft's Edge Read Aloud service. It is free, needs no account, and is not an official API: it may stop working at any time."
 - **Row:** `DependencyKind::EdgeTtsProgram` blocks speech and has manual steps only. `provision` refuses it.
   - Ready: "Found at {path}."
   - Missing: title "edge-tts", detail "edge-tts is not installed. Please install it: `pipx install edge-tts`". The steps are the distro's pipx command from `/etc/os-release`, then "Press Check again.":
@@ -142,6 +142,30 @@ context: ['{project-root}/_bmad-output/implementation-artifacts/epic-3-context.m
 ## Spec Change Log
 
 ## Review Triage Log
+
+Pass 1 (blind-hunter, edge-case-hunter, verification-gap), 2026-09-24.
+
+| Verdict | Finding | Evidence |
+|---|---|---|
+| medium | `--list-voices` contacts Microsoft on every check, before the disclosure is confirmed (blind, edge) | Real. The frozen block said both "refreshed on each check" and "before any process is spawned" → intent gap, asked. Erdem decided the listing may run first (no user text; Azure's exception). Recorded in the frozen block. No code change |
+| medium | The disclosure can say "none chosen" when the list is empty, and a different voice then speaks (blind, edge) | Mostly moot after the decision: the list is fetched at selection (`apply_selection` → `run_check`), so it is filled before the overlay. With an empty list, Speak is refused ("no voices listed"), so nothing speaks unnamed → rejected |
+| medium | `refresh_edge_tts_voices` has no generation guard, so stale or late results win; it writes after a switch away; it overwrites an unrelated SpeechLanguage error (blind, edge, verification-gap other) | Confirmed in main.rs; Azure has `azure_generation` → patch |
+| medium | The listing-result handling in the composition root is untested (verification-gap, pre-verified) | → patch (extract a pure fn and test it) |
+| medium | The missing-program path of `edge_tts_rows` never runs in CI, and its manual steps are unchecked (verification-gap, pre-verified) | → patch (pure `edge_tts_rows_with` and tests) |
+| medium | The real `--list-voices` test runs on every CI build and depends on Microsoft's service (blind, verification-gap other) | Confirmed: it is not gated, and CI installs the program → patch (gate behind `VOICE_ME_EDGE_TTS_ONLINE`) |
+| low | Relative `PATH` entries resolve `edge-tts` against the working directory (edge) | Confirmed; a one-line filter → patch |
+| low | An older edge-tts's list format gives "listed no voices" with no hint (blind) | Confirmed; a string correction → patch |
+| false | Selecting Edge TTS does not list voices until the next check (blind) | `apply_selection` calls `run_check`, which runs `refresh_edge_tts_voices` → rejected |
+| low | The steps never include `pipx install edge-tts`; "Or:" follows nothing; pip `--user` fails on PEP 668 systems (blind) | The row's detail carries the pipx command, and the steps are frozen. Changing them edits the spec → rejected |
+| low | Language labels are raw locale codes (blind) | The frozen block sets label = locale → rejected |
+| low | The 30 s deadline does not scale with text length (blind) | Set by the frozen block, and overlay lines are short → rejected |
+| low | Duplicated strings (`EDGE_TTS_NOT_INSTALLED`, the stock note, the other-OS text) (blind) | Sharing them needs cfg-gated imports, since the edge crate is Linux-only. No named divergence → rejected |
+| low | `find_program` stats `PATH` on the UI thread (blind) | A few `stat` calls per check, like the System voice's → rejected |
+| low | `rubato` for a rate that "should not happen" (blind) | The frozen block asks to resample if the rate differs → rejected |
+| low | The executable bit is judged by mode only, not for this user (edge) | Rare. The spawn error still names the reason → rejected |
+| low | A mid-stream MP3 format change mis-mixes audio (edge) | edge-tts writes one fixed format → rejected |
+| low | The parser accepts any two-token dashed row as a voice (edge) | The program prints only its table; the fixture pins it → rejected |
+| low | No test loads a pre-3.17 settings file without `edge_tts` keys (blind) | `to_state` defaults a missing key through `unwrap_or_else`, the same path Azure's tests cover → rejected |
 
 ## Verification
 
