@@ -182,3 +182,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-3-15-speak-naturally-and-instantly-with-piper-on-linux.md`
   summary: No test checks that Install on "No Piper voice installed" downloads the built-in default voice (fahrettin).
   evidence: `piper::default_voice()` has its URLs fixed in code, so an adapter-level test cannot point it at a `TestServer`. Make the default voice's source injectable (e.g. through `PiperSources`) first.
+
+- source_spec: none
+  summary: Install on Piper's ONNX Runtime row fails when the saved Chatterbox backend is a GPU one, because `provision_runtime` checks `request.backend` instead of the CPU runtime Piper's row is built for.
+  evidence: `crates/voice-me-deps/src/lib.rs` `piper_rows` builds the row with `SpeechBackend::CPU` and `installable`, but `provision_row` passes `request.backend` to `provision_runtime`, which refuses any non-CPU target with `gpu_runtime_unavailable`. Found while investigating a Linux runtime auto-download request that turned out to be already served by the Install button.
