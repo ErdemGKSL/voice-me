@@ -56,3 +56,12 @@ reassembles the graph, verifies both files, and creates the immutable
 `voice-tr_TR-erdem-high-v1` release. The catalog entry above downloads its
 `model.onnx` and `config.json` assets. For a changed model, use a new versioned
 tag and update the catalog URLs and checksums; do not replace v1 assets.
+
+`custom/tr_TR-erdem-medium/` contains an early Erdem medium checkpoint
+(`epoch=89-step=720.ckpt`). Its 63 MB graph fits in Git without splitting.
+`piper-erdem-medium.yml` publishes it to the replaceable
+`voice-tr_TR-erdem-medium-dev` release. Future checkpoints can replace the
+model and config at the same paths: update `SHA256SUMS` and the catalog's
+byte sizes and SHA-256 values in the same commit. The catalog URL stays the
+same. Users who installed an older copy must delete it in voice-me and
+install it again to receive the replacement.

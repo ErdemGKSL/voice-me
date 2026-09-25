@@ -2,6 +2,23 @@
   "version": 1,
   "voices": [
     {
+      "key": "tr_TR-erdem-medium",
+      "name": "erdem",
+      "locale": "tr_TR",
+      "language": "Turkish (Turkey)",
+      "quality": "medium",
+      "model": {
+        "url": "https://github.com/ErdemGKSL/voice-me/releases/download/voice-tr_TR-erdem-medium-dev/model.onnx",
+        "size": 63516051,
+        "sha256": "f1e8968333b44c9840183f720b7d39e19960799f914c374b7c31c8352ad61c32"
+      },
+      "config": {
+        "url": "https://github.com/ErdemGKSL/voice-me/releases/download/voice-tr_TR-erdem-medium-dev/config.json",
+        "size": 4877,
+        "sha256": "9f648ed2ffd995c0ec97e92045f640a1f1185d518cfe7329eabf142dd7560629"
+      }
+    },
+    {
       "key": "tr_TR-erdem-high",
       "name": "erdem",
       "locale": "tr_TR",

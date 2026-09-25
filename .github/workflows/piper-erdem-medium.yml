@@ -1,0 +1,45 @@
+name: Publish Erdem medium Piper voice
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/piper-erdem-medium.yml'
+      - 'piper-voices/custom/tr_TR-erdem-medium/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: piper-erdem-medium
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    if: github.repository == 'ErdemGKSL/voice-me'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify model and config
+        working-directory: piper-voices/custom/tr_TR-erdem-medium
+        run: sha256sum -c SHA256SUMS
+      - name: Publish replaceable development assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=voice-tr_TR-erdem-medium-dev
+          dir=piper-voices/custom/tr_TR-erdem-medium
+          notes="Replaceable Erdem medium Piper model from commit $GITHUB_SHA (early training checkpoint)."
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$dir/model.onnx" "$dir/config.json" "$dir/SHA256SUMS" --clobber
+            gh release edit "$tag" --notes "$notes" --prerelease
+          else
+            gh release create "$tag" "$dir/model.onnx" "$dir/config.json" "$dir/SHA256SUMS" \
+              --target "$GITHUB_SHA" \
+              --title 'Piper voice: Erdem medium (development)' \
+              --notes "$notes" \
+              --prerelease
+          fi
