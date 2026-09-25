@@ -43,3 +43,16 @@ the same key in `rhasspy/piper-voices` or the speaches-ai repositories.
 2. Compute `sha256sum` and the byte size of each file.
 3. Add an entry above and commit it to `main`. Users see it the next time they
    open or refresh Settings → Piper voices.
+
+## Erdem voice in this repository
+
+`custom/tr_TR-erdem-high/` contains the Turkish Erdem model exported from the
+`epoch=824-step=6600.ckpt` checkpoint. The 114 MB ONNX graph is stored as
+three xz chunks so each Git object stays below GitHub's file-size limit.
+`config.json` and `SHA256SUMS` are kept alongside the chunks.
+
+On a push to `main` that changes these files, `piper-erdem-voice.yml`
+reassembles the graph, verifies both files, and creates the immutable
+`voice-tr_TR-erdem-high-v1` release. The catalog entry above downloads its
+`model.onnx` and `config.json` assets. For a changed model, use a new versioned
+tag and update the catalog URLs and checksums; do not replace v1 assets.

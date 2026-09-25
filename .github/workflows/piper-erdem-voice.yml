@@ -1,0 +1,44 @@
+name: Publish Erdem Piper voice
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/piper-erdem-voice.yml'
+      - 'piper-voices/custom/tr_TR-erdem-high/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.repository == 'ErdemGKSL/voice-me'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reassemble and verify voice
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_dir=piper-voices/custom/tr_TR-erdem-high
+          mkdir -p dist
+          cat "$source_dir"/model.onnx.xz.part-* | xz -dc > dist/model.onnx
+          cp "$source_dir/config.json" "$source_dir/SHA256SUMS" dist/
+          (cd dist && sha256sum -c SHA256SUMS)
+      - name: Publish versioned voice assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag=voice-tr_TR-erdem-high-v1
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; leaving its pinned assets unchanged."
+            exit 0
+          fi
+          gh release create "$tag" dist/model.onnx dist/config.json dist/SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --title 'Piper voice: Erdem (Turkish, high)' \
+            --notes 'Piper model exported from the Erdem training checkpoint. The ONNX graph and config are verified against SHA256SUMS.' \
+            --prerelease
