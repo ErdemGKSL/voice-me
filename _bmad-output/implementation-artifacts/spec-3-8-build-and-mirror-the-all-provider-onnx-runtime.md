@@ -110,6 +110,8 @@ context:
 
 ## Spec Change Log
 
+- 2026-09-25 -- Build fit (decision 5 kept). Nine real CUDA architectures ran past the 6 h hosted-runner limit (both runners were lost after 1.5 h and 5 h). The build now emits real code for `60;75;80;120` plus `compute_60` PTX, so the 6.0 floor stays: sm_80 code runs on sm_86/89, and the driver JITs the PTX for Volta and Hopper. The LLM-only CUDA kernels (flash and memory-efficient attention, FpA-IntB GEMM, FP8 KV cache) are off; TTS models use none of them, and ORT falls back to unfused kernels.
+
 ## Review Triage Log
 
 Pass 1: blind hunter (B), edge-case hunter (E), verification gap (V). The code is behaviour-neutral until pinning (decision 7), but every finding below applies the moment the release is pinned.

@@ -44,9 +44,11 @@ concurrency:
 env:
   ORT_VERSION: ${{ inputs.ort_version }}
   TAG: onnxruntime-${{ inputs.ort_version }}-voiceme.${{ inputs.build_number }}
-  # Decision 5: CUDA 12.8, compute capability 6.0 upwards, plus PTX for
-  # anything newer than the last real architecture.
-  CUDA_ARCHS: "60-real;70-real;75-real;80-real;86-real;89-real;90-real;120-real;120-virtual"
+  # Decision 5: CUDA 12.8, compute capability 6.0 upwards. Real code for
+  # Pascal, Turing, Ampere (sm_80 code also runs on sm_86/sm_89) and consumer
+  # Blackwell; compute_60 PTX lets the driver JIT for everything else (Volta,
+  # Hopper). Nine real architectures did not finish inside the 6 h job limit.
+  CUDA_ARCHS: "60-real;75-real;80-real;120-real;60-virtual"
   CUDNN_VERSION: "9.8.0"
 
 jobs:
@@ -103,7 +105,9 @@ jobs:
           ./build.sh --config Release --build_shared_lib --parallel 4 --nvcc_threads 1 \
             --use_cuda --cuda_home /usr/local/cuda-12.8 --cudnn_home "$GITHUB_WORKSPACE/cudnn" \
             --use_webgpu --skip_tests --compile_no_warning_as_error --cmake_generator Ninja \
-            --cmake_extra_defines "CMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHS" onnxruntime_BUILD_UNIT_TESTS=OFF
+            --cmake_extra_defines "CMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHS" onnxruntime_BUILD_UNIT_TESTS=OFF \
+              onnxruntime_USE_FLASH_ATTENTION=OFF onnxruntime_USE_MEMORY_EFFICIENT_ATTENTION=OFF \
+              onnxruntime_USE_FPA_INTB_GEMM=OFF onnxruntime_USE_FP8_KV_CACHE=OFF
           df -h /
 
       - name: Package
@@ -181,13 +185,16 @@ jobs:
         working-directory: C:\ort
         shell: pwsh
         run: |
-          # Two jobs and one nvcc thread each: the runner has 16 GB of memory,
-          # and an unbounded CUDA build runs it out.
-          .\build.bat --config Release --build_shared_lib --parallel 2 --nvcc_threads 1 --use_cuda `
+          # Three jobs and one nvcc thread each: the runner has 16 GB of memory,
+          # and an unbounded CUDA build runs it out. The LLM-only attention and
+          # mixed-precision GEMM kernels (the heaviest CUDA units) are left out.
+          .\build.bat --config Release --build_shared_lib --parallel 3 --nvcc_threads 1 --use_cuda `
             --cuda_home "$env:CUDA_PATH" --cudnn_home "$env:GITHUB_WORKSPACE\cudnn" `
             --use_webgpu --skip_tests --compile_no_warning_as_error `
             --cmake_generator "Visual Studio 17 2022" `
-            --cmake_extra_defines "CMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS" onnxruntime_BUILD_UNIT_TESTS=OFF
+            --cmake_extra_defines "CMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS" onnxruntime_BUILD_UNIT_TESTS=OFF `
+              onnxruntime_USE_FLASH_ATTENTION=OFF onnxruntime_USE_MEMORY_EFFICIENT_ATTENTION=OFF `
+              onnxruntime_USE_FPA_INTB_GEMM=OFF onnxruntime_USE_FP8_KV_CACHE=OFF
           $code = $LASTEXITCODE
           Get-PSDrive C, D | Format-Table Name, Used, Free
           if ($code -ne 0) { exit $code }
