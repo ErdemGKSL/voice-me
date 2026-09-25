@@ -12,11 +12,21 @@ name: ONNX Runtime (all providers)
 # - cuda: `onnxruntime_providers_cuda`. Only a CUDA backend downloads it,
 #   together with NVIDIA's own wheels for cudart/cuBLAS/cuFFT/cuDNN.
 #
-# Started by hand only: a build takes hours, and a published asset is pinned
-# by size and SHA-256 in `crates/voice-me-deps/src/sources.rs`, so it must
-# never change under the same name.
+# Runs by itself only when the runtime voice-me pins changes: a push to main
+# touching `crates/voice-me-deps/src/sources.rs` (or this file) builds
+# `VOICEME_RUNTIME_TAG` from there, and only if that release does not exist
+# yet. So bumping the ONNX Runtime version or the `.N` build number there
+# starts a build; pinning, or any other edit, does not. A build takes hours,
+# and a published asset is pinned by size and SHA-256 in `sources.rs`, so it
+# never changes under the same name: to rebuild with other settings (CUDA,
+# cuDNN, flags), bump the build number. Started by hand, it always builds.
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - crates/voice-me-deps/src/sources.rs
+      - .github/workflows/onnxruntime.yml
   workflow_dispatch:
     inputs:
       ort_version:
@@ -38,12 +48,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: onnxruntime-${{ inputs.ort_version }}-${{ inputs.build_number }}-${{ inputs.targets }}
+  group: onnxruntime-${{ inputs.targets || 'both' }}
   cancel-in-progress: false
 
 env:
-  ORT_VERSION: ${{ inputs.ort_version }}
-  TAG: onnxruntime-${{ inputs.ort_version }}-voiceme.${{ inputs.build_number }}
   # Decision 5: CUDA 12.8, compute capability 6.0 upwards. Real code for
   # Pascal, Turing, Ampere (sm_80 code also runs on sm_86/sm_89) and consumer
   # Blackwell; compute_60 PTX lets the driver JIT for everything else (Volta,
@@ -52,11 +60,59 @@ env:
   CUDNN_VERSION: "9.8.0"
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      ort_version: ${{ steps.plan.outputs.ort_version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      targets: ${{ steps.plan.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: crates/voice-me-deps/src/sources.rs
+          sparse-checkout-cone-mode: false
+
+      - name: Decide what to build
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          IN_VERSION: ${{ inputs.ort_version }}
+          IN_BUILD: ${{ inputs.build_number }}
+          IN_TARGETS: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = workflow_dispatch ]; then
+            version=$IN_VERSION build_number=$IN_BUILD targets=$IN_TARGETS
+          else
+            pinned=$(sed -n 's/^pub const VOICEME_RUNTIME_TAG: &str = "\(.*\)";$/\1/p' \
+              crates/voice-me-deps/src/sources.rs)
+            [[ $pinned =~ ^onnxruntime-([0-9][0-9.]*)-voiceme\.([0-9]+)$ ]] || {
+              echo "::error::VOICEME_RUNTIME_TAG '$pinned' is not onnxruntime-<version>-voiceme.<n>"
+              exit 1
+            }
+            version=${BASH_REMATCH[1]} build_number=${BASH_REMATCH[2]} targets=both
+          fi
+          tag="onnxruntime-$version-voiceme.$build_number"
+          build=true
+          if [ "$EVENT" != workflow_dispatch ] && gh release view "$tag" > /dev/null 2>&1; then
+            echo "$tag is already published; nothing to build."
+            build=false
+          fi
+          echo "$tag: build=$build targets=$targets"
+          { echo "build=$build"; echo "ort_version=$version"; echo "tag=$tag"; echo "targets=$targets"; } >> "$GITHUB_OUTPUT"
+
   build-linux:
-    if: inputs.targets != 'windows'
+    needs: plan
+    if: needs.plan.outputs.build == 'true' && needs.plan.outputs.targets != 'windows'
     # The same glibc floor as the app's Linux build (dev-release.yml).
     runs-on: ubuntu-22.04
     timeout-minutes: 355
+    env:
+      ORT_VERSION: ${{ needs.plan.outputs.ort_version }}
+      TAG: ${{ needs.plan.outputs.tag }}
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@v1.3.1
@@ -140,11 +196,15 @@ jobs:
           path: dist/*
 
   build-windows:
-    if: inputs.targets != 'linux'
+    needs: plan
+    if: needs.plan.outputs.build == 'true' && needs.plan.outputs.targets != 'linux'
     # CUDA 12.8's nvcc supports Visual Studio 2022 as its host compiler;
     # windows-latest has moved past it.
     runs-on: windows-2022
     timeout-minutes: 355
+    env:
+      ORT_VERSION: ${{ needs.plan.outputs.ort_version }}
+      TAG: ${{ needs.plan.outputs.tag }}
     steps:
       - uses: actions/setup-python@v5
         with:
@@ -227,13 +287,16 @@ jobs:
           path: dist/*
 
   release:
-    needs: [build-linux, build-windows]
+    needs: [plan, build-linux, build-windows]
     # Publishes whatever built; a later run with `targets` set to the missing
     # OS (and `reuse_run_id` pointing here, if useful) adds the rest.
     if: >-
       !cancelled() &&
       (needs.build-linux.result == 'success' || needs.build-windows.result == 'success')
     runs-on: ubuntu-latest
+    env:
+      ORT_VERSION: ${{ needs.plan.outputs.ort_version }}
+      TAG: ${{ needs.plan.outputs.tag }}
     permissions:
       contents: write
       actions: read
