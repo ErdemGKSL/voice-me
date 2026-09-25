@@ -453,7 +453,10 @@ impl ReleaseArchive {
 pub const VOICEME_LINUX_CORE: ReleaseArchive = ReleaseArchive {
     dir: "onnxruntime-voiceme-linux-x64-1.28.2",
     extension: "tgz",
-    pin: None,
+    pin: Some(Pin {
+        size: 14_704_763,
+        sha256: "95578240ef4a11b15aaaaa491a357b329549e05000a5dd105d41d602cb3c4590",
+    }),
     libraries: &[
         ("libonnxruntime.so.1.28.2", "libonnxruntime.so"),
         (
@@ -467,7 +470,10 @@ pub const VOICEME_LINUX_CORE: ReleaseArchive = ReleaseArchive {
 pub const VOICEME_LINUX_CUDA: ReleaseArchive = ReleaseArchive {
     dir: "onnxruntime-voiceme-linux-x64-cuda12-1.28.2",
     extension: "tgz",
-    pin: None,
+    pin: Some(Pin {
+        size: 160_115_833,
+        sha256: "75c2930fba866d8996a5a1925beee3fd5136c13a5ac43dad16101735c1b9e8b3",
+    }),
     libraries: &[(
         "libonnxruntime_providers_cuda.so",
         "libonnxruntime_providers_cuda.so",
@@ -478,13 +484,20 @@ pub const VOICEME_LINUX_CUDA: ReleaseArchive = ReleaseArchive {
 pub const VOICEME_WINDOWS_CORE: ReleaseArchive = ReleaseArchive {
     dir: "onnxruntime-voiceme-win-x64-1.28.2",
     extension: "zip",
-    pin: None,
+    pin: Some(Pin {
+        size: 16_744_869,
+        sha256: "1f35b9125bfa2d612ac1c35812554db123df03fe968ec5e45a70ee4d3bb7dab6",
+    }),
     libraries: &[
         ("onnxruntime.dll", "onnxruntime.dll"),
         (
             "onnxruntime_providers_shared.dll",
             "onnxruntime_providers_shared.dll",
         ),
+        // Dawn's shader compiler for WebGPU on Direct3D 12; Dawn itself is
+        // linked into onnxruntime.dll.
+        ("dxil.dll", "dxil.dll"),
+        ("dxcompiler.dll", "dxcompiler.dll"),
     ],
 };
 
@@ -492,7 +505,10 @@ pub const VOICEME_WINDOWS_CORE: ReleaseArchive = ReleaseArchive {
 pub const VOICEME_WINDOWS_CUDA: ReleaseArchive = ReleaseArchive {
     dir: "onnxruntime-voiceme-win-x64-cuda12-1.28.2",
     extension: "zip",
-    pin: None,
+    pin: Some(Pin {
+        size: 154_285_811,
+        sha256: "b4a9b477cb5b5941859db2d7533b5b4497efac7d9cf6ec6c7dad72abae3d50ef",
+    }),
     libraries: &[(
         "onnxruntime_providers_cuda.dll",
         "onnxruntime_providers_cuda.dll",
@@ -582,13 +598,21 @@ pub const NVIDIA_WHEELS_LINUX: [NvidiaWheel; 4] = [
     NvidiaWheel {
         package: "nvidia-cuda-runtime-cu12",
         version: "12.8.90",
-        pin: None,
+        pin: Some(WheelPin {
+            url: "https://files.pythonhosted.org/packages/0d/9b/a997b638fcd068ad6e4d53b8551a7d30fe8b404d6f1804abf1df69838932/nvidia_cuda_runtime_cu12-12.8.90-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+            size: 954_765,
+            sha256: "adade8dcbd0edf427b7204d480d6066d33902cab2a4707dcfc48a2d0fd44ab90",
+        }),
         members: &["nvidia/cuda_runtime/lib/libcudart.so.12"],
     },
     NvidiaWheel {
         package: "nvidia-cublas-cu12",
         version: "12.8.4.1",
-        pin: None,
+        pin: Some(WheelPin {
+            url: "https://files.pythonhosted.org/packages/dc/61/e24b560ab2e2eaeb3c839129175fb330dfcfc29e5203196e5541a4c44682/nvidia_cublas_cu12-12.8.4.1-py3-none-manylinux_2_27_x86_64.whl",
+            size: 594_346_921,
+            sha256: "8ac4e771d5a348c551b2a426eda6193c19aa630236b418086020df5ba9667142",
+        }),
         members: &[
             "nvidia/cublas/lib/libcublasLt.so.12",
             "nvidia/cublas/lib/libcublas.so.12",
@@ -597,13 +621,21 @@ pub const NVIDIA_WHEELS_LINUX: [NvidiaWheel; 4] = [
     NvidiaWheel {
         package: "nvidia-cufft-cu12",
         version: "11.3.3.83",
-        pin: None,
+        pin: Some(WheelPin {
+            url: "https://files.pythonhosted.org/packages/1f/13/ee4e00f30e676b66ae65b4f08cb5bcbb8392c03f54f2d5413ea99a5d1c80/nvidia_cufft_cu12-11.3.3.83-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+            size: 193_118_695,
+            sha256: "4d2dd21ec0b88cf61b62e6b43564355e5222e4a3fb394cac0db101f2dd0d4f74",
+        }),
         members: &["nvidia/cufft/lib/libcufft.so.11"],
     },
     NvidiaWheel {
         package: "nvidia-cudnn-cu12",
         version: "9.8.0.87",
-        pin: None,
+        pin: Some(WheelPin {
+            url: "https://files.pythonhosted.org/packages/77/f0/8236c886a061d203e51247aec2b8e3a8f5350178251ab57237daf2140680/nvidia_cudnn_cu12-9.8.0.87-py3-none-manylinux_2_27_x86_64.whl",
+            size: 697_999_707,
+            sha256: "d6b02cd0e3e24aa31d0193a8c39fec239354360d7d81055edddb69f35d53a4c8",
+        }),
         members: &[
             "nvidia/cudnn/lib/libcudnn_graph.so.9",
             "nvidia/cudnn/lib/libcudnn_engines_precompiled.so.9",
@@ -622,13 +654,21 @@ pub const NVIDIA_WHEELS_WINDOWS: [NvidiaWheel; 4] = [
     NvidiaWheel {
         package: "nvidia-cuda-runtime-cu12",
         version: "12.8.90",
-        pin: None,
+        pin: Some(WheelPin {
+            url: "https://files.pythonhosted.org/packages/30/a5/a515b7600ad361ea14bfa13fb4d6687abf500adc270f19e89849c0590492/nvidia_cuda_runtime_cu12-12.8.90-py3-none-win_amd64.whl",
+            size: 944_318,
+            sha256: "c0c6027f01505bfed6c3b21ec546f69c687689aad5f1a377554bc6ca4aa993a8",
+        }),
         members: &["nvidia/cuda_runtime/bin/cudart64_12.dll"],
     },
     NvidiaWheel {
         package: "nvidia-cublas-cu12",
         version: "12.8.4.1",
-        pin: None,
+        pin: Some(WheelPin {
+            url: "https://files.pythonhosted.org/packages/70/61/7d7b3c70186fb651d0fbd35b01dbfc8e755f69fd58f817f3d0f642df20c3/nvidia_cublas_cu12-12.8.4.1-py3-none-win_amd64.whl",
+            size: 567_544_208,
+            sha256: "47e9b82132fa8d2b4944e708049229601448aaad7e6f296f630f2d1a32de35af",
+        }),
         members: &[
             "nvidia/cublas/bin/cublasLt64_12.dll",
             "nvidia/cublas/bin/cublas64_12.dll",
@@ -637,13 +677,21 @@ pub const NVIDIA_WHEELS_WINDOWS: [NvidiaWheel; 4] = [
     NvidiaWheel {
         package: "nvidia-cufft-cu12",
         version: "11.3.3.83",
-        pin: None,
+        pin: Some(WheelPin {
+            url: "https://files.pythonhosted.org/packages/7d/ec/ce1629f1e478bb5ccd208986b5f9e0316a78538dd6ab1d0484f012f8e2a1/nvidia_cufft_cu12-11.3.3.83-py3-none-win_amd64.whl",
+            size: 192_216_559,
+            sha256: "7a64a98ef2a7c47f905aaf8931b69a3a43f27c55530c698bb2ed7c75c0b42cb7",
+        }),
         members: &["nvidia/cufft/bin/cufft64_11.dll"],
     },
     NvidiaWheel {
         package: "nvidia-cudnn-cu12",
         version: "9.8.0.87",
-        pin: None,
+        pin: Some(WheelPin {
+            url: "https://files.pythonhosted.org/packages/39/6a/5e9910b2b2c9dcddee9aaef372b3db0f08b9f7eaf1d462f859461a79caf9/nvidia_cudnn_cu12-9.8.0.87-py3-none-win_amd64.whl",
+            size: 684_630_375,
+            sha256: "b4b5cfddc32aa4180f9d390ee99e9a9f55a89e7087329b41aba4319327e22466",
+        }),
         members: &[
             "nvidia/cudnn/bin/cudnn_graph64_9.dll",
             "nvidia/cudnn/bin/cudnn_engines_precompiled64_9.dll",

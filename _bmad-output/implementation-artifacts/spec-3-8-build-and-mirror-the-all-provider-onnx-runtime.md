@@ -2,7 +2,7 @@
 title: 'Build and mirror the all-provider ONNX Runtime'
 type: 'feature'
 created: '2026-09-24'
-status: 'in-review'
+status: 'done'
 baseline_commit: '698ae2924706fdfcad381a49f78ea1048e39b0f5'
 route: 'dispatch'
 review_loop_iteration: 1
@@ -80,12 +80,12 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `.github/workflows/onnxruntime.yml` -- the build and release workflow (decisions 4–6).
+- [x] `.github/workflows/onnxruntime.yml` -- the build and release workflow (decisions 4–6).
 - [x] `crates/voice-me-deps/src/{sources,provision,lib}.rs` -- multi-library archives, the CUDA provider archive, the NVIDIA wheels (`None` until pinned), the rows and Install. Tests use injected sources and fake archives (a zip wheel with `nvidia/cudnn/lib/libcudnn.so.9`).
 - [x] `crates/voice-me-core/src/assets.rs` -- the `runtime/cuda` layout helpers and tests.
 - [x] `crates/voice-me-tts/{Cargo.toml,src/sessions.rs}` -- remove `webgpu-probe`, add the NVIDIA preload, switch without a restart.
 - [x] `crates/voice-me-app/src/main.rs` -- `needs_restart` for the bundled library, and tests.
-- [ ] After the first successful workflow run: pin the URLs, sizes and SHA-256 of the 4 release assets (2 per OS) and the 4 NVIDIA wheels per OS in `sources.rs`. Switch the default runtime to the core archive.
+- [x] After the first successful workflow run: pin the URLs, sizes and SHA-256 of the 4 release assets (2 per OS) and the 4 NVIDIA wheels per OS in `sources.rs`. Switch the default runtime to the core archive.
 - [x] `README.md` + `ARCHITECTURE-SPINE.md` stack row -- the mirrored runtime and the NVIDIA wheels.
 
 **Acceptance Criteria:**
@@ -94,6 +94,13 @@ context:
 - Given `cargo tree`, then no crate enables `ort/download-binaries`.
 
 ## Implementation Notes
+
+- 2026-09-25 -- Released `onnxruntime-1.28.2-voiceme.1` (run 36090693293: Linux built in 2 h 14 m, Windows in 3 h 59 m) and pinned it with the NVIDIA wheels.
+  - Core archives: Linux 14.7 MB, Windows 16.7 MB. Dawn is linked in statically. The Windows core also ships `dxil.dll` and `dxcompiler.dll`, which are added to `VOICEME_WINDOWS_CORE`.
+  - The Linux CUDA provider links cudart, cuBLAS and cuBLASLt directly and loads cuDNN and cuFFT at run time, so no cuRAND or NVRTC wheel is needed. Zip entries use `/`.
+  - Verified on the Linux core: `voice-me-tts-piper`'s `real_engine` test speaks 2 s of Turkish in 230-340 ms.
+  - Open gap: the Backend tab still offers only the bundled CPU. Picking bundled CUDA or WebGPU arrives with `spec-backend-engine-and-device-selects.md` (decision 3), queued next.
+  - The workflow now also runs on a push that changes `VOICEME_RUNTIME_TAG` to a release that does not exist yet.
 
 - **Pinning is data only.** `sources.rs` holds `VOICEME_{LINUX,WINDOWS}_{CORE,CUDA}` (`ReleaseArchive`: dir, extension, `pin: Option<Pin>`, libraries under `<dir>/lib/`) and `NVIDIA_WHEELS_{LINUX,WINDOWS}` (`NvidiaWheel`: package, version, `pin: Option<WheelPin>`, member paths). Filling the `pin` fields switches `Sources::pinned()` to the core archive (`runtime_all_providers = true`) and enables CUDA (`cuda_installable()`, which needs the core, the CUDA archive and all 4 wheels pinned). If the workflow's `*-contents.txt` lists more libraries in the core (Dawn, `dxil.dll`, `dxcompiler.dll`), add them to its `libraries`.
 - **Wheel members were read from the published wheels** (central directory over HTTP ranges): cudart 12.8.90, cuBLAS 12.8.4.1 (`libcublasLt` + `libcublas`, not `libnvblas`), cuFFT 11.3.3.83 (not `cufftw`), cuDNN 9.8.0.87 (all 8 libraries).

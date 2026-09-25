@@ -93,26 +93,29 @@ open **Settings → Dependencies** and press **Install** on each missing row.
   1.56 GB, with progress shown on the row. An interrupted download resumes
   from the bytes already on disk the next time Install is pressed, and every
   file is checked against a pinned SHA-256 before it is used.
-- **ONNX Runtime** (Linux x64, Windows x64) — until voice-me's own build is
-  pinned, the core library from Microsoft's `onnxruntime-linux-x64-1.28.2.tgz`
-  release, extracted to `<cache>/runtime/libonnxruntime.so`, or on Windows
-  from `onnxruntime-win-x64-1.28.2.zip`, extracted to
-  `<cache>/runtime/onnxruntime.dll`. On other systems, or when
+- **ONNX Runtime** (Linux x64, Windows x64) — the core archive of
+  voice-me's own all-provider build (below), extracted to
+  `<cache>/runtime/libonnxruntime.so`, or on Windows to
+  `<cache>/runtime/onnxruntime.dll` (with `dxil.dll` and `dxcompiler.dll`,
+  which WebGPU needs on Direct3D 12). On other systems, or when
   `ORT_DYLIB_PATH` points somewhere that does not exist, the row shows short
   manual steps instead of an Install button.
 - **voice-me's all-provider runtime** (Story 3.8) — ONNX Runtime 1.28.2
-  built from source in CI (`.github/workflows/onnxruntime.yml`, started by
-  hand) with the CPU, WebGPU and CUDA 12.8 execution providers in one
+  built from source in CI (`.github/workflows/onnxruntime.yml`, which runs
+  when `VOICEME_RUNTIME_TAG` in `sources.rs` names a release that does not
+  exist yet, or by hand) with the CPU, WebGPU and CUDA 12.8 execution providers in one
   library, mirrored on this repo's Releases as `onnxruntime-1.28.2-voiceme.1`.
   Per OS there is a **core** archive (`onnxruntime` and
   `onnxruntime_providers_shared`, WebGPU built in), which every backend
   uses, and a **CUDA provider** archive (`onnxruntime_providers_cuda`),
   fetched only for a CUDA backend. Because one library carries every
   provider, switching between CPU, WebGPU and CUDA rebuilds the speech
-  session instead of restarting voice-me. Once the release is pinned in
-  `crates/voice-me-deps/src/sources.rs`, the core replaces Microsoft's
-  archive; a CPU-only runtime already in the cache keeps serving the CPU
-  backend, and Install replaces it when a GPU backend is selected.
+  session instead of restarting voice-me. The release is pinned by size and
+  SHA-256 in `crates/voice-me-deps/src/sources.rs` and replaces Microsoft's
+  CPU archive; a CPU-only runtime already in the cache keeps serving the CPU
+  backend, and Install replaces it when a GPU backend is selected. CUDA code
+  is built for compute capability 6.0, 7.5, 8.0 and 12.0 (8.0 code also runs
+  on 8.6/8.9), with PTX that the driver compiles for the others.
 - **NVIDIA libraries for CUDA** — the CUDA runtime, cuBLAS/cuBLASLt, cuFFT
   and cuDNN 9, from NVIDIA's own wheels on PyPI (`nvidia-cuda-runtime-cu12`,
   `nvidia-cublas-cu12`, `nvidia-cufft-cu12`, `nvidia-cudnn-cu12`), each pinned
