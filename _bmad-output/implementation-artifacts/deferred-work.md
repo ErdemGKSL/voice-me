@@ -244,3 +244,9 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-overlay-vertical-position.md`
   summary: No test checks that the overlay-open closure in `main()` uses the persisted `overlay_position` on each summon, or that `SettingsView` hands the value through to the Hotkey tab.
   evidence: Only the pure helpers are tested. Extract the size-and-position choice into a pure helper next to `overlay_bounds_in` and test it.
+- source_spec: `_bmad-output/implementation-artifacts/spec-backend-engine-and-device-selects.md`
+  summary: The warm-up guard `for_current_selection` compares only `report.backend`, so a late report for one engine can start a warm-up for another engine on the same device.
+  evidence: `main.rs` compares `report.backend` with `resolve_backend(current selection)`. Chatterbox CPU → Piper CPU already matched before this spec; Piper now matches on GPU devices too. Fix by carrying the selection in `DependencyReport`.
+- source_spec: `_bmad-output/implementation-artifacts/spec-backend-engine-and-device-selects.md`
+  summary: Piper never sends `AppEvent::SpeechSessionBuilt`, so the Backend tab's "actually acquired" line (AD-9) never shows Piper's device or a failed GPU build.
+  evidence: Only `TtsAdapter::with_events` sends it. `build_piper` has no event sender. This dates from Story 3.15 and matters now that Piper can run on CUDA/WebGPU.

@@ -1377,7 +1377,7 @@ mod tests {
     /// installed — and no Reference Voice Sample.
     fn piper_state(voice: Option<&str>) -> AppState {
         AppState {
-            backend_selection: BackendSelection::Piper,
+            backend_selection: BackendSelection::PIPER_CPU,
             speech_voices: crate::state::SpeechVoices {
                 piper: voice.map(str::to_string),
                 ..Default::default()

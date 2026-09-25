@@ -500,7 +500,9 @@ fn run_probe(
 }
 
 /// The AD-9 resolved backend for `selection`: the target, and the weights
-/// the target implies (CPU → Q4, a GPU → FP16).
+/// the target implies (CPU → Q4, a GPU → FP16). Piper's target is its own
+/// device (spec-backend-engine-and-device-selects); it has no weights to
+/// pick, so only the target matters there.
 ///
 /// A remote selection — and the System voice (Story 3.12) — never reaches
 /// the ONNX engine; no ONNX adapter is built for either, so they resolve to
@@ -566,7 +568,7 @@ fn check_request(state: &AppState) -> CheckRequest {
             }
             BackendSelection::Local { .. }
             | BackendSelection::SystemVoice
-            | BackendSelection::Piper => false,
+            | BackendSelection::Piper { .. } => false,
         },
         // Story 3.14: only Azure has a region; only its voice is required.
         has_region: state.azure_region.is_some(),
@@ -580,13 +582,11 @@ fn check_request(state: &AppState) -> CheckRequest {
 
 /// The runtime library a selection loads: the added one it names, or the
 /// bundled one by the usual rule — which is also Piper's (Story 3.15: it
-/// shares the bundled CPU runtime). `None` for a remote selection and the
-/// System voice, or when there is no cache root to resolve the bundled one
-/// against.
+/// shares the bundled runtime, on any of its devices). `None` for a remote
+/// selection and the System voice, or when there is no cache root to
+/// resolve the bundled one against.
 fn selection_library(selection: &BackendSelection) -> Option<PathBuf> {
-    if !selection.is_piper() {
-        selection.local_target()?;
-    }
+    selection.local_target()?;
     let root = voice_me_core::assets::model_cache_root().ok()?;
     Some(voice_me_core::assets::resolve_runtime_dylib(&root, selection.added_runtime()).path)
 }
@@ -649,7 +649,24 @@ fn apply_staged_runtime() {
     }
 }
 
-/// Whether `selection` runs on a GPU execution provider.
+/// What "Use CPU backend" selects: the saved engine on CPU — Piper stays
+/// Piper — or the bundled CPU runtime when the settings cannot be read.
+fn use_cpu_selection(store: &dyn SettingsStore) -> BackendSelection {
+    store
+        .load()
+        .map(|state| state.backend_selection.on_cpu())
+        .unwrap_or(BackendSelection::BUNDLED_CPU)
+}
+
+/// Whether the bundled runtime voice-me installs has every execution
+/// provider (Story 3.8), so the Backend tab lists its CUDA and WebGPU
+/// devices.
+fn bundled_all_providers() -> bool {
+    voice_me_deps::sources::Sources::pinned().runtime_all_providers
+}
+
+/// Whether `selection` runs on a GPU execution provider — Chatterbox's or,
+/// since spec-backend-engine-and-device-selects, Piper's.
 fn is_gpu_selection(selection: &BackendSelection) -> bool {
     selection
         .local_target()
@@ -803,8 +820,9 @@ fn build_engine(
                 .to_string(),
         );
     }
-    // Story 3.15: Piper on the bundled CPU runtime, committed through
-    // `voice-me-tts`'s once-per-process guard; phonemes from `espeak-ng`.
+    // Story 3.15: Piper on the bundled runtime, committed through
+    // `voice-me-tts`'s once-per-process guard, on its own device; phonemes
+    // from `espeak-ng`.
     if state.backend_selection.is_piper() {
         return match build_piper(state) {
             Ok(port) => Engine {
@@ -842,16 +860,48 @@ fn build_engine(
 fn build_piper(state: &AppState) -> Result<Arc<dyn TtsPort>, String> {
     let root = assets::model_cache_root().map_err(|error| error.to_string())?;
     let runtime_root = root.clone();
-    Ok(Arc::new(voice_me_tts_piper::PiperTts::new(
-        root,
-        piper_voice_for(state),
-        Arc::new(voice_me_tts_piper::EspeakPhonemizer::new()),
-        Arc::new(move || {
-            voice_me_tts::sessions::init_runtime(
-                &assets::resolve_runtime_dylib(&runtime_root, None).path,
-            )
-        }),
-    )))
+    let providers_root = root.clone();
+    // spec-backend-engine-and-device-selects: Piper's device, with the same
+    // providers, restart rule and NVIDIA preload as Chatterbox's (AD-1:
+    // injected, so `voice-me-tts-piper` never depends on `voice-me-tts`).
+    let backend = resolve_backend(&state.backend_selection);
+    Ok(Arc::new(
+        voice_me_tts_piper::PiperTts::new(
+            root,
+            piper_voice_for(state),
+            Arc::new(voice_me_tts_piper::EspeakPhonemizer::new()),
+            Arc::new(move || {
+                voice_me_tts::sessions::init_runtime(
+                    &assets::resolve_runtime_dylib(&runtime_root, None).path,
+                )
+            }),
+        )
+        .with_providers(Arc::new(move || piper_providers(&providers_root, backend))),
+    ))
+}
+
+/// The providers Piper's session is built with on `backend`'s target, on
+/// the bundled runtime under `root`, and the NVIDIA libraries that did not
+/// load as a note for a failed build.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn piper_providers(
+    root: &Path,
+    backend: SpeechBackend,
+) -> Result<voice_me_tts_piper::SessionProviders, voice_me_core::VoiceMeError> {
+    let runtime = assets::resolve_runtime_dylib(root, None).path;
+    let (providers, preload_failures) = voice_me_tts::session_providers(root, &runtime, backend)?;
+    let failure_notes = if preload_failures.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(
+            "these NVIDIA libraries did not load: {}",
+            preload_failures.join("; ")
+        )]
+    };
+    Ok(voice_me_tts_piper::SessionProviders {
+        providers,
+        failure_notes,
+    })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -1763,6 +1813,29 @@ mod tests {
         assert_eq!(state.piper_voices[0].language, "tr_TR");
     }
 
+    /// "Use CPU backend" keeps the saved engine: Piper on CUDA → Piper on
+    /// CPU; Chatterbox on an added runtime's CUDA → the bundled CPU.
+    #[test]
+    fn use_cpu_keeps_the_saved_engine() {
+        let dir = TempDir::new("use-cpu");
+        let store = FileSettingsStore::with_dirs(dir.0.join("config"), dir.0.join("data"));
+
+        store
+            .save_backend_selection(&BackendSelection::Piper {
+                target: SpeechExecutionTarget::Cuda,
+            })
+            .unwrap();
+        assert_eq!(use_cpu_selection(&store), BackendSelection::PIPER_CPU);
+
+        store
+            .save_backend_selection(&BackendSelection::Local {
+                runtime: Some(PathBuf::from("/opt/ort/libonnxruntime.so")),
+                target: SpeechExecutionTarget::Cuda,
+            })
+            .unwrap();
+        assert_eq!(use_cpu_selection(&store), BackendSelection::BUNDLED_CPU);
+    }
+
     /// Use on the Piper voices tab saves the language before the voice,
     /// since saving a language clears the voice: a voice of another
     /// locale ends up saved.
@@ -2258,7 +2331,23 @@ mod tests {
 
             assert!(is_gpu_selection(&gpu));
             assert!(!is_gpu_selection(&cpu));
-            assert!(!is_gpu_selection(&BackendSelection::Piper));
+            assert!(!is_gpu_selection(&BackendSelection::PIPER_CPU));
+            // spec-backend-engine-and-device-selects: Piper on a GPU counts.
+            let piper_gpu = BackendSelection::Piper {
+                target: SpeechExecutionTarget::Cuda,
+            };
+            assert!(is_gpu_selection(&piper_gpu));
+            assert!(is_gpu_selection(&BackendSelection::Piper {
+                target: SpeechExecutionTarget::WebGpu,
+            }));
+            assert!(runtime_restart_due(&piper_gpu, true, true, false));
+            assert!(runtime_restart_due(&piper_gpu, true, false, true));
+            assert!(!runtime_restart_due(
+                &BackendSelection::PIPER_CPU,
+                true,
+                true,
+                true
+            ));
 
             // bundled, replaced, staged
             assert!(runtime_restart_due(&gpu, true, true, false));
@@ -2376,12 +2465,23 @@ mod tests {
         #[test]
         fn the_check_request_names_pipers_voice() {
             let state = AppState {
-                backend_selection: BackendSelection::Piper,
+                backend_selection: BackendSelection::PIPER_CPU,
                 ..AppState::default()
             };
             let request = check_request(&state);
-            assert_eq!(request.selection, BackendSelection::Piper);
+            assert_eq!(request.selection, BackendSelection::PIPER_CPU);
             assert_eq!(request.backend, SpeechBackend::CPU);
+            // Piper's own device is what the check asks about.
+            let webgpu = AppState {
+                backend_selection: BackendSelection::Piper {
+                    target: SpeechExecutionTarget::WebGpu,
+                },
+                ..state.clone()
+            };
+            assert_eq!(
+                check_request(&webgpu).backend.target,
+                SpeechExecutionTarget::WebGpu
+            );
             assert!(!request.has_api_key);
             assert_eq!(
                 request.piper_voice.as_deref(),
@@ -2412,11 +2512,11 @@ mod tests {
             let _lock = super::cache_root_lock();
             let _ = voice_me_core::assets::model_cache_root();
             assert_eq!(
-                selection_library(&BackendSelection::Piper),
+                selection_library(&BackendSelection::PIPER_CPU),
                 selection_library(&BackendSelection::BUNDLED_CPU)
             );
             if voice_me_core::assets::model_cache_root().is_ok() {
-                assert!(selection_library(&BackendSelection::Piper).is_some());
+                assert!(selection_library(&BackendSelection::PIPER_CPU).is_some());
             }
             assert_eq!(selection_library(&BackendSelection::SystemVoice), None);
         }
@@ -2427,7 +2527,7 @@ mod tests {
         fn piper_gets_its_engine() {
             let (tx, _rx) = mpsc::unbounded();
             let state = AppState {
-                backend_selection: BackendSelection::Piper,
+                backend_selection: BackendSelection::PIPER_CPU,
                 ..AppState::default()
             };
 
@@ -3420,6 +3520,9 @@ fn main() {
                     check_request: check_request(&state),
                     selection: state.backend_selection,
                     runtimes: state.local_runtimes,
+                    // Story 3.8: the bundled CUDA and WebGPU devices are
+                    // listed once voice-me's all-provider runtime is pinned.
+                    bundled_all_providers: bundled_all_providers(),
                     api_keys: state.api_keys,
                     active: active_backend.borrow().clone(),
                     restart_pending: restart_pending.get(),
@@ -3851,9 +3954,12 @@ fn main() {
                 BackendAction::Select(selection) => {
                     (*apply_selection)(selection, BackendArea::Selection, cx)
                 }
-                BackendAction::UseCpu => {
-                    (*apply_selection)(BackendSelection::BUNDLED_CPU, BackendArea::Capability, cx)
-                }
+                // The saved engine on CPU: Piper stays Piper.
+                BackendAction::UseCpu => (*apply_selection)(
+                    use_cpu_selection(settings_store.as_ref()),
+                    BackendArea::Capability,
+                    cx,
+                ),
                 BackendAction::AddRuntime(path) => {
                     if probing.borrow().is_some() {
                         return;

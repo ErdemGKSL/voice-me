@@ -3,18 +3,26 @@ name = "voice-me-tts-piper"
 version = "0.1.0"
 edition.workspace = true
 
-# Story 3.15: Piper VITS voices, in-process on the existing ONNX Runtime,
-# CPU only. No Piper engine code (`piper1-gpl`, `piper-phonemize`) and no
-# libespeak-ng is linked: phonemes come from the `espeak-ng` program through
-# `voice-me-espeak`. Offline — no HTTP client (AD-8). AD-1: no dependency on
+# Story 3.15: Piper VITS voices, in-process on the existing ONNX Runtime —
+# on CPU, or on CUDA or WebGPU with voice-me's all-provider runtime
+# (spec-backend-engine-and-device-selects). No Piper engine code
+# (`piper1-gpl`, `piper-phonemize`) and no libespeak-ng is linked: phonemes
+# come from the `espeak-ng` program through `voice-me-espeak`. Offline — no HTTP client (AD-8). AD-1: no dependency on
 # `voice-me-tts`; the runtime is committed through an injected closure.
 [dependencies]
 voice-me-core = { path = "../voice-me-core" }
 # The version `voice-me-tts` uses. `default-features = false` is
 # load-bearing for the same reason as there: ort's defaults download a
 # runtime at build time (AD-8). `load-dynamic` comes from the default
-# `dynamic-runtime` feature below.
-ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray"] }
+# `dynamic-runtime` feature below. `cuda` and `webgpu` only compile in the
+# providers' registration code; the composition root passes the providers
+# (from `voice-me-tts`) in, so they link and download nothing.
+ort = { version = "2.0.0-rc.13", default-features = false, features = [
+  "std",
+  "ndarray",
+  "cuda",
+  "webgpu",
+] }
 # The version ort rc.13 itself depends on.
 ndarray = "0.17"
 # Piper voices speak at 22 050 Hz (most) or 16 000 Hz; AD-11's buffer is

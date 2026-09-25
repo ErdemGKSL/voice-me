@@ -371,17 +371,25 @@ pub fn capability_row(request: &CheckRequest, probe: &dyn GpuProbe) -> Option<De
         }
         // Story 3.15: on Linux Piper's readiness is its runtime, voice and
         // eSpeak NG rows — and on Windows too since Story 3.16. Elsewhere
-        // it has no engine yet.
-        BackendSelection::Piper => {
-            if cfg!(any(target_os = "linux", target_os = "windows")) {
-                None
-            } else {
-                Some(cannot_run(
-                    selection,
-                    "Piper on this system arrives in a later voice-me release.",
-                ))
-            }
+        // it has no engine yet. On CUDA or WebGPU its device is probed like
+        // Chatterbox's (spec-backend-engine-and-device-selects).
+        BackendSelection::Piper { .. }
+            if !cfg!(any(target_os = "linux", target_os = "windows")) =>
+        {
+            Some(cannot_run(
+                selection,
+                "Piper on this system arrives in a later voice-me release.",
+            ))
         }
+        BackendSelection::Piper { target } => match target {
+            SpeechExecutionTarget::Cpu => None,
+            SpeechExecutionTarget::Cuda => Some(cuda_row(
+                selection,
+                request.backend.device.unwrap_or(0),
+                probe.cuda(),
+            )),
+            SpeechExecutionTarget::WebGpu => Some(webgpu_row(selection, probe.vulkan())),
+        },
     }
 }
 
@@ -746,7 +754,8 @@ mod tests {
 
         assert_blocks(&row, "can't run here: No NVIDIA driver found.");
         assert!(
-            row.detail.starts_with("CUDA (libonnxruntime.so)"),
+            row.detail
+                .starts_with("Chatterbox — your voice · CUDA — libonnxruntime.so"),
             "{}",
             row.detail
         );

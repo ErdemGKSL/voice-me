@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use ort::ep::ExecutionProviderDispatch;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::TensorRef;
@@ -118,6 +119,30 @@ mod espeak_phonemizer_tests {
 /// What commits the ONNX Runtime library: the composition root passes the
 /// one `voice-me-tts` guards, so the process still commits exactly one.
 pub type RuntimeInit = Arc<dyn Fn() -> Result<(), VoiceMeError> + Send + Sync>;
+
+/// The execution providers a voice's session is built with, and the notes
+/// to add to a failed build — say, NVIDIA libraries that did not load
+/// before the CUDA provider was registered.
+pub struct SessionProviders {
+    pub providers: Vec<ExecutionProviderDispatch>,
+    pub failure_notes: Vec<String>,
+}
+
+impl SessionProviders {
+    /// The CPU execution provider: Piper's default.
+    pub fn cpu() -> Self {
+        Self {
+            providers: vec![ort::ep::CPU::default().build()],
+            failure_notes: Vec::new(),
+        }
+    }
+}
+
+/// What picks a session's providers (spec-backend-engine-and-device-selects).
+/// Called after [`RuntimeInit`], before each session build. AD-1: the
+/// composition root injects `voice-me-tts`'s providers and its CUDA library
+/// preload; this crate never depends on it.
+pub type ProvidersInit = Arc<dyn Fn() -> Result<SessionProviders, VoiceMeError> + Send + Sync>;
 
 /// A failure, naming Piper and the reason.
 fn failure(reason: impl std::fmt::Display) -> VoiceMeError {
@@ -236,6 +261,9 @@ pub struct PiperTts {
     warm_voice: Option<String>,
     phonemizer: Arc<dyn Phonemizer>,
     runtime_init: RuntimeInit,
+    /// The providers each session is built with: CPU unless the root says
+    /// otherwise.
+    providers_init: ProvidersInit,
     /// The held session, keyed by voice. The mutex is the queue (AD-10):
     /// one generation at a time, the second waits.
     held: Mutex<Option<LoadedVoice>>,
@@ -246,6 +274,8 @@ pub struct PiperTts {
 impl PiperTts {
     /// The adapter over the voices under `root` (the cache root). `warm_voice`
     /// is the voice warm-up loads; `runtime_init` commits ONNX Runtime.
+    /// Sessions run on the CPU unless [`Self::with_providers`] says
+    /// otherwise.
     pub fn new(
         root: PathBuf,
         warm_voice: Option<String>,
@@ -257,9 +287,17 @@ impl PiperTts {
             warm_voice,
             phonemizer,
             runtime_init,
+            providers_init: Arc::new(|| Ok(SessionProviders::cpu())),
             held: Mutex::new(None),
             ready: AtomicBool::new(false),
         }
+    }
+
+    /// Build each session with the providers `providers_init` returns — a
+    /// GPU one for Piper on CUDA or WebGPU.
+    pub fn with_providers(mut self, providers_init: ProvidersInit) -> Self {
+        self.providers_init = providers_init;
+        self
     }
 
     fn lock(&self) -> MutexGuard<'_, Option<LoadedVoice>> {
@@ -307,7 +345,9 @@ impl PiperTts {
                         ))
                     })
                 })?;
-            let session = build_session(&files.model)?;
+            let providers = (self.providers_init)()?;
+            let session = build_session(&files.model, &providers.providers)
+                .map_err(|error| with_notes(error, &providers.failure_notes))?;
             *held = Some(LoadedVoice {
                 key: key.to_string(),
                 session,
@@ -319,14 +359,26 @@ impl PiperTts {
     }
 }
 
-/// One session on the CPU execution provider, from the model's path.
-fn build_session(model: &Path) -> Result<Session, VoiceMeError> {
+/// A failed session build's error, with `notes` added after it.
+fn with_notes(error: VoiceMeError, notes: &[String]) -> VoiceMeError {
+    match error {
+        VoiceMeError::SpeechEngine(reason) if !notes.is_empty() => {
+            VoiceMeError::SpeechEngine(format!("{reason} ({})", notes.join("; ")))
+        }
+        error => error,
+    }
+}
+
+/// One session on `providers`, from the model's path.
+fn build_session(
+    model: &Path,
+    providers: &[ExecutionProviderDispatch],
+) -> Result<Session, VoiceMeError> {
     let engine =
         |error: ort::Error| failure(format!("could not load {}: {error}", model.display()));
-    let providers = vec![ort::ep::CPU::default().build()];
     Session::builder()
         .map_err(engine)?
-        .with_execution_providers(&providers)
+        .with_execution_providers(providers)
         .map_err(|error| engine(error.into()))?
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(|error| engine(error.into()))?
@@ -562,5 +614,53 @@ mod tests {
         );
         // Nothing selected: warm-up has nothing to build.
         assert!(tts.warm_up().is_ok());
+    }
+
+    /// spec-backend-engine-and-device-selects: the injected providers are
+    /// asked for after the runtime is committed, before the session is
+    /// built, and their failure is the build's.
+    #[test]
+    fn the_injected_providers_are_asked_for_after_the_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let key = "tr_TR-fahrettin-medium";
+        let files = assets::piper_voice_files(root.path(), key).unwrap();
+        std::fs::create_dir_all(&files.dir).unwrap();
+        std::fs::write(&files.model, b"not a graph").unwrap();
+        std::fs::write(&files.config, FAHRETTIN).unwrap();
+
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let (runtime_calls, provider_calls) = (calls.clone(), calls.clone());
+        let tts = PiperTts::new(
+            root.path().to_path_buf(),
+            Some(key.to_string()),
+            Arc::new(table()),
+            Arc::new(move || {
+                runtime_calls.lock().unwrap().push("runtime");
+                Ok(())
+            }),
+        )
+        .with_providers(Arc::new(move || {
+            provider_calls.lock().unwrap().push("providers");
+            Err(VoiceMeError::SpeechEngine(
+                "the WebGPU provider is not available".to_string(),
+            ))
+        }));
+
+        let error = tts.warm_up().unwrap_err().to_string();
+        assert!(error.contains("WebGPU provider"), "{error}");
+        assert_eq!(*calls.lock().unwrap(), vec!["runtime", "providers"]);
+        assert!(!tts.is_ready());
+    }
+
+    #[test]
+    fn failure_notes_follow_a_failed_build() {
+        let error = with_notes(
+            VoiceMeError::SpeechEngine("Piper could not load x".to_string()),
+            &["libcudnn.so.9: not found".to_string()],
+        )
+        .to_string();
+        assert!(error.contains("x (libcudnn.so.9: not found)"), "{error}");
+        let untouched = with_notes(VoiceMeError::EmptyText, &["note".to_string()]);
+        assert!(matches!(untouched, VoiceMeError::EmptyText));
     }
 }

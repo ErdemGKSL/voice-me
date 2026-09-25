@@ -2,9 +2,10 @@
 title: 'Choose the engine first, then the device it runs on'
 type: 'feature'
 created: '2026-09-25'
-status: 'draft'
+status: 'done'
 route: 'dispatch'
-review_loop_iteration: 0
+baseline_commit: 'a50ccc9d967814d53bfb620fca6450a93544ddbc'
+review_loop_iteration: 1
 context:
   - '{project-root}/_bmad-output/implementation-artifacts/spec-3-8-build-and-mirror-the-all-provider-onnx-runtime.md'
 ---
@@ -63,12 +64,12 @@ context:
 ## Tasks & Acceptance
 
 **Execution:**
-- [ ] `crates/voice-me-core/src/{state,settings_store}.rs` -- the Piper target, engine and device choices, persistence and compatibility. Tests for the matrix rows Engine list, Device list, Old file and Engine switch.
-- [ ] `crates/voice-me-deps/src/{capability,lib}.rs` -- Piper GPU rows and Install. Tests: Piper+CUDA rows include the CUDA provider and NVIDIA rows and exclude weights; Piper+CPU is unchanged.
-- [ ] `crates/voice-me-tts-piper/` -- injectable providers, CPU by default for existing callers and tests.
-- [ ] `crates/voice-me-ui/src/backend.rs` (+ `dependencies.rs` test) -- the two selects and their UI tests: engine list, device list shown or hidden, device Confirm saves, engine switch keeps the device.
-- [ ] `crates/voice-me-app/src/main.rs` -- the wiring above and the Piper-GPU `is_gpu_selection` test.
-- [ ] `EXPERIENCE.md`, `README.md` -- the selector rows.
+- [x] `crates/voice-me-core/src/{state,settings_store}.rs` -- the Piper target, engine and device choices, persistence and compatibility. Tests for the matrix rows Engine list, Device list, Old file and Engine switch.
+- [x] `crates/voice-me-deps/src/{capability,lib}.rs` -- Piper GPU rows and Install. Tests: Piper+CUDA rows include the CUDA provider and NVIDIA rows and exclude weights; Piper+CPU is unchanged.
+- [x] `crates/voice-me-tts-piper/` -- injectable providers, CPU by default for existing callers and tests.
+- [x] `crates/voice-me-ui/src/backend.rs` (+ `dependencies.rs` test) -- the two selects and their UI tests: engine list, device list shown or hidden, device Confirm saves, engine switch keeps the device.
+- [x] `crates/voice-me-app/src/main.rs` -- the wiring above and the Piper-GPU `is_gpu_selection` test.
+- [x] `EXPERIENCE.md`, `README.md` -- the selector rows.
 
 **Acceptance Criteria:**
 - Given Settings → Backend on Local, when the user opens the backend `Select`, then it lists engines without device suffixes, and a device `Select` appears under Piper or Chatterbox.
@@ -76,9 +77,37 @@ context:
 
 ## Implementation Notes
 
+- `BackendSelection::Piper { target }` (+ `PIPER_CPU`). `local_target()` now returns Piper's target too, so `resolve_backend`, `is_gpu_selection`, `selection_library` and the deps capability/runtime rows treat Piper's device like Chatterbox's; `is_chatterbox()` marks the one engine with model files. Piper on CPU is `is_cpu()`, so the Backend tab shows the "CPU mode" tag beside "stock voice".
+- Core: `LocalEngine` (Piper, Chatterbox, SystemVoice), `engine_choices()`, `device_choices(engine, runtimes, all_providers)`, `switch_engine(current, engine, runtimes, all_providers)`, `BackendSelection::{engine, device_label, on_cpu}`. `label()` (the *Selected* line) reads "<engine> · <device>". `backend_choices` takes `all_providers` and lists each engine's devices.
+- Settings: `SelectionFile::Piper { #[serde(default)] target }`. Always written; an old build reads it as Piper (serde ignores the extra field of an internally tagged unit variant).
+- Piper crate: `PiperTts::with_providers(ProvidersInit)` returning `SessionProviders { providers, failure_notes }`, CPU by default; called after `RuntimeInit`. `ort` gains `cuda`/`webgpu`.
+- `voice_me_tts::session_providers(root, runtime, backend)` shares Chatterbox's restart rule and NVIDIA preload (`prepare_target`); the app injects it into Piper.
+- UI: the backend `Select` value is `BackendEntry::{Engine, Remote}`; `backend-device-select` (value `BackendSelection`) is shown for Piper/Chatterbox under the Local kind. `BackendPanel.bundled_all_providers` comes from `Sources::pinned().runtime_all_providers`.
+- "Use CPU backend" now selects the saved engine on CPU (Piper stays Piper).
+
 ## Spec Change Log
 
 ## Review Triage Log
+
+Pass 1: blind hunter (B), edge-case hunter (E), verification gap (V).
+
+| Verdict | Finding | Evidence / route |
+|---|---|---|
+| medium | `session_providers` test checks only `len()==1`; a target-blind implementation passes (V) | Pre-verified gap → patch: downcast per target |
+| medium | "Use CPU backend keeps Piper" lives inline in `main()`, untested (V, B) | Pre-verified gap → patch: extract `use_cpu_selection`, test |
+| low | Piper+WebGPU capability arm and rows untested (V, B) | Pre-verified gap → patch: add a WebGPU case |
+| low | `backend_choices` public but unused outside core tests (B) | Direct deletion → patch: `#[cfg(test)]`, drop the re-export |
+| low | `BackendEntry::of` panics with `unreachable!` on the render path (B) | Direct correction → patch: exhaustive match |
+| low | Over-long comment line in `voice-me-tts-piper/Cargo.toml` (B) | Direct correction → patch |
+| medium | A stale Chatterbox-GPU report can pass `for_current_selection` for Piper on the same device (E) | The guard compares `report.backend` only; the same race already existed for Chatterbox CPU → Piper CPU → defer (pre-existing) |
+| medium | Piper never sends `SpeechSessionBuilt`, so the "acquired" line never shows its device (B) | Pre-existing since Story 3.15; now matters for GPU → defer |
+| low | UseCpu falls back to `BUNDLED_CPU` when the settings load fails (B, E) | Real only when the settings file is unreadable, which is unlikely; the old behaviour → rejected |
+| low | A saved GPU device missing from the device list leaves the `Select` on its placeholder (B, E) | Reachable only through a hand-edited or newer file while the all-provider runtime is pinned; the fix adds a branch → rejected |
+| false | Piper on GPU builds on a CPU-only runtime with only a late error (E) | `runtime_row` for a GPU target reports the runtime missing, so speech is blocked before warm-up |
+| false | CUDA/WebGPU listed based on the pinned runtime, not the installed one (B) | By design (3.8): the rows show missing and Install replaces the CPU runtime |
+| low | `BackendSelection::on_cpu` vs `LocalEngine::on_cpu` differ for the System voice (B) | UseCpu only arises from a GPU capability row, never for the System voice; the doc states the behaviour → rejected |
+| low | Downgrade compatibility (`kind="piper"` + `target`) untested (B) | serde's internally tagged unit variant ignores extra keys, and the load is lenient anyway → rejected |
+| false | Bare "CUDA" beside "CUDA — libonnxruntime.so" is ambiguous (B) | Frozen decision 2 sets these labels |
 
 ## Verification
 

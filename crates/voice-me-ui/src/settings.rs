@@ -600,7 +600,7 @@ mod tests {
                         deps_port: Arc::new(StubDepsPort),
                         events: event_tx.clone(),
                         backend: BackendPanel {
-                            selection: voice_me_core::BackendSelection::Piper,
+                            selection: voice_me_core::BackendSelection::PIPER_CPU,
                             ..BackendPanel::default()
                         },
                         actions: std::rc::Rc::new(|_, _| {}),

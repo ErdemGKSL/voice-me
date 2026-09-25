@@ -290,8 +290,12 @@ enum SelectionFile {
     },
     /// Story 3.12.
     SystemVoice,
-    /// Story 3.15.
-    Piper,
+    /// Story 3.15. A file from before the device `Select` has no target:
+    /// Piper on CPU.
+    Piper {
+        #[serde(default)]
+        target: SpeechExecutionTarget,
+    },
 }
 
 impl From<&BackendSelection> for SelectionFile {
@@ -305,7 +309,7 @@ impl From<&BackendSelection> for SelectionFile {
                 provider: *provider,
             },
             BackendSelection::SystemVoice => SelectionFile::SystemVoice,
-            BackendSelection::Piper => SelectionFile::Piper,
+            BackendSelection::Piper { target } => SelectionFile::Piper { target: *target },
         }
     }
 }
@@ -316,7 +320,7 @@ impl From<SelectionFile> for BackendSelection {
             SelectionFile::Local { runtime, target } => BackendSelection::Local { runtime, target },
             SelectionFile::Remote { provider } => BackendSelection::Remote(provider),
             SelectionFile::SystemVoice => BackendSelection::SystemVoice,
-            SelectionFile::Piper => BackendSelection::Piper,
+            SelectionFile::Piper { target } => BackendSelection::Piper { target },
         }
     }
 }
@@ -1130,7 +1134,7 @@ mod tests {
 
         assert_eq!(state.backend_selection, BackendSelection::default());
         if cfg!(any(target_os = "linux", target_os = "windows")) {
-            assert_eq!(state.backend_selection, BackendSelection::Piper);
+            assert_eq!(state.backend_selection, BackendSelection::PIPER_CPU);
         } else {
             assert_eq!(state.backend_selection, BackendSelection::BUNDLED_CPU);
         }
@@ -1561,13 +1565,13 @@ mod tests {
         );
 
         store
-            .save_backend_selection(&BackendSelection::Piper)
+            .save_backend_selection(&BackendSelection::PIPER_CPU)
             .unwrap();
         store
             .save_speech_voice(LanguageBackend::Piper, Some("tr_TR-dfki-medium"))
             .unwrap();
         let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
-        assert_eq!(state.backend_selection, BackendSelection::Piper);
+        assert_eq!(state.backend_selection, BackendSelection::PIPER_CPU);
         assert_eq!(
             state.speech_voices.piper.as_deref(),
             Some("tr_TR-dfki-medium")
@@ -1597,5 +1601,44 @@ mod tests {
         );
         let text = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
         assert!(text.contains("kind = \"local\""), "{text}");
+    }
+
+    /// spec-backend-engine-and-device-selects: Piper's device is saved and
+    /// read back.
+    #[test]
+    fn a_piper_device_round_trips() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = store_in(config_dir.path(), data_dir.path());
+
+        for target in [
+            SpeechExecutionTarget::Cuda,
+            SpeechExecutionTarget::WebGpu,
+            SpeechExecutionTarget::Cpu,
+        ] {
+            let selection = BackendSelection::Piper { target };
+            store.save_backend_selection(&selection).unwrap();
+            let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+            assert_eq!(state.backend_selection, selection);
+        }
+        let text = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
+        assert!(text.contains("kind = \"piper\""), "{text}");
+    }
+
+    /// The Old file row: `kind = "piper"` with no target is Piper on CPU.
+    #[test]
+    fn an_old_piper_selection_without_a_target_is_piper_on_cpu() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_dir.path().join(SETTINGS_FILE_NAME),
+            "hotkey = \"Ctrl+Alt+KeyV\"\n\n[backend_selection]\nkind = \"piper\"\n",
+        )
+        .unwrap();
+
+        let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+
+        assert_eq!(state.backend_selection, BackendSelection::PIPER_CPU);
+        assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
     }
 }

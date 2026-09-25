@@ -707,9 +707,11 @@ pub enum BackendSelection {
     /// The OS's own speech engine in a stock voice (Story 3.12): eSpeak NG
     /// on Linux. Local, but never an ONNX target.
     SystemVoice,
-    /// A Piper neural stock voice (Story 3.15), run on the bundled CPU
-    /// runtime. Local, but not a Chatterbox ONNX target.
-    Piper,
+    /// A Piper neural stock voice (Story 3.15), run on the bundled runtime
+    /// — on CPU, or on CUDA or WebGPU once the bundled runtime has every
+    /// provider (spec-backend-engine-and-device-selects). Local, but not a
+    /// Chatterbox target.
+    Piper { target: SpeechExecutionTarget },
 }
 
 /// What an unsaved selection is (Story 3.15): Piper where this OS's build
@@ -719,7 +721,7 @@ pub enum BackendSelection {
 impl Default for BackendSelection {
     fn default() -> Self {
         if cfg!(any(target_os = "linux", target_os = "windows")) {
-            Self::Piper
+            Self::PIPER_CPU
         } else {
             Self::BUNDLED_CPU
         }
@@ -734,15 +736,64 @@ impl BackendSelection {
         target: SpeechExecutionTarget::Cpu,
     };
 
-    /// The local Chatterbox execution target, or `None` for a remote
-    /// provider, for the System voice, which runs no ONNX session, and for
-    /// Piper, whose one CPU session is not a Chatterbox target.
+    /// Piper on the bundled CPU runtime — the first-run default on Linux
+    /// and Windows.
+    pub const PIPER_CPU: Self = Self::Piper {
+        target: SpeechExecutionTarget::Cpu,
+    };
+
+    /// The ONNX execution target this selection runs on — Chatterbox's or
+    /// Piper's — or `None` for a remote provider and for the System voice,
+    /// which runs no ONNX session.
     pub fn local_target(&self) -> Option<SpeechExecutionTarget> {
         match self {
-            BackendSelection::Local { target, .. } => Some(*target),
-            BackendSelection::Remote(_)
-            | BackendSelection::SystemVoice
-            | BackendSelection::Piper => None,
+            BackendSelection::Local { target, .. } | BackendSelection::Piper { target } => {
+                Some(*target)
+            }
+            BackendSelection::Remote(_) | BackendSelection::SystemVoice => None,
+        }
+    }
+
+    /// Whether this is Chatterbox (a [`BackendSelection::Local`] entry): the
+    /// one engine that needs the speech model files.
+    pub fn is_chatterbox(&self) -> bool {
+        matches!(self, BackendSelection::Local { .. })
+    }
+
+    /// The local engine this selection runs, or `None` for a remote one.
+    pub fn engine(&self) -> Option<LocalEngine> {
+        match self {
+            BackendSelection::Piper { .. } => Some(LocalEngine::Piper),
+            BackendSelection::Local { .. } => Some(LocalEngine::Chatterbox),
+            BackendSelection::SystemVoice => Some(LocalEngine::SystemVoice),
+            BackendSelection::Remote(_) => None,
+        }
+    }
+
+    /// The same engine on the CPU — what "Use CPU backend" selects: Piper
+    /// on CPU for Piper, the bundled CPU runtime for anything else.
+    pub fn on_cpu(&self) -> Self {
+        match self {
+            BackendSelection::Piper { .. } => Self::PIPER_CPU,
+            _ => Self::BUNDLED_CPU,
+        }
+    }
+
+    /// How the device reads in the device `Select`: "CPU", "CUDA",
+    /// "WebGPU", or "CUDA — libonnxruntime.so" for an added runtime's.
+    /// `None` for a selection with no device.
+    pub fn device_label(&self) -> Option<String> {
+        match self {
+            BackendSelection::Local {
+                runtime: Some(path),
+                target,
+            } => Some(format!("{} — {}", target.label(), file_name(path))),
+            BackendSelection::Local {
+                runtime: None,
+                target,
+            }
+            | BackendSelection::Piper { target } => Some(target.label().to_string()),
+            BackendSelection::Remote(_) | BackendSelection::SystemVoice => None,
         }
     }
 
@@ -751,7 +802,7 @@ impl BackendSelection {
     /// 3.14): the System voice and Azure.
     pub fn is_stock_voice(&self) -> bool {
         match self {
-            BackendSelection::SystemVoice | BackendSelection::Piper => true,
+            BackendSelection::SystemVoice | BackendSelection::Piper { .. } => true,
             BackendSelection::Remote(provider) => provider.is_stock_voice(),
             BackendSelection::Local { .. } => false,
         }
@@ -766,7 +817,7 @@ impl BackendSelection {
 
     /// Whether this is Piper (Story 3.15).
     pub fn is_piper(&self) -> bool {
-        matches!(self, BackendSelection::Piper)
+        matches!(self, BackendSelection::Piper { .. })
     }
 
     /// The added runtime library this selection loads, if it is one the
@@ -788,7 +839,7 @@ impl BackendSelection {
             BackendSelection::Local { .. } => LanguageBackend::Local,
             BackendSelection::Remote(provider) => LanguageBackend::Remote(*provider),
             BackendSelection::SystemVoice => LanguageBackend::SystemVoice,
-            BackendSelection::Piper => LanguageBackend::Piper,
+            BackendSelection::Piper { .. } => LanguageBackend::Piper,
         }
     }
 
@@ -798,25 +849,67 @@ impl BackendSelection {
         self.local_target() == Some(SpeechExecutionTarget::Cpu)
     }
 
-    /// How the entry reads in the backend `Select`: "CPU (bundled
-    /// runtime)", "CUDA (libonnxruntime.so)", "DeepInfra (remote)".
+    /// How the selection reads on the *Selected* line: the engine, then
+    /// its device — "Chatterbox — your voice · CUDA — libonnxruntime.so",
+    /// "Piper — natural, instant (stock voice) · WebGPU" — or the remote
+    /// provider, "DeepInfra (remote)".
     pub fn label(&self) -> String {
         match self {
-            BackendSelection::Local {
-                runtime: None,
-                target,
-            } => format!("{} (bundled runtime)", target.label()),
-            BackendSelection::Local {
-                runtime: Some(path),
-                target,
-            } => format!("{} ({})", target.label(), file_name(path)),
             // Story 3.17: the UX's own entry for the keyless one.
             BackendSelection::Remote(RemoteProvider::EdgeTts) => {
                 "Edge TTS — free, online (stock voice)".to_string()
             }
             BackendSelection::Remote(provider) => format!("{} (remote)", provider.label()),
-            BackendSelection::SystemVoice => "System voice — instant (stock voice)".to_string(),
-            BackendSelection::Piper => "Piper — natural, instant (stock voice)".to_string(),
+            local => {
+                let engine = local.engine().map(LocalEngine::label).unwrap_or_default();
+                match local.device_label() {
+                    Some(device) => format!("{engine} · {device}"),
+                    None => engine.to_string(),
+                }
+            }
+        }
+    }
+}
+
+/// A local engine — what the Local backend `Select` lists
+/// (spec-backend-engine-and-device-selects). Piper and Chatterbox run on
+/// ONNX Runtime and so also have a device; the System voice has none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LocalEngine {
+    Piper,
+    Chatterbox,
+    SystemVoice,
+}
+
+impl LocalEngine {
+    /// Every local engine, in the order the `Select` lists them.
+    pub const ALL: [LocalEngine; 3] = [
+        LocalEngine::Piper,
+        LocalEngine::Chatterbox,
+        LocalEngine::SystemVoice,
+    ];
+
+    /// How the engine reads in the backend `Select`, without a device.
+    pub fn label(self) -> &'static str {
+        match self {
+            LocalEngine::Piper => "Piper — natural, instant (stock voice)",
+            LocalEngine::Chatterbox => "Chatterbox — your voice",
+            LocalEngine::SystemVoice => "System voice — instant (stock voice)",
+        }
+    }
+
+    /// Whether the engine runs on an ONNX device, and so has a device
+    /// `Select`.
+    pub fn has_device(self) -> bool {
+        !matches!(self, LocalEngine::SystemVoice)
+    }
+
+    /// The engine on the CPU: its default device.
+    pub fn on_cpu(self) -> BackendSelection {
+        match self {
+            LocalEngine::Piper => BackendSelection::PIPER_CPU,
+            LocalEngine::Chatterbox => BackendSelection::BUNDLED_CPU,
+            LocalEngine::SystemVoice => BackendSelection::SystemVoice,
         }
     }
 }
@@ -871,14 +964,93 @@ impl LocalRuntime {
     }
 }
 
-/// Every entry the backend `Select` lists, in order: Piper (Story 3.15,
-/// first under Local), the bundled CPU runtime, each added runtime's
-/// entries, the System voice, then the remote providers.
-pub fn backend_choices(runtimes: &[LocalRuntime]) -> Vec<BackendSelection> {
-    std::iter::once(BackendSelection::Piper)
-        .chain(std::iter::once(BackendSelection::BUNDLED_CPU))
-        .chain(runtimes.iter().flat_map(LocalRuntime::entries))
-        .chain(std::iter::once(BackendSelection::SystemVoice))
+/// The local engines the backend `Select` lists under Local, in order:
+/// Piper, Chatterbox, the System voice.
+pub fn engine_choices() -> Vec<LocalEngine> {
+    LocalEngine::ALL.to_vec()
+}
+
+/// The devices `engine` can run on, in the order the device `Select` lists
+/// them: CPU on the bundled runtime, then CUDA and WebGPU on it when it
+/// has every provider (`all_providers`, Story 3.8), then — for Chatterbox
+/// only, since Piper runs on the bundled runtime — each added runtime's
+/// entries. Empty for the System voice.
+pub fn device_choices(
+    engine: LocalEngine,
+    runtimes: &[LocalRuntime],
+    all_providers: bool,
+) -> Vec<BackendSelection> {
+    let bundled_targets: &[SpeechExecutionTarget] = if all_providers {
+        &[
+            SpeechExecutionTarget::Cpu,
+            SpeechExecutionTarget::Cuda,
+            SpeechExecutionTarget::WebGpu,
+        ]
+    } else {
+        &[SpeechExecutionTarget::Cpu]
+    };
+    match engine {
+        LocalEngine::SystemVoice => Vec::new(),
+        LocalEngine::Piper => bundled_targets
+            .iter()
+            .map(|&target| BackendSelection::Piper { target })
+            .collect(),
+        LocalEngine::Chatterbox => bundled_targets
+            .iter()
+            .map(|&target| BackendSelection::Local {
+                runtime: None,
+                target,
+            })
+            .chain(runtimes.iter().flat_map(LocalRuntime::entries))
+            .collect(),
+    }
+}
+
+/// The selection a switch to `engine` saves: the same device when `engine`
+/// offers it, otherwise CPU. An added runtime's device is only Chatterbox's,
+/// so Piper keeps its target on the bundled runtime when that has it.
+pub fn switch_engine(
+    current: &BackendSelection,
+    engine: LocalEngine,
+    runtimes: &[LocalRuntime],
+    all_providers: bool,
+) -> BackendSelection {
+    let devices = device_choices(engine, runtimes, all_providers);
+    if devices.contains(current) {
+        return current.clone();
+    }
+    let wanted = match (engine, current) {
+        (LocalEngine::Piper, BackendSelection::Local { target, .. }) => {
+            Some(BackendSelection::Piper { target: *target })
+        }
+        (LocalEngine::Chatterbox, BackendSelection::Piper { target }) => {
+            Some(BackendSelection::Local {
+                runtime: None,
+                target: *target,
+            })
+        }
+        _ => None,
+    };
+    wanted
+        .filter(|wanted| devices.contains(wanted))
+        .unwrap_or_else(|| engine.on_cpu())
+}
+
+/// Every entry a backend can be, grouped as the tab lists them: each local
+/// engine's devices (or the System voice itself), then the remote
+/// providers. Only the tests enumerate them all.
+#[cfg(test)]
+fn backend_choices(runtimes: &[LocalRuntime], all_providers: bool) -> Vec<BackendSelection> {
+    LocalEngine::ALL
+        .into_iter()
+        .flat_map(|engine| {
+            let devices = device_choices(engine, runtimes, all_providers);
+            if devices.is_empty() {
+                vec![engine.on_cpu()]
+            } else {
+                devices
+            }
+        })
         .chain(
             RemoteProvider::ALL
                 .into_iter()
@@ -1512,19 +1684,25 @@ mod tests {
                 target: SpeechExecutionTarget::Cuda,
             }]
         );
-        assert_eq!(cuda.entries()[0].label(), "CUDA (libonnxruntime.so)");
+        assert_eq!(
+            cuda.entries()[0].device_label().as_deref(),
+            Some("CUDA — libonnxruntime.so")
+        );
 
         let cpu_only = LocalRuntime {
             path: PathBuf::from("/opt/cpu/libonnxruntime.so"),
             targets: vec![SpeechExecutionTarget::Cpu],
         };
-        assert_eq!(cpu_only.entries()[0].label(), "CPU (libonnxruntime.so)");
+        assert_eq!(
+            cpu_only.entries()[0].device_label().as_deref(),
+            Some("CPU — libonnxruntime.so")
+        );
 
-        let choices = backend_choices(&[cuda]);
-        // Story 3.15: Piper first under Local, then the bundled CPU.
-        assert_eq!(choices.first(), Some(&BackendSelection::Piper));
+        let choices = backend_choices(&[cuda], false);
+        // Piper first under Local, then Chatterbox's devices.
+        assert_eq!(choices.first(), Some(&BackendSelection::PIPER_CPU));
         assert_eq!(choices[1], BackendSelection::BUNDLED_CPU);
-        assert_eq!(choices[1].label(), "CPU (bundled runtime)");
+        assert_eq!(choices[1].label(), "Chatterbox — your voice · CPU");
         assert_eq!(
             choices.last(),
             Some(&BackendSelection::Remote(RemoteProvider::EdgeTts))
@@ -1532,6 +1710,167 @@ mod tests {
         assert_eq!(choices.len(), 8);
         // The System voice comes after the local runtimes, before remote.
         assert_eq!(choices[3], BackendSelection::SystemVoice);
+    }
+
+    /// The Engine list row: Piper, Chatterbox, the System voice, without a
+    /// device in any label.
+    #[test]
+    fn the_engine_list_is_piper_chatterbox_then_the_system_voice() {
+        assert_eq!(
+            engine_choices(),
+            vec![
+                LocalEngine::Piper,
+                LocalEngine::Chatterbox,
+                LocalEngine::SystemVoice
+            ]
+        );
+        for engine in engine_choices() {
+            let label = engine.label();
+            for device in ["CPU", "CUDA", "WebGPU", "runtime"] {
+                assert!(!label.contains(device), "{label}");
+            }
+        }
+        assert!(LocalEngine::Piper.has_device());
+        assert!(LocalEngine::Chatterbox.has_device());
+        assert!(!LocalEngine::SystemVoice.has_device());
+        assert_eq!(
+            BackendSelection::Piper {
+                target: SpeechExecutionTarget::Cuda
+            }
+            .engine(),
+            Some(LocalEngine::Piper)
+        );
+        assert_eq!(
+            BackendSelection::BUNDLED_CPU.engine(),
+            Some(LocalEngine::Chatterbox)
+        );
+        assert_eq!(
+            BackendSelection::Remote(RemoteProvider::Azure).engine(),
+            None
+        );
+    }
+
+    /// The Device list and No device rows.
+    #[test]
+    fn the_device_list_follows_the_engine_and_the_bundled_runtime() {
+        let added = LocalRuntime {
+            path: PathBuf::from("/opt/ort/libonnxruntime.so"),
+            targets: vec![SpeechExecutionTarget::Cpu, SpeechExecutionTarget::Cuda],
+        };
+        let runtimes = [added];
+
+        let chatterbox = device_choices(LocalEngine::Chatterbox, &runtimes, true);
+        let labels: Vec<_> = chatterbox
+            .iter()
+            .map(|selection| selection.device_label().unwrap())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["CPU", "CUDA", "WebGPU", "CUDA — libonnxruntime.so"]
+        );
+
+        // Before the all-provider runtime: the bundled runtime offers CPU
+        // only.
+        let labels: Vec<_> = device_choices(LocalEngine::Chatterbox, &runtimes, false)
+            .iter()
+            .map(|selection| selection.device_label().unwrap())
+            .collect();
+        assert_eq!(labels, vec!["CPU", "CUDA — libonnxruntime.so"]);
+
+        // Piper runs on the bundled runtime only.
+        assert_eq!(
+            device_choices(LocalEngine::Piper, &runtimes, true),
+            vec![
+                BackendSelection::PIPER_CPU,
+                BackendSelection::Piper {
+                    target: SpeechExecutionTarget::Cuda
+                },
+                BackendSelection::Piper {
+                    target: SpeechExecutionTarget::WebGpu
+                },
+            ]
+        );
+        assert_eq!(
+            device_choices(LocalEngine::Piper, &runtimes, false),
+            vec![BackendSelection::PIPER_CPU]
+        );
+        assert!(device_choices(LocalEngine::SystemVoice, &runtimes, true).is_empty());
+        assert_eq!(BackendSelection::SystemVoice.device_label(), None);
+        assert_eq!(
+            BackendSelection::Remote(RemoteProvider::DeepInfra).device_label(),
+            None
+        );
+    }
+
+    /// The Engine switch row: the device is kept when the new engine offers
+    /// it, otherwise CPU.
+    #[test]
+    fn switching_engine_keeps_the_device_when_the_new_engine_offers_it() {
+        let webgpu = BackendSelection::Local {
+            runtime: None,
+            target: SpeechExecutionTarget::WebGpu,
+        };
+        assert_eq!(
+            switch_engine(&webgpu, LocalEngine::Piper, &[], true),
+            BackendSelection::Piper {
+                target: SpeechExecutionTarget::WebGpu
+            }
+        );
+        assert_eq!(
+            switch_engine(
+                &BackendSelection::Piper {
+                    target: SpeechExecutionTarget::Cuda
+                },
+                LocalEngine::Chatterbox,
+                &[],
+                true
+            ),
+            BackendSelection::Local {
+                runtime: None,
+                target: SpeechExecutionTarget::Cuda
+            }
+        );
+        // Not offered → CPU.
+        assert_eq!(
+            switch_engine(&webgpu, LocalEngine::Piper, &[], false),
+            BackendSelection::PIPER_CPU
+        );
+        // An added runtime's device is Chatterbox's only; Piper takes the
+        // same target on the bundled runtime.
+        let added = BackendSelection::Local {
+            runtime: Some(PathBuf::from("/opt/ort/libonnxruntime.so")),
+            target: SpeechExecutionTarget::Cuda,
+        };
+        assert_eq!(
+            switch_engine(&added, LocalEngine::Piper, &[], true),
+            BackendSelection::Piper {
+                target: SpeechExecutionTarget::Cuda
+            }
+        );
+        assert_eq!(
+            switch_engine(&added, LocalEngine::Piper, &[], false),
+            BackendSelection::PIPER_CPU
+        );
+        assert_eq!(
+            switch_engine(
+                &BackendSelection::SystemVoice,
+                LocalEngine::Chatterbox,
+                &[],
+                true
+            ),
+            BackendSelection::BUNDLED_CPU
+        );
+        assert_eq!(
+            switch_engine(&webgpu, LocalEngine::SystemVoice, &[], true),
+            BackendSelection::SystemVoice
+        );
+        assert_eq!(
+            BackendSelection::Piper {
+                target: SpeechExecutionTarget::Cuda
+            }
+            .on_cpu(),
+            BackendSelection::PIPER_CPU
+        );
     }
 
     #[test]
@@ -1600,12 +1939,12 @@ mod tests {
             path: PathBuf::from("/opt/cpu/libonnxruntime.so"),
             targets: vec![SpeechExecutionTarget::Cpu],
         };
-        for selection in backend_choices(&[runtime, cpu_only]) {
+        for selection in backend_choices(&[runtime, cpu_only], true) {
             let expected = match &selection {
                 BackendSelection::Local { .. } => LanguageBackend::Local,
                 BackendSelection::Remote(provider) => LanguageBackend::Remote(*provider),
                 BackendSelection::SystemVoice => LanguageBackend::SystemVoice,
-                BackendSelection::Piper => LanguageBackend::Piper,
+                BackendSelection::Piper { .. } => LanguageBackend::Piper,
             };
             assert_eq!(selection.language_backend(), expected);
         }
@@ -1942,14 +2281,24 @@ mod tests {
 
     #[test]
     fn piper_is_a_local_stock_voice_listed_first_with_a_voice_list() {
-        let piper = BackendSelection::Piper;
-        assert_eq!(piper.local_target(), None);
-        assert!(!piper.is_cpu());
+        let piper = BackendSelection::PIPER_CPU;
+        assert_eq!(piper.local_target(), Some(SpeechExecutionTarget::Cpu));
+        assert!(piper.is_cpu());
+        assert!(!piper.is_chatterbox());
+        let piper_cuda = BackendSelection::Piper {
+            target: SpeechExecutionTarget::Cuda,
+        };
+        assert_eq!(piper_cuda.local_target(), Some(SpeechExecutionTarget::Cuda));
+        assert!(!piper_cuda.is_cpu());
+        assert!(piper_cuda.is_piper());
         assert!(piper.is_stock_voice());
         assert!(!piper.is_system_voice());
         assert!(piper.is_piper());
-        assert_eq!(piper.label(), "Piper — natural, instant (stock voice)");
-        assert_eq!(backend_choices(&[])[0], piper);
+        assert_eq!(
+            piper.label(),
+            "Piper — natural, instant (stock voice) · CPU"
+        );
+        assert_eq!(backend_choices(&[], false)[0], piper);
         let backend = piper.language_backend();
         assert_eq!(backend, LanguageBackend::Piper);
         assert!(backend.has_voice_list() && backend.has_voice_choice());
@@ -1972,7 +2321,7 @@ mod tests {
     fn an_unsaved_selection_is_piper_on_linux_and_the_bundled_cpu_elsewhere() {
         let state = AppState::default();
         if cfg!(any(target_os = "linux", target_os = "windows")) {
-            assert_eq!(state.backend_selection, BackendSelection::Piper);
+            assert_eq!(state.backend_selection, BackendSelection::PIPER_CPU);
             assert_eq!(state.speech_language(), Some("tr_TR"));
             assert_eq!(
                 state.speech_voices.get(LanguageBackend::Piper),

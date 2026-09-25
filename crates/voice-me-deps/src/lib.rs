@@ -246,18 +246,11 @@ impl DepsAdapter {
                 fetch(kind, &plan, events)
             }
             // Story 3.8: one Install on any of the runtime's rows fetches
-            // everything the selected target still needs. Piper speaks on
-            // the CPU runtime whatever Chatterbox backend is saved.
+            // everything the selected target still needs — Piper's too, on
+            // its own device (spec-backend-engine-and-device-selects).
             DependencyKind::OnnxRuntime
             | DependencyKind::CudaProvider
-            | DependencyKind::NvidiaLibraries => {
-                let backend = if request.selection.is_piper() {
-                    SpeechBackend::CPU
-                } else {
-                    backend
-                };
-                self.provision_runtime(kind, backend, events)
-            }
+            | DependencyKind::NvidiaLibraries => self.provision_runtime(kind, backend, events),
             DependencyKind::VirtualMicrophone => self.provision_virtual_mic(events),
             DependencyKind::PiperVoice => self.provision_piper_voice(request, events),
             // Story 3.16: where eSpeak NG has a pinned download (Windows
@@ -796,25 +789,20 @@ impl DependencyProvisioningPort for DepsAdapter {
         // selection has no file list (its readiness is a key and a
         // provider), so it reports no engine rows.
         let capability = capability::capability_row(&request, self.gpu_probe.as_ref());
-        let engine_rows = match request.selection.local_target() {
-            Some(_) => speech_engine_rows(
-                &root,
-                request.backend,
-                request.selection.added_runtime(),
-                &self.sources,
-            ),
+        let engine_rows = match &request.selection {
+            BackendSelection::Local { runtime, .. } => {
+                speech_engine_rows(&root, request.backend, runtime.as_deref(), &self.sources)
+            }
             // Story 3.12: the System voice's one engine row. It is not an
             // ONNX target, so it has no runtime or model rows.
-            None if request.selection.is_system_voice() => self.system_voice_engine_rows(),
-            // Story 3.15: Piper's shared CPU runtime, its voice, and the
-            // eSpeak NG it reads text through.
-            None if request.selection.is_piper() => self.piper_rows(&root, &request),
+            BackendSelection::SystemVoice => self.system_voice_engine_rows(),
+            // Story 3.15: Piper's shared runtime (with its device's CUDA
+            // pieces), its voice, and the eSpeak NG it reads text through.
+            BackendSelection::Piper { .. } => self.piper_rows(&root, &request),
             // Story 3.17: Edge TTS's one program row. Its key-free
             // readiness is whether `edge-tts` is found.
-            None if request.selection == BackendSelection::Remote(RemoteProvider::EdgeTts) => {
-                edge_tts_rows()
-            }
-            None => Vec::new(),
+            BackendSelection::Remote(RemoteProvider::EdgeTts) => edge_tts_rows(),
+            BackendSelection::Remote(_) => Vec::new(),
         };
 
         let report = DependencyReport::new(
@@ -874,19 +862,23 @@ impl DepsAdapter {
         ))]
     }
 
-    /// Story 3.15: Piper's rows — the shared CPU runtime (the one the
-    /// bundled CPU backend uses; Piper never downloads its own), the voice,
-    /// and eSpeak NG. Linux and (Story 3.16) Windows only: elsewhere the
-    /// capability row says Piper arrives later.
+    /// Story 3.15: Piper's rows — the shared bundled runtime (the one
+    /// Chatterbox uses; Piper never downloads its own) with, on CUDA, the
+    /// CUDA provider and NVIDIA libraries (spec-backend-engine-and-device-
+    /// selects), then the voice and eSpeak NG. Never the model files.
+    /// Linux and (Story 3.16) Windows only: elsewhere the capability row
+    /// says Piper arrives later.
     fn piper_rows(&self, root: &Path, request: &CheckRequest) -> Vec<Dependency> {
         if !cfg!(any(target_os = "linux", target_os = "windows")) {
             return Vec::new();
         }
         let known = |key: &str| self.known_piper_voice(key).is_some();
-        let mut rows = vec![
-            runtime_row(root, SpeechBackend::CPU, None, &self.sources),
-            piper::piper_voice_row(root, request.piper_voice.as_deref(), &known),
-        ];
+        let mut rows = runtime_rows(root, request.backend, None, &self.sources);
+        rows.push(piper::piper_voice_row(
+            root,
+            request.piper_voice.as_deref(),
+            &known,
+        ));
         rows.extend(self.piper_espeak_rows());
         rows
     }
@@ -1085,6 +1077,21 @@ pub fn speech_engine_rows(
     added: Option<&Path>,
     sources: &Sources,
 ) -> Vec<Dependency> {
+    let mut rows = runtime_rows(root, backend, added, sources);
+    rows.push(model_weights_row(root, backend.weights));
+    rows
+}
+
+/// The runtime rows every ONNX engine on `backend`'s target needs: the
+/// runtime library and, for CUDA on the bundled runtime, its CUDA provider
+/// and NVIDIA libraries. Chatterbox adds its model files after them; Piper
+/// its voice (spec-backend-engine-and-device-selects).
+fn runtime_rows(
+    root: &Path,
+    backend: SpeechBackend,
+    added: Option<&Path>,
+    sources: &Sources,
+) -> Vec<Dependency> {
     let mut rows = vec![runtime_row(root, backend, added, sources)];
     // Story 3.8: the bundled runtime's CUDA pieces, each its own row, once
     // they can be installed. A library the user added or configured is
@@ -1097,7 +1104,6 @@ pub fn speech_engine_rows(
         rows.push(cuda_provider_row(root, sources));
         rows.push(nvidia_libraries_row(root, sources));
     }
-    rows.push(model_weights_row(root, backend.weights));
     rows
 }
 
@@ -2876,7 +2882,7 @@ mod tests {
     fn piper_request(voice: Option<&str>) -> CheckRequest {
         CheckRequest {
             backend: SpeechBackend::CPU,
-            selection: voice_me_core::BackendSelection::Piper,
+            selection: voice_me_core::BackendSelection::PIPER_CPU,
             has_api_key: false,
             has_region: false,
             has_voice: voice.is_some(),
@@ -2939,6 +2945,84 @@ mod tests {
         assert_eq!(
             report.dependencies[0].kind,
             DependencyKind::BackendCapability
+        );
+    }
+
+    /// spec-backend-engine-and-device-selects: Piper on CUDA gets the same
+    /// runtime, CUDA provider and NVIDIA rows as Chatterbox, then its voice
+    /// — never the model files — and a capability row for its device. Piper
+    /// on CPU is unchanged.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn piper_on_a_gpu_reports_its_device_rows_and_no_model_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::new()
+            .unset(assets::RUNTIME_DYLIB_ENV)
+            .set(assets::CACHE_ROOT_ENV, dir.path());
+        let check = |target: SpeechExecutionTarget| {
+            let (tx, mut rx) = futures::channel::mpsc::unbounded();
+            let request = CheckRequest {
+                backend: SpeechBackend::for_target(target),
+                selection: BackendSelection::Piper { target },
+                ..piper_request(Some(assets::PIPER_DEFAULT_VOICE.key))
+            };
+            DepsAdapter::with_sources(all_provider_sources())
+                .with_gpu_probe(NoGpu)
+                .check(request, tx)
+                .unwrap();
+            let AppEvent::DependencyCheckCompleted { report } = rx.try_recv().unwrap() else {
+                panic!("the check sends exactly one kind of event");
+            };
+            report.dependencies
+        };
+        let kinds = |rows: &[Dependency]| -> Vec<DependencyKind> {
+            rows.iter()
+                .map(|row| row.kind)
+                .filter(|kind| *kind != DependencyKind::VirtualMicrophone)
+                .collect()
+        };
+
+        let cuda = check(SpeechExecutionTarget::Cuda);
+        assert_eq!(
+            kinds(&cuda),
+            vec![
+                DependencyKind::BackendCapability,
+                DependencyKind::OnnxRuntime,
+                DependencyKind::CudaProvider,
+                DependencyKind::NvidiaLibraries,
+                DependencyKind::PiperVoice,
+                DependencyKind::SystemVoiceEngine,
+            ]
+        );
+        let capability = row(&cuda, DependencyKind::BackendCapability);
+        assert!(capability.status.is_missing(), "{capability:?}");
+        let provider = row(&cuda, DependencyKind::CudaProvider);
+        assert!(provider.status.is_missing() && provider.automatable);
+        let nvidia = row(&cuda, DependencyKind::NvidiaLibraries);
+        assert!(nvidia.status.is_missing() && nvidia.automatable);
+
+        // WebGPU with no GPU: a blocking capability row, and no CUDA pieces.
+        let webgpu = check(SpeechExecutionTarget::WebGpu);
+        assert_eq!(
+            kinds(&webgpu),
+            vec![
+                DependencyKind::BackendCapability,
+                DependencyKind::OnnxRuntime,
+                DependencyKind::PiperVoice,
+                DependencyKind::SystemVoiceEngine,
+            ]
+        );
+        let capability = row(&webgpu, DependencyKind::BackendCapability);
+        assert!(capability.status.is_missing(), "{capability:?}");
+
+        let cpu = check(SpeechExecutionTarget::Cpu);
+        assert_eq!(
+            kinds(&cpu),
+            vec![
+                DependencyKind::OnnxRuntime,
+                DependencyKind::PiperVoice,
+                DependencyKind::SystemVoiceEngine,
+            ]
         );
     }
 

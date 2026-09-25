@@ -138,6 +138,18 @@ Windows, with the Turkish voice `tr_TR-fahrettin-medium`. It reads text
 through the `espeak-ng` program, run as a separate process; nothing of
 eSpeak NG is linked.
 
+Settings → Backend picks the engine first, then its device. Under **Local**
+the backend `Select` lists the engines — Piper, Chatterbox and System voice —
+and picking Piper or Chatterbox shows a **Device** `Select` under it: CPU,
+CUDA or WebGPU on the bundled runtime (CUDA and WebGPU once voice-me's
+all-provider runtime is the pinned one), plus, for Chatterbox, each added
+runtime's targets ("CUDA — libonnxruntime.so"). Piper runs on the bundled
+runtime only. Switching engine keeps the device when the new engine offers
+it, otherwise CPU. Piper on CUDA gets the same runtime, CUDA provider and
+NVIDIA library rows and one-click Install as Chatterbox, but never the
+Chatterbox model files. The System voice and the remote backends have no
+device.
+
 - **Linux** — install `espeak-ng` with your package manager; the eSpeak NG
   row shows the command.
 - **Windows** — voice-me looks for `espeak-ng.exe` in its cache, then under

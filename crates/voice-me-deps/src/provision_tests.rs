@@ -2014,10 +2014,10 @@ fn before_pinning_a_cuda_install_is_refused_as_before() {
     assert!(fixture.server.requests().is_empty());
 }
 
-/// Deferred-work fix: Piper speaks on the CPU runtime, so Install on its
-/// runtime row works whatever GPU backend Chatterbox has saved.
+/// Piper on CPU installs the CPU runtime: the request's backend is Piper's
+/// own device (spec-backend-engine-and-device-selects), not Chatterbox's.
 #[test]
-fn a_piper_runtime_install_uses_the_cpu_runtime_whatever_backend_is_saved() {
+fn a_piper_runtime_install_on_cpu_installs_the_cpu_runtime() {
     let fixture = Fixture::with_extra_files(
         vec![(
             "runtime/ort-9.9.9.tgz".to_string(),
@@ -2026,10 +2026,7 @@ fn a_piper_runtime_install_uses_the_cpu_runtime_whatever_backend_is_saved() {
         Some("ort-9.9.9/lib/libonnxruntime.so.9.9.9".to_string()),
     );
     let request = voice_me_core::CheckRequest {
-        backend: voice_me_core::SpeechBackend::for_target(
-            voice_me_core::SpeechExecutionTarget::Cuda,
-        ),
-        selection: voice_me_core::BackendSelection::Piper,
+        selection: voice_me_core::BackendSelection::PIPER_CPU,
         ..voice_me_core::CheckRequest::cpu()
     };
 
@@ -2245,4 +2242,39 @@ fn an_update_to_a_loaded_runtime_is_staged() {
             .all(|row| !row.status.is_missing()),
         "{rows:?}"
     );
+}
+
+/// Matrix row "Piper on CUDA": Install on Piper's CUDA provider row fetches
+/// the core, the provider and the NVIDIA libraries, exactly as for
+/// Chatterbox — and never the model files.
+#[test]
+fn a_piper_cuda_install_fetches_the_cuda_runtime_pieces() {
+    let fixture = all_provider_fixture();
+    let target = voice_me_core::SpeechExecutionTarget::Cuda;
+    let request = voice_me_core::CheckRequest {
+        backend: voice_me_core::SpeechBackend::for_target(target),
+        selection: voice_me_core::BackendSelection::Piper { target },
+        ..voice_me_core::CheckRequest::cpu()
+    };
+
+    let (result, _) = fixture.provision_for(DependencyKind::CudaProvider, request);
+
+    assert_eq!(result, Ok(()));
+    let root = fixture.root();
+    assert_eq!(
+        std::fs::read(assets::bundled_runtime_dylib(root)).unwrap(),
+        CORE_LIB
+    );
+    assert_eq!(
+        std::fs::read(assets::bundled_cuda_provider(root)).unwrap(),
+        CUDA_LIB
+    );
+    assert!(
+        assets::cuda_libraries_dir(root)
+            .join("libcudnn.so.9")
+            .exists()
+    );
+    for path in assets::required_model_files(root, voice_me_core::SpeechWeights::Fp16) {
+        assert!(!path.exists(), "{}", path.display());
+    }
 }

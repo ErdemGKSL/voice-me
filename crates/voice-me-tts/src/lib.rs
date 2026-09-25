@@ -222,31 +222,57 @@ impl TtsAdapter {
         // launch.
         sessions::init_runtime(&self.runtime)?;
 
-        // Story 3.8: on the bundled runtime, the GPU providers come from
-        // voice-me's own build. One that Install put in place after this
-        // process loaded the old library only runs after a restart.
-        let bundled = assets::is_bundled_runtime(self.cache.root(), &self.runtime);
-        let gpu = self.target != ExecutionTarget::Cpu;
-        if replaced_runtime_needs_restart(bundled, gpu, sessions::committed_runtime_replaced()) {
-            return Err(VoiceMeError::SpeechEngine(format!(
-                "ONNX Runtime at {} was replaced since voice-me loaded it; restart voice-me to \
-                 use the new one",
-                self.runtime.display()
-            )));
-        }
-        // …and CUDA's NVIDIA libraries are loaded from the cache before the
-        // provider is registered. A library the user added or configured
-        // finds its own, exactly as before.
-        let preload_failures = match preload_dir(self.cache.root(), &self.runtime, self.target) {
-            Some(dir) => sessions::preload_cuda_libraries(
-                &dir,
-                &assets::installed_cuda_libraries(self.cache.root()),
-            ),
-            None => Vec::new(),
-        };
+        let preload_failures = prepare_target(self.cache.root(), &self.runtime, self.target)?;
         Sessions::build(&self.cache, self.variant, self.target, false)
             .map_err(|error| with_preload_failures(error, &preload_failures))
     }
+}
+
+/// The execution providers another engine's session is built with — Piper's
+/// (spec-backend-engine-and-device-selects) — on `backend`'s target, on the
+/// runtime at `runtime` under the cache `root`, which the caller has
+/// already committed with [`sessions::init_runtime`]. The same providers,
+/// restart rule and NVIDIA preload Chatterbox's sessions get. Returns the
+/// providers and, for CUDA, the NVIDIA libraries that did not load, which
+/// the caller adds to a failed build's error.
+pub fn session_providers(
+    root: &Path,
+    runtime: &Path,
+    backend: SpeechBackend,
+) -> Result<(Vec<ort::ep::ExecutionProviderDispatch>, Vec<String>), VoiceMeError> {
+    let target = execution_target_for(backend);
+    let preload_failures = prepare_target(root, runtime, target)?;
+    Ok((target.providers()?, preload_failures))
+}
+
+/// What a session build on `target` needs first, on the committed runtime
+/// at `runtime` under the cache `root`. Story 3.8: on the bundled runtime
+/// the GPU providers come from voice-me's own build, and one that Install
+/// put in place after this process loaded the old library only runs after
+/// a restart. CUDA's NVIDIA libraries are then loaded from the cache before
+/// the provider is registered; a library the user added or configured finds
+/// its own, exactly as before. Returns the NVIDIA libraries that did not
+/// load.
+fn prepare_target(
+    root: &Path,
+    runtime: &Path,
+    target: ExecutionTarget,
+) -> Result<Vec<String>, VoiceMeError> {
+    let bundled = assets::is_bundled_runtime(root, runtime);
+    let gpu = target != ExecutionTarget::Cpu;
+    if replaced_runtime_needs_restart(bundled, gpu, sessions::committed_runtime_replaced()) {
+        return Err(VoiceMeError::SpeechEngine(format!(
+            "ONNX Runtime at {} was replaced since voice-me loaded it; restart voice-me to use \
+             the new one",
+            runtime.display()
+        )));
+    }
+    Ok(match preload_dir(root, runtime, target) {
+        Some(dir) => {
+            sessions::preload_cuda_libraries(&dir, &assets::installed_cuda_libraries(root))
+        }
+        None => Vec::new(),
+    })
 }
 
 /// Story 3.8: the one restart rule for a runtime Install replaced on disk
@@ -793,6 +819,36 @@ mod tests {
             preload_dir(root, &bundled, ExecutionTarget::WebGpu { device_id: 0 }),
             None
         );
+    }
+
+    /// spec-backend-engine-and-device-selects: Piper's session gets the
+    /// provider its target names, and nothing is preloaded off CUDA.
+    #[test]
+    fn session_providers_follow_the_backend_target() {
+        let _lock = sessions::committed_test_lock();
+        let root = tempfile::tempdir().unwrap();
+        let bundled = assets::bundled_runtime_dylib(root.path());
+        for target in [
+            SpeechExecutionTarget::Cpu,
+            SpeechExecutionTarget::WebGpu,
+            SpeechExecutionTarget::Cuda,
+        ] {
+            let (providers, failures) =
+                session_providers(root.path(), &bundled, SpeechBackend::for_target(target))
+                    .unwrap();
+            assert_eq!(providers.len(), 1, "{target:?}");
+            let provider = &providers[0];
+            let matches = match target {
+                SpeechExecutionTarget::Cpu => provider.downcast_ref::<ort::ep::CPU>().is_some(),
+                SpeechExecutionTarget::Cuda => provider.downcast_ref::<ort::ep::CUDA>().is_some(),
+                SpeechExecutionTarget::WebGpu => {
+                    provider.downcast_ref::<ort::ep::WebGPU>().is_some()
+                }
+            };
+            assert!(matches, "{target:?}: {provider:?}");
+            // No NVIDIA record in an empty cache: nothing to preload.
+            assert!(failures.is_empty(), "{target:?}: {failures:?}");
+        }
     }
 
     #[test]

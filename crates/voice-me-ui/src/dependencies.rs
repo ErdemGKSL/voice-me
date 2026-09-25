@@ -1210,6 +1210,7 @@ mod tests {
             window.render_frame(cx);
             for id in [
                 "backend-select",
+                "backend-device-select",
                 "backend-runtimes",
                 "backend-add-runtime",
                 "backend-api-keys",
@@ -1292,14 +1293,14 @@ mod tests {
     fn install_on_the_piper_voice_row_forwards_the_selected_voice(cx: &mut TestAppContext) {
         let request = CheckRequest {
             backend: voice_me_core::SpeechBackend::CPU,
-            selection: voice_me_core::BackendSelection::Piper,
+            selection: voice_me_core::BackendSelection::PIPER_CPU,
             has_api_key: false,
             has_region: false,
             has_voice: false,
             piper_voice: Some("tr_TR-dfki-medium".to_string()),
         };
         let panel = BackendPanel {
-            selection: voice_me_core::BackendSelection::Piper,
+            selection: voice_me_core::BackendSelection::PIPER_CPU,
             check_request: request.clone(),
             ..BackendPanel::default()
         };
