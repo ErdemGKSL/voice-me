@@ -106,7 +106,7 @@ jobs:
             --use_cuda --cuda_home /usr/local/cuda-12.8 --cudnn_home "$GITHUB_WORKSPACE/cudnn" \
             --use_webgpu --skip_tests --compile_no_warning_as_error --cmake_generator Ninja \
             --cmake_extra_defines "CMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHS" onnxruntime_BUILD_UNIT_TESTS=OFF \
-              onnxruntime_USE_FLASH_ATTENTION=OFF onnxruntime_USE_MEMORY_EFFICIENT_ATTENTION=OFF \
+              onnxruntime_USE_FLASH_ATTENTION=OFF \
               onnxruntime_USE_FPA_INTB_GEMM=OFF onnxruntime_USE_FP8_KV_CACHE=OFF
           df -h /
 
@@ -186,14 +186,14 @@ jobs:
         shell: pwsh
         run: |
           # Three jobs and one nvcc thread each: the runner has 16 GB of memory,
-          # and an unbounded CUDA build runs it out. The LLM-only attention and
+          # and an unbounded CUDA build runs it out. The LLM-only flash attention and
           # mixed-precision GEMM kernels (the heaviest CUDA units) are left out.
           .\build.bat --config Release --build_shared_lib --parallel 3 --nvcc_threads 1 --use_cuda `
             --cuda_home "$env:CUDA_PATH" --cudnn_home "$env:GITHUB_WORKSPACE\cudnn" `
             --use_webgpu --skip_tests --compile_no_warning_as_error `
             --cmake_generator "Visual Studio 17 2022" `
             --cmake_extra_defines "CMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS" onnxruntime_BUILD_UNIT_TESTS=OFF `
-              onnxruntime_USE_FLASH_ATTENTION=OFF onnxruntime_USE_MEMORY_EFFICIENT_ATTENTION=OFF `
+              onnxruntime_USE_FLASH_ATTENTION=OFF `
               onnxruntime_USE_FPA_INTB_GEMM=OFF onnxruntime_USE_FP8_KV_CACHE=OFF
           $code = $LASTEXITCODE
           Get-PSDrive C, D | Format-Table Name, Used, Free
