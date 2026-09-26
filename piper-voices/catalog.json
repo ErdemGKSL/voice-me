@@ -9,8 +9,8 @@
       "quality": "medium",
       "model": {
         "url": "https://github.com/ErdemGKSL/voice-me/releases/download/voice-tr_TR-erdem-medium-dev/model.onnx",
-        "size": 63516051,
-        "sha256": "f1e8968333b44c9840183f720b7d39e19960799f914c374b7c31c8352ad61c32"
+        "size": 63516050,
+        "sha256": "5f877a5cca27f632eeb724b41e5e556e3177f9dcd0237b688c4369aaf61a336f"
       },
       "config": {
         "url": "https://github.com/ErdemGKSL/voice-me/releases/download/voice-tr_TR-erdem-medium-dev/config.json",

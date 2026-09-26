@@ -57,8 +57,8 @@ reassembles the graph, verifies both files, and creates the immutable
 `model.onnx` and `config.json` assets. For a changed model, use a new versioned
 tag and update the catalog URLs and checksums; do not replace v1 assets.
 
-`custom/tr_TR-erdem-medium/` contains an early Erdem medium checkpoint
-(`epoch=89-step=720.ckpt`). Its 63 MB graph fits in Git without splitting.
+`custom/tr_TR-erdem-medium/` contains the Erdem medium model, fine-tuned from
+`tr_TR-fahrettin-medium` (currently exported from `epoch=3809-step=30480.ckpt`). Its 63 MB graph fits in Git without splitting.
 `piper-erdem-medium.yml` publishes it to the replaceable
 `voice-tr_TR-erdem-medium-dev` release. Future checkpoints can replace the
 model and config at the same paths: update `SHA256SUMS` and the catalog's
