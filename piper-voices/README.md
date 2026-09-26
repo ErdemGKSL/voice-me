@@ -46,22 +46,20 @@ the same key in `rhasspy/piper-voices` or the speaches-ai repositories.
 
 ## Erdem voice in this repository
 
-`custom/tr_TR-erdem-high/` contains the Turkish Erdem model exported from the
-`epoch=824-step=6600.ckpt` checkpoint. The 114 MB ONNX graph is stored as
-three xz chunks so each Git object stays below GitHub's file-size limit.
-`config.json` and `SHA256SUMS` are kept alongside the chunks.
-
-On a push to `main` that changes these files, `piper-erdem-voice.yml`
-reassembles the graph, verifies both files, and creates the immutable
-`voice-tr_TR-erdem-high-v1` release. The catalog entry above downloads its
-`model.onnx` and `config.json` assets. For a changed model, use a new versioned
-tag and update the catalog URLs and checksums; do not replace v1 assets.
-
 `custom/tr_TR-erdem-medium/` contains the Erdem medium model, fine-tuned from
-`tr_TR-fahrettin-medium` (currently exported from `epoch=3809-step=30480.ckpt`). Its 63 MB graph fits in Git without splitting.
-`piper-erdem-medium.yml` publishes it to the replaceable
-`voice-tr_TR-erdem-medium-dev` release. Future checkpoints can replace the
-model and config at the same paths: update `SHA256SUMS` and the catalog's
-byte sizes and SHA-256 values in the same commit. The catalog URL stays the
-same. Users who installed an older copy must delete it in voice-me and
-install it again to receive the replacement.
+`tr_TR-fahrettin-medium` (currently exported from `epoch=3809-step=30480.ckpt`).
+Its 63 MB graph fits in Git without splitting. `piper-erdem-medium.yml`
+publishes it to the replaceable `voice-tr_TR-erdem-medium-dev` release. Future
+checkpoints can replace the model and config at the same paths: update
+`SHA256SUMS` and the catalog's byte sizes and SHA-256 values in the same
+commit. The catalog URL stays the same.
+
+## Updates
+
+An installed voice from this catalog follows its entry. voice-me reads this
+catalog at startup, every six hours while it runs, and whenever Settings →
+Piper voices is refreshed; a voice whose `model` or `config` SHA-256 no longer
+matches the installed copy is downloaded again (only the files that changed)
+and used from the next line spoken. No Delete and Download is needed. Until the
+release workflow has uploaded the new assets, the check fails its checksum and
+keeps the old copy; the next check picks the new one up.

@@ -19,23 +19,6 @@
       }
     },
     {
-      "key": "tr_TR-erdem-high",
-      "name": "erdem",
-      "locale": "tr_TR",
-      "language": "Turkish (Turkey)",
-      "quality": "high",
-      "model": {
-        "url": "https://github.com/ErdemGKSL/voice-me/releases/download/voice-tr_TR-erdem-high-v1/model.onnx",
-        "size": 114204024,
-        "sha256": "2f049db2cfa72506b8ce88c71043d6c340d44f4c8776eab84ea484bc58cd9fbd"
-      },
-      "config": {
-        "url": "https://github.com/ErdemGKSL/voice-me/releases/download/voice-tr_TR-erdem-high-v1/config.json",
-        "size": 4877,
-        "sha256": "9f648ed2ffd995c0ec97e92045f640a1f1185d518cfe7329eabf142dd7560629"
-      }
-    },
-    {
       "key": "tr_TR-fahrettin-medium",
       "name": "fahrettin",
       "locale": "tr_TR",
