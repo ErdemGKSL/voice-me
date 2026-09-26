@@ -14,9 +14,12 @@
 //!    `model.onnx` and the Git blob SHA-1 of `config.json`, and both files
 //!    are fetched at that revision.
 //!
-//! The parsers are pure and fixture-tested. Catalogs are fetched only when
-//! the Piper voices tab is opened or refreshed — never at startup — and the
-//! default voice is pinned in code, so a first run needs no catalog.
+//! The parsers are pure and fixture-tested. The three catalogs are fetched
+//! only when the Piper voices tab is opened or refreshed, and the default
+//! voice is pinned in code, so a first run needs no catalog. voice-me's own
+//! catalog alone is also read at startup and every few hours to update the
+//! custom voices it lists ([`outdated_custom_voices`]): their files can be
+//! replaced at the same URL, and an installed copy follows.
 //!
 //! A voice is installed like every other asset: each file to `.part`,
 //! verified, moved into place by rename; `voice.toml` last, so a voice with
@@ -592,7 +595,9 @@ fn resolve_files(
 }
 
 /// Download `voice` into `<root>/piper/<key>/`, reporting on `target`:
-/// each missing file through `.part`, verified, moved into place; then
+/// each file not already exactly the one named (its size and digest)
+/// through `.part`, verified, moved into place — so installing a voice
+/// whose catalog entry changed replaces only what changed; then
 /// `voice.toml`, which is what makes it installed.
 pub fn install_voice(
     root: &Path,
@@ -605,22 +610,25 @@ pub fn install_voice(
     let files = assets::piper_voice_files(root, key)
         .ok_or_else(|| VoiceMeError::Other(format!("{key:?} is not a voice name")))?;
     let (model, config) = resolve_files(voice, sources)?;
+    let model_sha256 = sha256_of(&model.digest);
+    let config_sha256 = sha256_of(&config.digest);
 
     let mut plan = Vec::new();
     for (remote, destination, file_name) in [
         (model, &files.model, assets::PIPER_MODEL_FILE),
         (config, &files.config, assets::PIPER_CONFIG_FILE),
     ] {
-        if destination.exists() {
+        let asset = Asset {
+            relative_path: format!("{}/{key}/{file_name}", assets::PIPER_DIR),
+            url: remote.url,
+            size: remote.size,
+            digest: remote.digest,
+        };
+        if crate::provision::is_verified(&asset, destination) {
             continue;
         }
         plan.push(PlannedDownload {
-            asset: Asset {
-                relative_path: format!("{}/{key}/{file_name}", assets::PIPER_DIR),
-                url: remote.url,
-                size: remote.size,
-                digest: remote.digest,
-            },
+            asset,
             destination: destination.clone(),
         });
     }
@@ -633,7 +641,26 @@ pub fn install_voice(
         quality: voice.entry.quality.clone(),
         source: voice.entry.source.label().to_string(),
         licence: voice.entry.licence.clone(),
+        model_sha256,
+        config_sha256,
     };
+    write_manifest(&files, key, &manifest)
+}
+
+/// The SHA-256 `digest` names, if it is one.
+fn sha256_of(digest: &Digest) -> Option<String> {
+    match digest {
+        Digest::Sha256(hex) => Some(hex.to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
+/// Write `voice.toml` through `.part` and a rename.
+fn write_manifest(
+    files: &assets::PiperVoiceFiles,
+    key: &str,
+    manifest: &PiperVoiceManifest,
+) -> Result<(), VoiceMeError> {
     let part = crate::provision::part_path(&files.manifest);
     let written = manifest
         .to_toml()
@@ -658,6 +685,58 @@ pub fn voice_for_entry(listed: &[CatalogVoice], entry: &PiperCatalogEntry) -> Op
         .find(|voice| voice.entry.key == entry.key && voice.entry.source == entry.source)
         .cloned()
         .or_else(|| (entry.key == PIPER_DEFAULT_VOICE.key).then(default_voice))
+}
+
+// ---- updates ------------------------------------------------------------
+
+/// Fetch voice-me's own catalog alone: what an update checks against.
+pub fn fetch_voice_me_catalog(sources: &PiperSources) -> Result<Vec<CatalogVoice>, String> {
+    crate::block_on(async {
+        let client = crate::provision::client()?;
+        Ok(get_text(&client, &sources.voice_me_catalog)
+            .await
+            .and_then(|json| parse_voice_me_catalog(&json)))
+    })
+    .unwrap_or_else(|error| Err(error.to_string()))
+}
+
+/// The installed voices from voice-me's own catalog whose files are no
+/// longer the ones `listed` names: a custom voice whose model was replaced
+/// at the same URL. Each comes back as the catalog voice to install again.
+///
+/// A `voice.toml` records the SHA-256 of what was installed. One written
+/// before it did is checked by hashing the files once; when they still
+/// match, the digests are recorded so the next check reads them instead.
+pub fn outdated_custom_voices(root: &Path, listed: &[CatalogVoice]) -> Vec<CatalogVoice> {
+    assets::installed_piper_voices(root)
+        .into_iter()
+        .filter(|installed| installed.manifest.source == PiperSource::VoiceMe.label())
+        .filter_map(|installed| {
+            let voice = listed.iter().find(|voice| {
+                voice.entry.key == installed.key && voice.entry.source == PiperSource::VoiceMe
+            })?;
+            let VoiceFiles::Direct { model, config } = &voice.files else {
+                return None;
+            };
+            let (want_model, want_config) = (sha256_of(&model.digest)?, sha256_of(&config.digest)?);
+            let files = assets::piper_voice_files(root, &installed.key)?;
+            let mut manifest = installed.manifest;
+            if manifest.model_sha256.is_none() || manifest.config_sha256.is_none() {
+                let hash = |path: &Path| crate::provision::sha256_file(path).ok();
+                manifest.model_sha256 = hash(&files.model);
+                manifest.config_sha256 = hash(&files.config);
+                let current = manifest.model_sha256.as_deref() == Some(want_model.as_str())
+                    && manifest.config_sha256.as_deref() == Some(want_config.as_str());
+                if current {
+                    // Best effort: failing to record only means hashing again.
+                    let _ = write_manifest(&files, &installed.key, &manifest);
+                }
+            }
+            let current = manifest.model_sha256.as_deref() == Some(want_model.as_str())
+                && manifest.config_sha256.as_deref() == Some(want_config.as_str());
+            (!current).then(|| voice.clone())
+        })
+        .collect()
 }
 
 /// Delete voice `key` from `<root>/piper/`.
@@ -1266,5 +1345,134 @@ mod tests {
             speaches,
             vec!["tr_TR-fahrettin-medium", "tr_TR-fettah-medium"]
         );
+    }
+
+    /// A custom voice as voice-me's own catalog lists it: both files by
+    /// SHA-256, served by `server`.
+    fn custom_voice_served_by(
+        server: &TestServer,
+        key: &str,
+        model: &[u8],
+        config: &[u8],
+    ) -> CatalogVoice {
+        use sha2::Digest as _;
+        let sha = |bytes: &[u8]| -> String {
+            sha2::Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        };
+        let mut voice = voice_served_by(server, key, model, config);
+        voice.entry.source = PiperSource::VoiceMe;
+        if let VoiceFiles::Direct { config: file, .. } = &mut voice.files {
+            file.digest = Digest::Sha256(sha(config));
+        }
+        voice
+    }
+
+    /// A custom model replaced at the same URL: the installed copy is
+    /// outdated, installing again replaces only the changed file and
+    /// records its digest, and then it is current.
+    #[test]
+    fn a_custom_voice_whose_model_changed_is_updated_in_place() {
+        let _env = no_proxy();
+        let key = "tr_TR-erdem-medium";
+        let config = b"{\"audio\":{}}".to_vec();
+        let (old_model, new_model) = (vec![1_u8; 4_000], vec![2_u8; 4_100]);
+        let old_server = TestServer::start(HashMap::from([
+            ("model.onnx".to_string(), old_model.clone()),
+            ("config.json".to_string(), config.clone()),
+        ]));
+        let root = tempfile::tempdir().unwrap();
+        let (tx, _rx) = futures::channel::mpsc::unbounded();
+        let sources = PiperSources::pinned();
+        let old = custom_voice_served_by(&old_server, key, &old_model, &config);
+        install_voice(
+            root.path(),
+            &old,
+            &sources,
+            ProgressTarget::PiperVoice(key.into()),
+            &tx,
+        )
+        .unwrap();
+        assert!(outdated_custom_voices(root.path(), std::slice::from_ref(&old)).is_empty());
+
+        // The same URLs now serve the new model; the config is unchanged.
+        let new_server = TestServer::start(HashMap::from([(
+            "model.onnx".to_string(),
+            new_model.clone(),
+        )]));
+        let mut new = custom_voice_served_by(&new_server, key, &new_model, &config);
+        if let (VoiceFiles::Direct { config: new, .. }, VoiceFiles::Direct { config: old, .. }) =
+            (&mut new.files, &old.files)
+        {
+            new.url = old.url.clone();
+        }
+        let outdated = outdated_custom_voices(root.path(), std::slice::from_ref(&new));
+        assert_eq!(outdated, vec![new.clone()]);
+
+        drop(old_server);
+        install_voice(
+            root.path(),
+            &new,
+            &sources,
+            ProgressTarget::PiperVoice(key.into()),
+            &tx,
+        )
+        .unwrap();
+        let files = assets::piper_voice_files(root.path(), key).unwrap();
+        assert_eq!(std::fs::read(&files.model).unwrap(), new_model);
+        assert!(outdated_custom_voices(root.path(), std::slice::from_ref(&new)).is_empty());
+        let installed = assets::installed_piper_voices(root.path());
+        assert_eq!(
+            installed[0].manifest.model_sha256.as_deref(),
+            sha256_of(match &new.files {
+                VoiceFiles::Direct { model, .. } => &model.digest,
+                VoiceFiles::Speaches { .. } => unreachable!(),
+            })
+            .as_deref()
+        );
+    }
+
+    /// A `voice.toml` from before digests were recorded: a copy that still
+    /// matches is current and gets its digests recorded; a voice from
+    /// another catalog is never updated here.
+    #[test]
+    fn an_older_manifest_is_checked_by_hashing_once_and_other_sources_are_left_alone() {
+        let key = "tr_TR-erdem-medium";
+        let (model, config) = (vec![3_u8; 1_000], b"{}".to_vec());
+        let server = TestServer::start(HashMap::new());
+        let voice = custom_voice_served_by(&server, key, &model, &config);
+        let root = tempfile::tempdir().unwrap();
+        let files = assets::piper_voice_files(root.path(), key).unwrap();
+        std::fs::create_dir_all(&files.dir).unwrap();
+        std::fs::write(&files.model, &model).unwrap();
+        std::fs::write(&files.config, &config).unwrap();
+        std::fs::write(
+            &files.manifest,
+            "name = \"erdem\"\nlocale = \"tr_TR\"\nlabel = \"Turkish (Turkey)\"\n\
+             quality = \"medium\"\nsource = \"voice-me\"\n",
+        )
+        .unwrap();
+
+        assert!(outdated_custom_voices(root.path(), std::slice::from_ref(&voice)).is_empty());
+        let manifest = &assets::installed_piper_voices(root.path())[0].manifest;
+        assert!(manifest.model_sha256.is_some() && manifest.config_sha256.is_some());
+
+        std::fs::write(&files.model, [9_u8; 1_000]).unwrap();
+        std::fs::write(
+            &files.manifest,
+            "name = \"erdem\"\nlocale = \"tr_TR\"\nlabel = \"Turkish (Turkey)\"\n\
+             quality = \"medium\"\nsource = \"voice-me\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            outdated_custom_voices(root.path(), std::slice::from_ref(&voice)).len(),
+            1
+        );
+
+        let mut elsewhere = voice.clone();
+        elsewhere.entry.source = PiperSource::Official;
+        assert!(outdated_custom_voices(root.path(), &[elsewhere]).is_empty());
     }
 }

@@ -342,6 +342,9 @@ const PROBE_OUTPUT_PREFIX: &str = "voice-me-probe-targets:";
 /// How long the helper may take before it is killed.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How often a running voice-me checks its custom Piper voices for updates.
+const CUSTOM_VOICE_UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
 /// Set on a relaunched process: the pid of the instance that relaunched
 /// it, which has to be gone before this one grabs the tray and hotkey.
 const RESTART_WAIT_ENV: &str = "VOICE_ME_RESTART_WAIT_PID";
@@ -4169,6 +4172,51 @@ fn main() {
             }
         });
 
+        // Custom voices — the ones voice-me's own catalog lists — follow
+        // their catalog entry: a model replaced at the same URL is fetched
+        // again, no Delete and Download needed. Checked at startup, every
+        // few hours while voice-me runs, and after each tab refresh. Each
+        // update reports like a download from the tab.
+        let update_custom_voices: Rc<dyn Fn(&mut App)> = Rc::new({
+            let piper_catalog = piper_catalog.clone();
+            let event_tx = event_tx.clone();
+            move |cx: &mut App| {
+                let Some(handle) = cx
+                    .try_global::<tokio_bridge::TokioRuntime>()
+                    .map(|runtime| runtime.handle().clone())
+                else {
+                    return;
+                };
+                let piper_catalog = piper_catalog.clone();
+                let events = event_tx.clone();
+                let work = tokio_bridge::spawn_blocking_on(&handle, move || {
+                    piper_catalog.update_custom_voices(events)
+                });
+                cx.spawn(async move |_| match work.await {
+                    Ok(updated) if !updated.is_empty() => {
+                        eprintln!("updated the Piper voices {}", updated.join(", "));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!("checking the custom Piper voices for updates failed: {error}");
+                    }
+                })
+                .detach();
+            }
+        });
+        cx.spawn({
+            let update_custom_voices = update_custom_voices.clone();
+            async move |cx| {
+                loop {
+                    cx.update(|cx| (*update_custom_voices)(cx));
+                    cx.background_executor()
+                        .timer(CUSTOM_VOICE_UPDATE_INTERVAL)
+                        .await;
+                }
+            }
+        })
+        .detach();
+
         // Story 3.15: everything the Piper voices tab asks for. Catalogs and
         // deletes run on GPUI's background executor; a download runs on the
         // Tokio blocking pool and reports by event.
@@ -4181,6 +4229,7 @@ fn main() {
             let run_check = run_check.clone();
             let push_panel = push_panel.clone();
             let event_tx = event_tx.clone();
+            let update_custom_voices = update_custom_voices.clone();
             move |action: PiperVoicesAction, cx: &mut App| match action {
                 PiperVoicesAction::Refresh => {
                     if *piper_catalog_state.borrow() == PiperCatalogState::Loading {
@@ -4194,10 +4243,14 @@ fn main() {
                     };
                     let piper_catalog_state = piper_catalog_state.clone();
                     let push_panel = push_panel.clone();
+                    let update_custom_voices = update_custom_voices.clone();
                     cx.spawn(async move |cx| {
                         let results = fetch.await;
                         *piper_catalog_state.borrow_mut() = PiperCatalogState::Loaded(results);
-                        cx.update(|cx| (*push_panel)(cx));
+                        cx.update(|cx| {
+                            (*push_panel)(cx);
+                            (*update_custom_voices)(cx);
+                        });
                     })
                     .detach();
                 }

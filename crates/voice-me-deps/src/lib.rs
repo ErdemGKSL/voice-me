@@ -964,6 +964,37 @@ impl PiperCatalogPort for DepsAdapter {
     fn delete(&self, key: &str) -> Result<(), VoiceMeError> {
         piper::delete_voice(&assets::model_cache_root()?, key)
     }
+
+    fn update_custom_voices(&self, events: AppEventSender) -> Result<Vec<String>, VoiceMeError> {
+        let root = assets::model_cache_root()?;
+        let listed =
+            piper::fetch_voice_me_catalog(&self.piper_sources).map_err(VoiceMeError::Other)?;
+        let mut updated = Vec::new();
+        for voice in piper::outdated_custom_voices(&root, &listed) {
+            let key = voice.entry.key.clone();
+            // A voice the tab is downloading right now is being replaced
+            // already.
+            let Some(_claim) = InFlight::claim(&self.piper_in_flight, key.clone()) else {
+                continue;
+            };
+            let result = piper::install_voice(
+                &root,
+                &voice,
+                &self.piper_sources,
+                ProgressTarget::PiperVoice(key.clone()),
+                &events,
+            );
+            drop(_claim);
+            if result.is_ok() {
+                updated.push(key.clone());
+            }
+            let _ = events.unbounded_send(AppEvent::PiperVoiceFinished {
+                key,
+                result: result.map_err(|error| error.to_string()),
+            });
+        }
+        Ok(updated)
+    }
 }
 
 /// Where eSpeak NG is unpacked first, inside the cache root (Story 3.16);

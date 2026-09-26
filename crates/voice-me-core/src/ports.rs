@@ -348,6 +348,13 @@ pub trait PiperCatalogPort: Send + Sync {
 
     /// Delete the installed voice `key` from the cache.
     fn delete(&self, key: &str) -> Result<(), VoiceMeError>;
+
+    /// Bring the installed voices from voice-me's own catalog up to date:
+    /// read that catalog, and install again each one whose files it now
+    /// names differently. Each update reports like [`Self::install`]. The
+    /// keys updated come back; `Err` only when the catalog could not be
+    /// read.
+    fn update_custom_voices(&self, events: AppEventSender) -> Result<Vec<String>, VoiceMeError>;
 }
 
 /// Port for reading/writing persisted settings (implemented inside

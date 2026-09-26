@@ -406,6 +406,14 @@ pub struct PiperVoiceManifest {
     /// Its licence, when the source declares one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub licence: Option<String>,
+    /// The SHA-256 of the `model.onnx` installed, when its source publishes
+    /// one: what an update compares with the catalog. Absent in a
+    /// `voice.toml` written before updates existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_sha256: Option<String>,
+    /// The SHA-256 of the `config.json` installed, likewise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_sha256: Option<String>,
 }
 
 impl PiperVoiceManifest {

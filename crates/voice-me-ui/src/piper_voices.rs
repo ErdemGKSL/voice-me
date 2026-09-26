@@ -630,6 +630,8 @@ mod tests {
                 quality: "medium".to_string(),
                 source: "voice-me".to_string(),
                 licence: Some("CC0-1.0".to_string()),
+                model_sha256: None,
+                config_sha256: None,
             },
             size_bytes: 63_206_316,
         }

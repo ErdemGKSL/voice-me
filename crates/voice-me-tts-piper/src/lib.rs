@@ -16,10 +16,10 @@
 //!    are joined, and the whole is resampled to AD-11's 24 kHz.
 //!
 //! One session is held per selected voice (AD-10) and rebuilt when the voice
-//! changes. The ONNX Runtime library is committed through an injected
-//! closure (AD-1: this crate does not depend on `voice-me-tts`, which owns
-//! the once-per-process guard). It never downloads a runtime or a voice, and
-//! opens no socket (AD-8).
+//! changes, or when its files were replaced by an update. The ONNX Runtime
+//! library is committed through an injected closure (AD-1: this crate does
+//! not depend on `voice-me-tts`, which owns the once-per-process guard). It
+//! never downloads a runtime or a voice, and opens no socket (AD-8).
 
 pub mod config;
 pub mod phonemes;
@@ -250,8 +250,22 @@ pub fn synthesize(
 /// One loaded voice: its session and its config.
 struct LoadedVoice {
     key: String,
+    /// What its files were when loaded: an update that replaced them
+    /// under the same key makes the session stale.
+    stamp: Option<FileStamp>,
     session: Session,
     config: PiperConfig,
+}
+
+/// The size and modification time of a voice's graph and config.
+type FileStamp = [(u64, std::time::SystemTime); 2];
+
+fn file_stamp(files: &assets::PiperVoiceFiles) -> Option<FileStamp> {
+    let stamp = |path: &Path| {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.len(), meta.modified().ok()?))
+    };
+    Some([stamp(&files.model)?, stamp(&files.config)?])
 }
 
 /// The Piper [`TtsPort`] adapter.
@@ -326,7 +340,11 @@ impl PiperTts {
         key: &str,
     ) -> Result<&'a mut LoadedVoice, VoiceMeError> {
         let files = self.voice_files(key)?;
-        if held.as_ref().is_none_or(|loaded| loaded.key != key) {
+        let stamp = file_stamp(&files);
+        if held
+            .as_ref()
+            .is_none_or(|loaded| loaded.key != key || loaded.stamp != stamp)
+        {
             *held = None;
             self.ready.store(false, Ordering::SeqCst);
             (self.runtime_init)()?;
@@ -350,6 +368,7 @@ impl PiperTts {
                 .map_err(|error| with_notes(error, &providers.failure_notes))?;
             *held = Some(LoadedVoice {
                 key: key.to_string(),
+                stamp,
                 session,
                 config,
             });
