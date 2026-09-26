@@ -48,11 +48,12 @@ the same key in `rhasspy/piper-voices` or the speaches-ai repositories.
 
 `custom/tr_TR-erdem/` contains the Erdem voice (medium quality), fine-tuned
 from `tr_TR-fahrettin-medium` (currently exported from `last.ckpt`, epoch
-10000, step 80000). Its 63 MB graph fits in Git without splitting.
-`piper-erdem.yml` publishes it to the replaceable `voice-tr_TR-erdem` release.
-Future checkpoints can replace the model and config at the same paths: update
+10000, step 80000). Its 63 MB graph fits in Git without splitting, so the
+catalog serves both files straight from `main` through
+`raw.githubusercontent.com`; no release is involved. A new checkpoint replaces
+`model.onnx` (and `config.json` if it changed) at the same path: update
 `SHA256SUMS` and the catalog's byte sizes and SHA-256 values in the same
-commit. The catalog URL stays the same.
+commit.
 
 ## Updates
 
@@ -60,6 +61,6 @@ An installed voice from this catalog follows its entry. voice-me reads this
 catalog at startup, every six hours while it runs, and whenever Settings →
 Piper voices is refreshed; a voice whose `model` or `config` SHA-256 no longer
 matches the installed copy is downloaded again (only the files that changed)
-and used from the next line spoken. No Delete and Download is needed. Until the
-release workflow has uploaded the new assets, the check fails its checksum and
+and used from the next line spoken. No Delete and Download is needed. While
+GitHub's cache still serves the previous file, the check fails its checksum and
 keeps the old copy; the next check picks the new one up.

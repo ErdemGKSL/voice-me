@@ -8,12 +8,12 @@
       "language": "Turkish (Turkey)",
       "quality": "medium",
       "model": {
-        "url": "https://github.com/ErdemGKSL/voice-me/releases/download/voice-tr_TR-erdem/model.onnx",
+        "url": "https://raw.githubusercontent.com/ErdemGKSL/voice-me/main/piper-voices/custom/tr_TR-erdem/model.onnx",
         "size": 63516050,
         "sha256": "4174e3048a03911fc3ed3d07b6f9e7d0441686d43552d3bd5f530b3e2f6de167"
       },
       "config": {
-        "url": "https://github.com/ErdemGKSL/voice-me/releases/download/voice-tr_TR-erdem/config.json",
+        "url": "https://raw.githubusercontent.com/ErdemGKSL/voice-me/main/piper-voices/custom/tr_TR-erdem/config.json",
         "size": 4877,
         "sha256": "9f648ed2ffd995c0ec97e92045f640a1f1185d518cfe7329eabf142dd7560629"
       }
