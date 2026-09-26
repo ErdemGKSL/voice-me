@@ -2,18 +2,18 @@
   "version": 1,
   "voices": [
     {
-      "key": "tr_TR-erdem-medium",
+      "key": "tr_TR-erdem",
       "name": "erdem",
       "locale": "tr_TR",
       "language": "Turkish (Turkey)",
       "quality": "medium",
       "model": {
-        "url": "https://github.com/ErdemGKSL/voice-me/releases/download/voice-tr_TR-erdem-medium-dev/model.onnx",
+        "url": "https://github.com/ErdemGKSL/voice-me/releases/download/voice-tr_TR-erdem/model.onnx",
         "size": 63516050,
-        "sha256": "5f877a5cca27f632eeb724b41e5e556e3177f9dcd0237b688c4369aaf61a336f"
+        "sha256": "4174e3048a03911fc3ed3d07b6f9e7d0441686d43552d3bd5f530b3e2f6de167"
       },
       "config": {
-        "url": "https://github.com/ErdemGKSL/voice-me/releases/download/voice-tr_TR-erdem-medium-dev/config.json",
+        "url": "https://github.com/ErdemGKSL/voice-me/releases/download/voice-tr_TR-erdem/config.json",
         "size": 4877,
         "sha256": "9f648ed2ffd995c0ec97e92045f640a1f1185d518cfe7329eabf142dd7560629"
       }

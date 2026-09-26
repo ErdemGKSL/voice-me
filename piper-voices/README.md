@@ -46,11 +46,11 @@ the same key in `rhasspy/piper-voices` or the speaches-ai repositories.
 
 ## Erdem voice in this repository
 
-`custom/tr_TR-erdem-medium/` contains the Erdem medium model, fine-tuned from
-`tr_TR-fahrettin-medium` (currently exported from `epoch=3809-step=30480.ckpt`).
-Its 63 MB graph fits in Git without splitting. `piper-erdem-medium.yml`
-publishes it to the replaceable `voice-tr_TR-erdem-medium-dev` release. Future
-checkpoints can replace the model and config at the same paths: update
+`custom/tr_TR-erdem/` contains the Erdem voice (medium quality), fine-tuned
+from `tr_TR-fahrettin-medium` (currently exported from `last.ckpt`, epoch
+10000, step 80000). Its 63 MB graph fits in Git without splitting.
+`piper-erdem.yml` publishes it to the replaceable `voice-tr_TR-erdem` release.
+Future checkpoints can replace the model and config at the same paths: update
 `SHA256SUMS` and the catalog's byte sizes and SHA-256 values in the same
 commit. The catalog URL stays the same.
 
