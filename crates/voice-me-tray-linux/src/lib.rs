@@ -1,6 +1,6 @@
 use gpui_kit::{App, Global, MenuItem, actions};
 use gpui_tray::{Icon, Tray};
-use voice_me_core::{AppEvent, AppEventSender, TrayPort, VoiceMeError};
+use voice_me_core::{AppEvent, AppEventSender, TrayPort, TrayVisualState, VoiceMeError};
 
 actions!(voice_me_tray_linux, [Settings, Quit]);
 
@@ -31,15 +31,30 @@ impl TrayPort for LinuxTrayAdapter {
         cx.on_action(on_quit);
 
         let tray = Tray::builder()
-            .icon(tray_icon().map_err(|error| VoiceMeError::Other(error.to_string()))?)
+            .icon(
+                tray_icon(&TrayVisualState::Starting)
+                    .map_err(|error| VoiceMeError::Other(error.to_string()))?,
+            )
             .title("voice-me")
-            .tooltip("voice-me")
+            .tooltip(TrayVisualState::Starting.tooltip())
             .menu(build_menu)
             .build(cx)
             .map_err(|error| VoiceMeError::Other(error.to_string()))?;
 
         cx.set_global(TrayHandle(tray));
         Ok(())
+    }
+
+    fn set_visual(&self, cx: &mut App, state: &TrayVisualState) -> Result<(), VoiceMeError> {
+        if !cx.has_global::<TrayHandle>() {
+            return Ok(());
+        }
+        let icon = tray_icon(state).map_err(|error| VoiceMeError::Other(error.to_string()))?;
+        let tray = cx.global::<TrayHandle>().0.clone();
+        tray.set_icon(Some(icon), cx)
+            .map_err(|error| VoiceMeError::Other(error.to_string()))?;
+        tray.set_tooltip(Some(state.tooltip()), cx)
+            .map_err(|error| VoiceMeError::Other(error.to_string()))
     }
 }
 
@@ -61,22 +76,42 @@ fn on_quit(_: &Quit, cx: &mut App) {
     cx.quit();
 }
 
-/// A small solid-circle placeholder icon (no bundled asset needed for this
-/// spike, matching `gpui-tray`'s own example pattern).
-fn tray_icon() -> gpui_tray::Result<Icon> {
-    const SIZE: u32 = 32;
-    let mut rgba = vec![0_u8; (SIZE * SIZE * 4) as usize];
+/// Raster exports of the same five-bar waveform identity. The source SVG
+/// and platform PNG/ICO exports live alongside these RGBA bytes.
+fn tray_icon(state: &TrayVisualState) -> gpui_tray::Result<Icon> {
+    let bytes: &[u8] = match state {
+        TrayVisualState::Starting => include_bytes!("../../../assets/tray/starting.rgba"),
+        TrayVisualState::Ready => include_bytes!("../../../assets/tray/ready.rgba"),
+        TrayVisualState::Generating => include_bytes!("../../../assets/tray/generating.rgba"),
+        TrayVisualState::Playing => include_bytes!("../../../assets/tray/playing.rgba"),
+        TrayVisualState::Attention(_) => include_bytes!("../../../assets/tray/attention.rgba"),
+    };
+    Icon::from_rgba(bytes.to_vec(), 32, 32)
+}
 
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let offset = ((y * SIZE + x) * 4) as usize;
-            let dx = 2 * x as i32 - (SIZE as i32 - 1);
-            let dy = 2 * y as i32 - (SIZE as i32 - 1);
-            if dx * dx + dy * dy <= (2 * 14) * (2 * 14) {
-                rgba[offset..offset + 4].copy_from_slice(&[45, 105, 220, 255]);
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_state_has_a_distinct_shape_and_named_tooltip() {
+        let states = [
+            TrayVisualState::Starting,
+            TrayVisualState::Ready,
+            TrayVisualState::Generating,
+            TrayVisualState::Playing,
+            TrayVisualState::Attention("speech blocked".into()),
+        ];
+        let icons: Vec<_> = states
+            .iter()
+            .map(|state| tray_icon(state).unwrap())
+            .collect();
+        for (index, icon) in icons.iter().enumerate() {
+            assert!(icons.iter().skip(index + 1).all(|other| other != icon));
         }
+        assert_eq!(
+            states[4].tooltip(),
+            "voice-me — attention needed; open Settings"
+        );
     }
-
-    Icon::from_rgba(rgba, SIZE, SIZE)
 }

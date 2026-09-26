@@ -25,7 +25,7 @@
 //! backend**. Story 3.10 moved everything else about the backend — the
 //! `Select`, the runtimes, the keys, the Selected/Active lines — to its own
 //! tab ([`crate::backend::BackendView`]); the capability row links there
-//! with **Open Backend tab**. The view still receives the same
+//! with **Open Speech**. The view still receives the same
 //! [`BackendPanel`] for what "Check again" and Install ask about and for the
 //! capability row's error, and still sends [`BackendAction::UseCpu`] to the
 //! composition root rather than touching `SettingsStore`.
@@ -55,7 +55,7 @@ use voice_me_core::{
 
 use crate::backend::{BackendAction, BackendActions, BackendArea, BackendPanel, error_line};
 
-/// Emitted when the capability row's **Open Backend tab** is clicked; the
+/// Emitted when the capability row's **Open Speech** is clicked; the
 /// Settings shell switches to the Backend tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenBackendTab;
@@ -417,7 +417,7 @@ impl DependenciesView {
                                 .child(
                                     Button::new("backend-open-tab")
                                         .ghost()
-                                        .label("Open Backend tab")
+                                        .label("Open Speech")
                                         .on_click(cx.listener(|_this, _, _window, cx| {
                                             cx.emit(OpenBackendTab)
                                         })),

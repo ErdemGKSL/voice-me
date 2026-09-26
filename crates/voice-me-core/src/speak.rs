@@ -78,7 +78,26 @@ pub fn speak(
     virtual_mic: &dyn VirtualMicPort,
     notifications: &dyn NotificationPort,
 ) -> Result<AudioBuffer, VoiceMeError> {
-    match speak_inner(text, state, tts, virtual_mic, notifications) {
+    speak_with_phase(text, state, tts, virtual_mic, notifications, |_| {})
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeechPhase {
+    Generating,
+    Playing,
+}
+
+/// Run a Speak Action while reporting each actual work phase. `Playing` is
+/// reported only after this line acquires the global playback lock.
+pub fn speak_with_phase(
+    text: &str,
+    state: &AppState,
+    tts: &dyn TtsPort,
+    virtual_mic: &dyn VirtualMicPort,
+    notifications: &dyn NotificationPort,
+    on_phase: impl Fn(SpeechPhase),
+) -> Result<AudioBuffer, VoiceMeError> {
+    match speak_inner(text, state, tts, virtual_mic, notifications, &on_phase) {
         Ok(audio) => Ok(audio),
         Err(error) => {
             // A missing device and a failed generation have different fixes,
@@ -105,6 +124,7 @@ fn speak_inner(
     tts: &dyn TtsPort,
     virtual_mic: &dyn VirtualMicPort,
     notifications: &dyn NotificationPort,
+    on_phase: &dyn Fn(SpeechPhase),
 ) -> Result<AudioBuffer, VoiceMeError> {
     // The overlay already drops a whitespace-only line, so this is a
     // backstop rather than the primary guard — but it is checked here, ahead
@@ -123,7 +143,7 @@ fn speak_inner(
     let backend = state.backend_selection.language_backend();
     let Some(stored) = state.speech_language() else {
         return Err(VoiceMeError::Other(format!(
-            "{} has no speech language yet — choose another backend in Settings → Backend",
+            "{} has no speech language yet — choose another backend in Settings → Speech",
             backend.label()
         )));
     };
@@ -144,8 +164,9 @@ fn speak_inner(
             state.speech_voices.get(backend),
         )
         .map_err(|refusal| VoiceMeError::Other(refusal.to_string()))?;
+        on_phase(SpeechPhase::Generating);
         let audio = tts.generate(text, None, &voice.language, Some(&voice.id))?;
-        return play(virtual_mic, audio);
+        return play(virtual_mic, audio, on_phase);
     }
 
     // Story 3.17: Edge TTS speaks in a stock Microsoft voice through the
@@ -166,8 +187,9 @@ fn speak_inner(
                 RemoteProvider::EdgeTts.label().to_string(),
             ));
         }
+        on_phase(SpeechPhase::Generating);
         let audio = tts.generate(text, None, &voice.language, Some(&voice.id))?;
-        return play(virtual_mic, audio);
+        return play(virtual_mic, audio, on_phase);
     }
 
     // Story 3.14: Azure speaks in a stock Microsoft voice. A voice has to
@@ -192,13 +214,14 @@ fn speak_inner(
                 RemoteProvider::Azure.label().to_string(),
             ));
         }
+        on_phase(SpeechPhase::Generating);
         let audio = tts.generate(text, None, &locale, Some(&voice))?;
-        return play(virtual_mic, audio);
+        return play(virtual_mic, audio, on_phase);
     }
 
     let Some(language) = backend.speech_language(stored) else {
         return Err(VoiceMeError::Other(format!(
-            "{} can't speak the speech language {stored:?} — choose one in Settings → Backend",
+            "{} can't speak the speech language {stored:?} — choose one in Settings → Speech",
             backend.label()
         )));
     };
@@ -228,11 +251,16 @@ fn speak_inner(
         eprintln!("could not show the still-working notification: {delivery}");
     }
 
+    on_phase(SpeechPhase::Generating);
     let audio = tts.generate(text, Some(reference_clip), language.code, None)?;
-    play(virtual_mic, audio)
+    play(virtual_mic, audio, on_phase)
 }
 
-fn play(virtual_mic: &dyn VirtualMicPort, audio: AudioBuffer) -> Result<AudioBuffer, VoiceMeError> {
+fn play(
+    virtual_mic: &dyn VirtualMicPort,
+    audio: AudioBuffer,
+    on_phase: &dyn Fn(SpeechPhase),
+) -> Result<AudioBuffer, VoiceMeError> {
     // The AD-11 buffer crosses straight from one port to the other,
     // unconverted: 24 kHz mono f32 is what the decoder emits and what the
     // adapter declares to the audio server. `play` blocks until the server
@@ -241,6 +269,7 @@ fn play(virtual_mic: &dyn VirtualMicPort, audio: AudioBuffer) -> Result<AudioBuf
     // describes. A poisoned lock means a previous `play` panicked; the next
     // utterance is still better off spoken than refused.
     let _playing = PLAYBACK.lock().unwrap_or_else(|poison| poison.into_inner());
+    on_phase(SpeechPhase::Playing);
     virtual_mic.play(&audio)?;
 
     Ok(audio)
@@ -450,6 +479,35 @@ mod tests {
     }
 
     #[test]
+    fn phases_report_generation_then_playing_under_the_queue_lock() {
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+        let phases = Mutex::new(Vec::new());
+        speak_with_phase(
+            "Merhaba",
+            &state_with_a_sample(),
+            &tts,
+            &mic,
+            &notifier,
+            |phase| {
+                if phase == SpeechPhase::Playing {
+                    assert!(
+                        PLAYBACK.try_lock().is_err(),
+                        "playing starts after the queue lock"
+                    );
+                }
+                phases.lock().unwrap().push(phase);
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *phases.lock().unwrap(),
+            [SpeechPhase::Generating, SpeechPhase::Playing]
+        );
+    }
+
+    #[test]
     fn no_reference_voice_sample_notifies_and_never_touches_the_engine() {
         let tts = FakeTts::default();
         let notifier = FakeNotifier::default();
@@ -572,7 +630,7 @@ mod tests {
             assert!(
                 message.contains(bad)
                     && message.contains("local Chatterbox")
-                    && message.contains("Settings → Backend"),
+                    && message.contains("Settings → Speech"),
                 "the message names the value, the backend and the fix: {message}"
             );
             assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
@@ -1014,7 +1072,7 @@ mod tests {
                     system_voices: Vec::new(),
                     ..system_voice_state("tr", None)
                 },
-                "Settings → Backend",
+                "Settings → Speech",
             ),
         ] {
             let tts = FakeTts::default();

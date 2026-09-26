@@ -1,4 +1,4 @@
-//! Settings → Backend (Story 3.10): which backend speaks for the user, and
+//! Settings → Speech (Story 3.10): which backend speaks for the user, and
 //! that backend's own options.
 //!
 //! The tab is two-step. The user first chooses **Local** or **Remote**, then
@@ -1719,7 +1719,7 @@ impl BackendView {
 fn speech_language_note(panel: &BackendPanel, backend: LanguageBackend) -> String {
     // Nothing listed is not the same as a wrong value.
     if backend == LanguageBackend::SystemVoice && panel.system_voices.is_empty() {
-        return "The System voice has not listed its voices yet. See Settings → Backend."
+        return "The System voice has not listed its voices yet. See Settings → Speech."
             .to_string();
     }
     if backend == LanguageBackend::Piper && panel.piper_voices.is_empty() {
@@ -3177,7 +3177,7 @@ mod tests {
             window.render_frame(cx);
             assert!(window.try_find("backend-speech-language-note").is_some());
             let note = speech_language_note(&view.read(cx).panel, LanguageBackend::SystemVoice);
-            assert!(note.contains("Settings → Backend"), "{note}");
+            assert!(note.contains("Settings → Speech"), "{note}");
             assert!(!note.contains("eSpeak"), "{note}");
             view.update(cx, |view, cx| {
                 view.set_backend_panel(system_voice_panel("tr", None), cx)

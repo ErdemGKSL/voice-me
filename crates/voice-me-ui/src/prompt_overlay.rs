@@ -84,7 +84,7 @@ const SURFACE_INSET_END: f32 = 6.;
 const BLOCKED_HEADLINE: &str = "voice-me can't speak yet";
 
 /// The second line, pointing at the one place the whole gap is explained.
-const BLOCKED_HINT: &str = "Settings → Dependencies has the details.";
+const BLOCKED_HINT: &str = "Settings → System has the details.";
 
 /// What the confirm-first shape says leaves the machine — exactly the
 /// three things the adapter sends, and nothing else.
@@ -92,7 +92,7 @@ pub const DISCLOSURE_ITEMS: [&str; 3] = [
     "the text you type",
     "the language tag of your speech language",
     "your Reference Voice Sample (uploaded once, then kept on their servers until you delete it \
-     in Settings → Backend or record a new sample)",
+     in Settings → Speech or record a new sample)",
 ];
 
 /// The closing line of Edge TTS's disclosure (Story 3.17).
@@ -489,8 +489,8 @@ impl PromptOverlayView {
             // stretched to its height.
             .size_full()
             .max_h(px(PROMPT_BAR_HEIGHT))
-            .px_5()
-            .gap_3()
+            .px_4()
+            .gap_2()
             .bg(cx.theme().popover)
             .text_color(cx.theme().popover_foreground)
             .border_1()
@@ -500,7 +500,7 @@ impl PromptOverlayView {
                 cx.theme().border
             })
             .rounded_full_style(cx)
-            .child(Icon::new(IconName::AudioLines).text_color(cx.theme().muted_foreground))
+            .child(Icon::new(IconName::AudioLines).text_color(cx.theme().primary))
             .child(
                 div().flex_1().min_w_0().child(
                     Input::new(&self.input)
@@ -512,9 +512,11 @@ impl PromptOverlayView {
             // What Enter does here is speak the line; the key is named in
             // the platform's own notation.
             .children(Keystroke::parse("enter").ok().map(|enter| {
-                Kbd::new(enter)
-                    .appearance(false)
+                h_flex()
+                    .gap_1()
                     .text_color(cx.theme().muted_foreground)
+                    .child("Speak")
+                    .child(Kbd::new(enter).appearance(false))
             }))
             .into_any_element()
     }

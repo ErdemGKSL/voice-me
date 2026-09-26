@@ -312,7 +312,7 @@ pub fn capability_row(request: &CheckRequest, probe: &dyn GpuProbe) -> Option<De
                 return Some(cannot_run(
                     selection,
                     &format!(
-                        "{} has no API key — add one in Settings → Backend.",
+                        "{} has no API key — add one in Settings → Speech.",
                         provider.label()
                     ),
                 ));
@@ -335,11 +335,11 @@ pub fn capability_row(request: &CheckRequest, probe: &dyn GpuProbe) -> Option<De
                 // by the check.
                 RemoteProvider::Azure if !request.has_region => Some(cannot_run(
                     selection,
-                    "Azure has no region — add one in Settings → Backend.",
+                    "Azure has no region — add one in Settings → Speech.",
                 )),
                 RemoteProvider::Azure if !request.has_voice => Some(cannot_run(
                     selection,
-                    "Azure has no voice selected — pick one in Settings → Backend.",
+                    "Azure has no voice selected — pick one in Settings → Speech.",
                 )),
                 RemoteProvider::Azure => None,
                 // Story 3.17: on Linux Edge TTS's readiness is the
@@ -1049,7 +1049,7 @@ mod tests {
 
         assert_blocks(
             &row,
-            "DeepInfra has no API key — add one in Settings → Backend",
+            "DeepInfra has no API key — add one in Settings → Speech",
         );
     }
 
@@ -1089,16 +1089,13 @@ mod tests {
     fn azure_blocks_on_key_then_region_then_voice() {
         let probe = good_gpu();
         let row = capability_row(&azure(false, false, false), &probe).unwrap();
-        assert_blocks(
-            &row,
-            "Azure has no API key — add one in Settings → Backend.",
-        );
+        assert_blocks(&row, "Azure has no API key — add one in Settings → Speech.");
         let row = capability_row(&azure(true, false, false), &probe).unwrap();
-        assert_blocks(&row, "Azure has no region — add one in Settings → Backend.");
+        assert_blocks(&row, "Azure has no region — add one in Settings → Speech.");
         let row = capability_row(&azure(true, true, false), &probe).unwrap();
         assert_blocks(
             &row,
-            "Azure has no voice selected — pick one in Settings → Backend.",
+            "Azure has no voice selected — pick one in Settings → Speech.",
         );
         assert_eq!(capability_row(&azure(true, true, true), &probe), None);
         assert_eq!(probe.asked.load(Ordering::SeqCst), 0);

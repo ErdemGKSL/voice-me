@@ -487,7 +487,7 @@ impl std::fmt::Display for StockVoiceRefusal {
         match self {
             StockVoiceRefusal::NoVoices(backend) => write!(
                 f,
-                "{} has no voices listed yet — check Settings → Backend",
+                "{} has no voices listed yet — check Settings → Speech",
                 backend.label()
             ),
             StockVoiceRefusal::Language { backend, language } => write!(
@@ -502,12 +502,12 @@ impl std::fmt::Display for StockVoiceRefusal {
                 voice,
             } => write!(
                 f,
-                "{} has no voice {voice:?} for {language:?} — choose one in Settings → Backend",
+                "{} has no voice {voice:?} for {language:?} — choose one in Settings → Speech",
                 backend.label()
             ),
             StockVoiceRefusal::NoVoice(backend) => write!(
                 f,
-                "{} has no voice selected — pick one in Settings → Backend",
+                "{} has no voice selected — pick one in Settings → Speech",
                 backend.label()
             ),
         }
@@ -1356,6 +1356,8 @@ pub fn format_bytes(bytes: u64) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyReport {
     pub backend: SpeechBackend,
+    /// Exact selection checked; `None` for reports built by older callers.
+    pub selection: Option<BackendSelection>,
     pub dependencies: Vec<Dependency>,
 }
 
@@ -1363,8 +1365,14 @@ impl DependencyReport {
     pub fn new(backend: SpeechBackend, dependencies: Vec<Dependency>) -> Self {
         Self {
             backend,
+            selection: None,
             dependencies,
         }
+    }
+
+    pub fn with_selection(mut self, selection: BackendSelection) -> Self {
+        self.selection = Some(selection);
+        self
     }
 
     /// Whether anything at all is missing — what decides whether Settings →
@@ -1425,7 +1433,7 @@ pub struct AppState {
     pub reference_voice_sample: Option<PathBuf>,
     pub ui_language: String,
     /// The language generated speech is produced in (FR5), per backend
-    /// (Story 3.11). Persisted, and set from Settings → Backend. Read on
+    /// (Story 3.11). Persisted, and set from Settings → Speech. Read on
     /// every Speak Action through [`Self::speech_language`].
     pub speech_languages: SpeechLanguages,
     /// The saved voice of each backend with a voice choice (Story 3.12).

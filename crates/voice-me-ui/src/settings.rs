@@ -1,9 +1,9 @@
-//! The Settings window shell (Story 2.3): a tab bar over the individual
+//! The Settings window shell: a sidebar beside the individual
 //! settings sections.
 //!
 //! Story 2.2 deliberately opened `VoiceSetupView` directly, with no shell
 //! around it. Epics 3 and 4 both add sections, so the shell arrives here
-//! rather than as a later rewrite — this view owns nothing but which tab is
+//! rather than as a later rewrite — this view owns which section is
 //! showing; each section keeps its own state in its own entity.
 
 use std::collections::HashMap;
@@ -11,19 +11,19 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::component::{
-    ActiveTheme as _, Sizable as _, TitleBar,
-    tab::{Tab, TabBar},
-    v_flex,
+    ActiveTheme as _, Icon, Sizable as _, TitleBar,
+    button::{Button, ButtonVariants as _},
+    h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, Styled as _, Subscription, TestSupportExt as _, Window,
-    WindowOptions, div, px, size,
+    App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
+    IntoElement, KeyDownEvent, ParentElement as _, Render, Styled as _, Subscription,
+    TestSupportExt as _, Window, WindowOptions, div, px, size,
 };
 use voice_me_core::{
-    AppEventSender, DependencyKind, DependencyOutcome, DependencyProvisioningPort, HotkeyPort,
-    SettingsStore,
+    AppEventSender, BackendSelection, DependencyKind, DependencyOutcome,
+    DependencyProvisioningPort, HotkeyPort, SettingsStore,
 };
 
 use crate::backend::{BackendActions, BackendPanel, BackendView, OpenPiperVoicesTab};
@@ -81,7 +81,7 @@ pub struct DependenciesTab {
     pub piper: PiperVoicesTab,
 }
 
-/// The tabbed Settings window.
+/// The Settings window with contextual sidebar navigation.
 pub struct SettingsView {
     voice: Entity<VoiceSetupView>,
     hotkey: Entity<HotkeyView>,
@@ -89,6 +89,9 @@ pub struct SettingsView {
     dependencies: Entity<DependenciesView>,
     piper_voices: Entity<PiperVoicesView>,
     active_tab: usize,
+    selection: BackendSelection,
+    speech_recorder_open: bool,
+    focus_handle: FocusHandle,
     /// What the title bar's own close button does (Linux only; Windows and
     /// macOS close through the platform, which runs the window's
     /// should-close handler itself).
@@ -97,13 +100,11 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
-    /// The window options the tab strip's title bar needs: the platform
+    /// The window options the branded title bar needs: the platform
     /// title bar gives way to it, so dragging its background moves the
     /// window and it draws the window controls where the OS expects them.
     ///
-    /// The minimum size keeps all five tabs and the window controls in the
-    /// bar: the tabs do not shrink, so a narrower window would push the
-    /// controls past its right edge.
+    /// The minimum leaves useful width for form controls beside the sidebar.
     pub fn window_options() -> WindowOptions {
         WindowOptions {
             window_min_size: Some(size(px(720.), px(480.))),
@@ -168,6 +169,7 @@ impl SettingsView {
             )
         });
 
+        let selection = dependencies.backend.selection.clone();
         let backend = cx.new(|cx| {
             BackendView::new(
                 dependencies.backend.clone(),
@@ -191,7 +193,7 @@ impl SettingsView {
             )
             .with_provisioning(dependencies.provisioning)
         });
-        // The capability row's "Open Backend tab".
+        // The capability row's "Open Speech".
         let open_backend = cx.subscribe(&dependencies, |this, _, _: &OpenBackendTab, cx| {
             this.active_tab = BACKEND_TAB;
             cx.notify();
@@ -201,13 +203,22 @@ impl SettingsView {
             this.show_piper_voices(cx);
         });
 
+        let focus_handle = cx.focus_handle();
+        window.focus(&focus_handle, cx);
         Self {
             voice,
             hotkey,
             backend,
             dependencies,
             piper_voices,
-            active_tab: VOICE_TAB,
+            active_tab: if selection.is_chatterbox() {
+                VOICE_TAB
+            } else {
+                BACKEND_TAB
+            },
+            selection,
+            speech_recorder_open: false,
+            focus_handle,
             on_close: None,
             _subscriptions: vec![open_backend, open_piper_voices],
         }
@@ -260,10 +271,22 @@ impl SettingsView {
     /// Dependencies tab, which still reads `check_request` and the
     /// capability row's error from it.
     pub fn set_backend_panel(&mut self, panel: BackendPanel, cx: &mut Context<Self>) {
+        let selection = panel.selection.clone();
+        if self.active_tab == VOICE_TAB && !selection.is_chatterbox() {
+            self.active_tab = BACKEND_TAB;
+        }
+        if !selection.is_piper() && self.active_tab == PIPER_VOICES_TAB {
+            self.active_tab = BACKEND_TAB;
+        }
+        if self.selection != selection {
+            self.speech_recorder_open = false;
+        }
+        self.selection = selection;
         self.backend
             .update(cx, |view, cx| view.set_backend_panel(panel.clone(), cx));
         self.dependencies
             .update(cx, |view, cx| view.set_backend_panel(panel, cx));
+        cx.notify();
     }
 
     /// Push a fresh Dependency Check outcome into the Dependencies tab.
@@ -273,67 +296,153 @@ impl SettingsView {
     }
 }
 
+impl Focusable for SettingsView {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let on_close = self.on_close.clone();
+        let cloning_remote = matches!(
+            self.selection,
+            BackendSelection::Remote(provider) if !provider.is_stock_voice()
+        );
+        let nav = |index, label: &'static str, cx: &mut Context<Self>| {
+            let button = Button::new(format!("settings-nav-{index}"))
+                .small()
+                .label(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.active_tab = index;
+                    cx.notify();
+                }));
+            if self.active_tab == index
+                || (index == BACKEND_TAB && self.active_tab == PIPER_VOICES_TAB)
+            {
+                button.outline()
+            } else {
+                button.ghost()
+            }
+        };
         v_flex()
             .size_full()
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if !event.keystroke.modifiers.control {
+                    return;
+                }
+                let tab = match event.keystroke.key.as_str() {
+                    "1" if this.selection.is_chatterbox() => VOICE_TAB,
+                    "2" => BACKEND_TAB,
+                    "3" => HOTKEY_TAB,
+                    "4" => DEPENDENCIES_TAB,
+                    _ => return,
+                };
+                this.active_tab = tab;
+                cx.notify();
+                cx.stop_propagation();
+            }))
             .bg(cx.theme().background)
             .child(
-                // The tab strip is the window's title bar: its empty
-                // background drags the window and it carries the window
-                // controls. `occlude` keeps the tabs themselves out of the
-                // drag area, so pressing one never starts a move (Linux)
-                // or turns into a caption hit (Windows).
                 TitleBar::new()
                     .when_some(on_close, |bar, on_close| {
                         bar.on_close_window(move |_, window, cx| on_close(window, cx))
                     })
                     .child(
                         div()
-                            .id("settings-tabs-strip")
+                            .id("settings-branded-title")
                             .test_support()
-                            .occlude()
+                            // A narrow absolute title stays centered in the
+                            // whole window without covering native controls.
+                            // TitleBar begins its content 12px from the edge.
+                            .absolute()
+                            .left(window.bounds().size.width / 2. - px(122.))
+                            .w(px(220.))
                             .h_full()
-                            // Full height so all of the bar's height is
-                            // occluded, with the tabs centred in it.
                             .flex()
                             .items_center()
+                            .justify_center()
+                            .gap_2()
                             .child(
-                                // Pills paint no background or bottom border
-                                // of their own, so the title bar's are the only
-                                // ones, and they sit centred in its height.
-                                TabBar::new("settings-tabs")
-                                    .pill()
-                                    .small()
-                                    .selected_index(self.active_tab)
-                                    .child(Tab::new().label("Voice"))
-                                    .child(Tab::new().label("Hotkey"))
-                                    .child(Tab::new().label("Backend"))
-                                    .child(Tab::new().label("Dependencies"))
-                                    .child(Tab::new().label("Piper voices"))
-                                    .on_click(cx.listener(|this, index: &usize, _window, cx| {
-                                        if *index == PIPER_VOICES_TAB {
-                                            this.show_piper_voices(cx);
-                                        } else {
-                                            this.active_tab = *index;
-                                            cx.notify();
-                                        }
-                                    })),
-                            ),
+                                div().id("settings-waveform-mark").test_support().child(
+                                    Icon::default()
+                                        .data(include_bytes!(
+                                            "../../../assets/voice-me-waveform.svg"
+                                        ))
+                                        .text_color(cx.theme().primary),
+                                ),
+                            )
+                            .child("Voice Me"),
                     ),
             )
             .child(
-                div()
+                h_flex()
                     .flex_1()
-                    .overflow_hidden()
-                    .map(|el| match self.active_tab {
-                        HOTKEY_TAB => el.child(self.hotkey.clone()),
-                        BACKEND_TAB => el.child(self.backend.clone()),
-                        DEPENDENCIES_TAB => el.child(self.dependencies.clone()),
-                        PIPER_VOICES_TAB => el.child(self.piper_voices.clone()),
-                        _ => el.child(self.voice.clone()),
-                    }),
+                    .min_h_0()
+                    .items_stretch()
+                    .child(
+                        v_flex()
+                            .id("settings-sidebar")
+                            .test_support()
+                            .w(px(168.))
+                            .h_full()
+                            .p_3()
+                            .gap_1()
+                            .bg(cx.theme().sidebar)
+                            .border_r_1()
+                            .border_color(cx.theme().border)
+                            .when(self.selection.is_chatterbox(), |el| {
+                                el.child(nav(VOICE_TAB, "Voice", cx))
+                            })
+                            .child(nav(BACKEND_TAB, "Speech", cx))
+                            .child(nav(HOTKEY_TAB, "Hotkey", cx))
+                            .child(nav(DEPENDENCIES_TAB, "System", cx)),
+                    )
+                    .child(
+                        div()
+                            .id("settings-content")
+                            .test_support()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .overflow_hidden()
+                            .map(|el| match self.active_tab {
+                                HOTKEY_TAB => el.child(self.hotkey.clone()),
+                                BACKEND_TAB if cloning_remote => el.child(
+                                    v_flex()
+                                        .size_full()
+                                        .child(
+                                            h_flex().p_2().bg(cx.theme().background).child(
+                                                Button::new("settings-speech-recorder")
+                                                    .small()
+                                                    .outline()
+                                                    .label(if self.speech_recorder_open {
+                                                        "Back to speech settings"
+                                                    } else {
+                                                        "Record reference sample"
+                                                    })
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.speech_recorder_open =
+                                                            !this.speech_recorder_open;
+                                                        cx.notify();
+                                                    })),
+                                            ),
+                                        )
+                                        .child(div().flex_1().min_h_0().overflow_hidden().child(
+                                            if self.speech_recorder_open {
+                                                self.voice.clone().into_any_element()
+                                            } else {
+                                                self.backend.clone().into_any_element()
+                                            },
+                                        )),
+                                ),
+                                BACKEND_TAB => el.child(self.backend.clone()),
+                                DEPENDENCIES_TAB => el.child(self.dependencies.clone()),
+                                PIPER_VOICES_TAB => el.child(self.piper_voices.clone()),
+                                _ => el.child(self.voice.clone()),
+                            }),
+                    ),
             )
     }
 }
@@ -473,24 +582,45 @@ mod tests {
         }
     }
 
-    /// The tabs sit centred in the title bar's height, not at its top.
     #[gpui_kit::test]
-    fn the_tabs_are_centred_vertically_in_the_title_bar(cx: &mut TestAppContext) {
+    fn the_sidebar_and_branded_title_fit_the_window(cx: &mut TestAppContext) {
         let (handle, _view) =
             open_settings(cx, BackendPanel::default(), DependencyOutcome::Pending);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            let strip = window.find("settings-tabs-strip").bounds();
-            let tab = window.find(VOICE_TAB).bounds();
+            let title = window.find("settings-branded-title").bounds();
             assert!(
-                strip.size.height > tab.size.height,
-                "the strip is the bar's height, taller than a tab: {strip:?} {tab:?}"
+                (title.center().x - window.bounds().center().x).abs() <= px(1.),
+                "title={title:?} window={:?}",
+                window.bounds()
             );
-            let offset = (strip.center().y - tab.center().y).abs();
-            assert!(
-                offset <= px(1.),
-                "the tab is {offset:?} off the strip's centre: {strip:?} {tab:?}"
-            );
+            if let Some(controls) = window.try_find("window-controls").map(|item| item.bounds()) {
+                assert!(title.origin.x + title.size.width <= controls.origin.x);
+            }
+            assert!(window.try_find("settings-waveform-mark").is_some());
+            assert!(window.try_find("settings-sidebar").is_some());
+            assert!(window.find("settings-content").bounds().size.width >= px(480.));
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn sidebar_is_keyboard_usable_at_minimum_width(cx: &mut TestAppContext) {
+        let (handle, _view) =
+            open_settings(cx, BackendPanel::default(), DependencyOutcome::Pending);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(window.bounds().size.width, px(720.));
+            window.activate_window();
+            window.press("tab", cx);
+            assert!(window.focused(cx).is_some());
+            window.press("tab", cx);
+            window.render_frame(cx);
+            assert!(window.focused(cx).is_some());
+            window.press("tab", cx);
+            window.press("ctrl-2", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("backend-surface").is_some());
         })
         .unwrap();
     }
@@ -537,7 +667,7 @@ mod tests {
             assert!(window.try_find("hotkey-change").is_none());
 
             // `TabBar` identifies each tab by its index.
-            window.click(HOTKEY_TAB, cx);
+            window.click("settings-nav-1", cx);
             window.render_frame(cx);
 
             assert!(
@@ -546,11 +676,11 @@ mod tests {
             );
             assert!(window.try_find("voice-setup-record").is_none());
 
-            window.click(VOICE_TAB, cx);
+            window.click("settings-nav-0", cx);
             window.render_frame(cx);
             assert!(window.try_find("voice-setup-record").is_some());
 
-            window.click(BACKEND_TAB, cx);
+            window.click("settings-nav-2", cx);
             window.render_frame(cx);
             assert!(
                 window.try_find("backend-surface").is_some(),
@@ -558,7 +688,7 @@ mod tests {
             );
             assert!(window.try_find("dependencies-surface").is_none());
 
-            window.click(DEPENDENCIES_TAB, cx);
+            window.click("settings-nav-3", cx);
             window.render_frame(cx);
             assert!(
                 window.try_find("dependencies-surface").is_some(),
@@ -566,13 +696,10 @@ mod tests {
             );
             assert!(window.try_find("backend-surface").is_none());
 
-            window.click(PIPER_VOICES_TAB, cx);
-            window.render_frame(cx);
             assert!(
-                window.try_find("piper-voices-surface").is_some(),
-                "the fifth tab must route to the Piper voices section"
+                window.try_find("settings-nav-4").is_none(),
+                "Piper management is contextual"
             );
-            assert!(window.try_find("dependencies-surface").is_none());
         })
         .unwrap();
     }
@@ -617,8 +744,9 @@ mod tests {
 
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            window.click(BACKEND_TAB, cx);
+            window.click("settings-nav-2", cx);
             window.render_frame(cx);
+            assert!(window.try_find("settings-nav-4").is_none());
             assert!(window.try_find("piper-voices-surface").is_none());
 
             window.click("backend-manage-piper-voices", cx);
@@ -634,6 +762,7 @@ mod tests {
                 "Manage voices must open the Piper voices tab"
             );
             assert!(window.try_find("backend-surface").is_none());
+            assert!(window.try_find("settings-nav-4").is_none());
         })
         .unwrap();
     }
@@ -729,7 +858,7 @@ mod tests {
         let hotkey_port: Arc<dyn HotkeyPort> = Arc::new(StubHotkeyPort);
         let (event_tx, _event_rx) = futures::channel::mpsc::unbounded::<AppEvent>();
         let mut slot = None;
-        let handle = cx.open_window(size(px(900.), px(900.)), |window, cx| {
+        let handle = cx.open_window(size(px(720.), px(900.)), |window, cx| {
             let view = cx.new(|cx| {
                 SettingsView::new(
                     settings_store.clone(),
@@ -759,7 +888,77 @@ mod tests {
         (handle, slot.unwrap())
     }
 
-    /// Story 3.10: the capability row's "Open Backend tab" switches the
+    #[gpui_kit::test]
+    fn cloning_remote_opens_speech_with_recorder_access(cx: &mut TestAppContext) {
+        let (handle, view) = open_settings(
+            cx,
+            BackendPanel {
+                selection: BackendSelection::Remote(voice_me_core::RemoteProvider::DeepInfra),
+                ..BackendPanel::default()
+            },
+            DependencyOutcome::Pending,
+        );
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("settings-nav-0").is_none());
+            assert!(window.try_find("backend-surface").is_some());
+            window.click("settings-speech-recorder", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("voice-setup-record").is_some());
+            window.click("settings-nav-3", cx);
+            window.click("settings-nav-2", cx);
+            view.update(cx, |view, cx| {
+                view.set_backend_panel(
+                    BackendPanel {
+                        selection: BackendSelection::Remote(
+                            voice_me_core::RemoteProvider::DeepInfra,
+                        ),
+                        ..BackendPanel::default()
+                    },
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("voice-setup-record").is_some());
+            view.update(cx, |view, cx| {
+                view.set_backend_panel(
+                    BackendPanel {
+                        selection: BackendSelection::PIPER_CPU,
+                        ..BackendPanel::default()
+                    },
+                    cx,
+                );
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("settings-speech-recorder").is_none());
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn switching_away_from_chatterbox_moves_voice_to_speech(cx: &mut TestAppContext) {
+        let (handle, view) = open_settings(cx, BackendPanel::default(), DependencyOutcome::Pending);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("settings-nav-0").is_some());
+            view.update(cx, |view, cx| {
+                view.set_backend_panel(
+                    BackendPanel {
+                        selection: BackendSelection::PIPER_CPU,
+                        ..BackendPanel::default()
+                    },
+                    cx,
+                )
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("settings-nav-0").is_none());
+            assert!(window.try_find("backend-surface").is_some());
+            assert!(window.try_find("settings-nav-4").is_none());
+        })
+        .unwrap();
+    }
+
+    /// Story 3.10: the capability row's "Open Speech" switches the
     /// shell to the Backend tab.
     #[gpui_kit::test]
     fn the_capability_link_switches_to_the_backend_tab(cx: &mut TestAppContext) {
@@ -830,7 +1029,7 @@ mod tests {
             window.render_frame(cx);
             assert!(window.try_find("backend-error-capability").is_some());
 
-            window.click(BACKEND_TAB, cx);
+            window.click("settings-nav-2", cx);
             window.render_frame(cx);
             assert!(
                 window.try_find("api-key-save-deepinfra").is_some(),

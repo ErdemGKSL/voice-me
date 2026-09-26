@@ -1,3 +1,4 @@
+use crate::SpeechPhase;
 use crate::state::{DependencyKind, DependencyReport, SpeechBackend};
 
 /// Events emitted by adapters onto the single shared `AppEvent` channel (AD-3).
@@ -32,6 +33,10 @@ pub enum AppEvent {
         /// The text the user typed, trimmed of surrounding whitespace.
         text: String,
     },
+    /// A background Speak Action crossed a generation or playback boundary.
+    SpeechPhaseChanged { id: u64, phase: SpeechPhase },
+    /// A background Speak Action ended; a failure remains visible in the tray.
+    SpeechFinished { id: u64, error: Option<String> },
     /// Provisioning one dependency row moved forward (Story 3.2).
     ///
     /// Sent by `voice-me-deps` while it downloads, at most about ten times a

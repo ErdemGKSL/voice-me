@@ -78,8 +78,8 @@ use voice_me_core::{
     ActiveBackend, AppEvent, AppState, BackendSelection, CheckRequest, DependencyKind,
     DependencyOutcome, DependencyProvisioningPort, DependencyReport, FileSettingsStore, HotkeyPort,
     LanguageBackend, LocalRuntime, NotificationPort, PiperCatalogPort, RemoteProvider,
-    SettingsStore, SpeechBackend, SpeechExecutionTarget, StockVoice, TtsPort, VirtualMicPort,
-    assets, stock_voices_of, tokio_bridge,
+    SettingsStore, SpeechBackend, SpeechExecutionTarget, SpeechPhase, StockVoice, TrayVisualState,
+    TtsPort, VirtualMicPort, assets, stock_voices_of, tokio_bridge,
 };
 use voice_me_deps::DepsAdapter;
 use voice_me_tts::TtsAdapter;
@@ -803,7 +803,7 @@ fn build_engine(
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         return unavailable(
             "The System voice on this system arrives in a later voice-me release. Choose \
-             another backend under Settings → Backend."
+             another backend under Settings → Speech."
                 .to_string(),
         );
     }
@@ -839,7 +839,7 @@ fn build_engine(
     if let BackendSelection::Remote(provider) = &state.backend_selection {
         return unavailable(format!(
             "{} is selected, and remote generation through it arrives in a later voice-me \
-             release. Choose a local backend under Settings → Backend.",
+             release. Choose a local backend under Settings → Speech.",
             provider.label()
         ));
     }
@@ -911,7 +911,7 @@ fn piper_providers(
 fn build_piper(_state: &AppState) -> Result<Arc<dyn TtsPort>, String> {
     Err(
         "Piper on this system arrives in a later voice-me release. Choose another backend under \
-         Settings → Backend."
+         Settings → Speech."
             .to_string(),
     )
 }
@@ -983,6 +983,100 @@ fn overlay_blocker(outcome: &DependencyOutcome) -> Option<String> {
             Some(format!("The dependency check could not run: {reason}"))
         }
         DependencyOutcome::Ready(report) => report.speech_engine_blocker().map(blocker_notice),
+    }
+}
+
+fn tray_visual(
+    outcome: &DependencyOutcome,
+    work: &HashMap<u64, SpeechPhase>,
+    speech_failure: Option<&str>,
+) -> TrayVisualState {
+    if work.values().any(|phase| *phase == SpeechPhase::Playing) {
+        return TrayVisualState::Playing;
+    }
+    if !work.is_empty() {
+        return TrayVisualState::Generating;
+    }
+    let blocker = overlay_blocker(outcome);
+    if let Some(reason) = speech_failure.or(blocker.as_deref()) {
+        return TrayVisualState::Attention(reason.to_string());
+    }
+    match outcome {
+        DependencyOutcome::Pending => TrayVisualState::Starting,
+        DependencyOutcome::Ready(_) => TrayVisualState::Ready,
+        DependencyOutcome::Failed(reason) => TrayVisualState::Attention(reason.clone()),
+    }
+}
+
+#[derive(Default)]
+struct TrayActivity {
+    work: HashMap<u64, SpeechPhase>,
+    next_id: u64,
+    failure: Option<String>,
+    checking: bool,
+}
+
+impl TrayActivity {
+    fn visual(&self, outcome: &DependencyOutcome) -> TrayVisualState {
+        let visual = tray_visual(outcome, &self.work, self.failure.as_deref());
+        if self.checking && visual == TrayVisualState::Ready {
+            TrayVisualState::Starting
+        } else {
+            visual
+        }
+    }
+
+    fn start_speech(&mut self) -> u64 {
+        self.failure = None;
+        self.next_id += 1;
+        self.work.insert(self.next_id, SpeechPhase::Generating);
+        self.next_id
+    }
+
+    fn phase(&mut self, id: u64, phase: SpeechPhase) {
+        if let Some(active) = self.work.get_mut(&id) {
+            *active = phase;
+        }
+    }
+
+    fn finish(&mut self, id: u64, error: Option<String>) {
+        self.work.remove(&id);
+        if let Some(error) = error {
+            self.failure = Some(error);
+        }
+    }
+
+    fn readiness_report(
+        &mut self,
+        report: &DependencyReport,
+        selected: &BackendSelection,
+        engine_error: Option<String>,
+    ) -> bool {
+        let current = report.selection.as_ref().map_or_else(
+            || report.backend == resolve_backend(selected),
+            |selection| selection == selected,
+        );
+        if !current {
+            return false;
+        }
+        self.checking = false;
+        self.failure = engine_error;
+        true
+    }
+
+    fn failed(&mut self, reason: String) {
+        self.checking = false;
+        self.failure = Some(reason);
+    }
+}
+
+fn update_tray(cx: &mut App, state: &TrayVisualState) {
+    #[cfg(target_os = "linux")]
+    let result = LinuxTrayAdapter.set_visual(cx, state);
+    #[cfg(target_os = "windows")]
+    let result = WindowsTrayAdapter.set_visual(cx, state);
+    if let Err(error) = result {
+        eprintln!("could not update tray: {error}");
     }
 }
 
@@ -1425,6 +1519,85 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn tray_tracks_overlapping_work_and_retains_attention() {
+        let ready = DependencyOutcome::Ready(DependencyReport::new(SpeechBackend::CPU, vec![]));
+        let mut work = HashMap::new();
+        assert_eq!(
+            tray_visual(&DependencyOutcome::Pending, &work, None),
+            TrayVisualState::Starting
+        );
+        assert_eq!(tray_visual(&ready, &work, None), TrayVisualState::Ready);
+        work.insert(1, SpeechPhase::Generating);
+        work.insert(2, SpeechPhase::Generating);
+        assert_eq!(
+            tray_visual(&ready, &work, None),
+            TrayVisualState::Generating
+        );
+        work.insert(1, SpeechPhase::Playing);
+        assert_eq!(tray_visual(&ready, &work, None), TrayVisualState::Playing);
+        work.remove(&1);
+        assert_eq!(
+            tray_visual(&ready, &work, None),
+            TrayVisualState::Generating
+        );
+        work.remove(&2);
+        assert!(matches!(
+            tray_visual(&ready, &work, Some("playback failed")),
+            TrayVisualState::Attention(_)
+        ));
+        assert_eq!(tray_visual(&ready, &work, None), TrayVisualState::Ready);
+        assert!(matches!(
+            tray_visual(
+                &DependencyOutcome::Failed("check failed".into()),
+                &work,
+                None
+            ),
+            TrayVisualState::Attention(_)
+        ));
+    }
+
+    #[test]
+    fn tray_activity_preserves_work_across_checks_and_completions() {
+        let report = DependencyReport::new(SpeechBackend::CPU, vec![])
+            .with_selection(BackendSelection::BUNDLED_CPU);
+        let ready = DependencyOutcome::Ready(report.clone());
+        let pending = DependencyOutcome::Pending;
+        let mut activity = TrayActivity::default();
+        assert_eq!(activity.visual(&pending), TrayVisualState::Starting);
+        activity.checking = true;
+        assert_eq!(activity.visual(&ready), TrayVisualState::Starting);
+        let blocked = DependencyOutcome::Failed("current blocker".into());
+        assert!(matches!(
+            activity.visual(&blocked),
+            TrayVisualState::Attention(_)
+        ));
+        let first = activity.start_speech();
+        let second = activity.start_speech();
+        activity.phase(first, SpeechPhase::Playing);
+        assert_eq!(activity.visual(&pending), TrayVisualState::Playing);
+        assert!(!activity.readiness_report(&report, &BackendSelection::PIPER_CPU, None));
+        activity.finish(first, None);
+        assert_eq!(activity.visual(&pending), TrayVisualState::Generating);
+        activity.failed("session failed".into());
+        assert_eq!(activity.visual(&pending), TrayVisualState::Generating);
+        activity.finish(second, None);
+        assert!(matches!(
+            activity.visual(&pending),
+            TrayVisualState::Attention(_)
+        ));
+        assert!(activity.readiness_report(&report, &BackendSelection::BUNDLED_CPU, None));
+        assert_eq!(activity.visual(&ready), TrayVisualState::Ready);
+        let third = activity.start_speech();
+        activity.finish(third, Some("playback failed".into()));
+        assert!(matches!(
+            activity.visual(&ready),
+            TrayVisualState::Attention(_)
+        ));
+        activity.start_speech();
+        assert_eq!(activity.visual(&ready), TrayVisualState::Generating);
+    }
 
     /// The Hotkey tab's note follows the backend that actually bound
     /// (spec-native-gnome-kde-hotkey, review pass 1).
@@ -3414,6 +3587,7 @@ fn main() {
         // readers — the Dependencies tab and the hotkey gate — read it.
         let dependency_outcome: Rc<RefCell<DependencyOutcome>> =
             Rc::new(RefCell::new(DependencyOutcome::Pending));
+        let tray_activity = Rc::new(RefCell::new(TrayActivity::default()));
 
         // Decision 2: Settings opens itself at most once per launch, and
         // only for what the *startup* check found. Deliberately not
@@ -3824,6 +3998,7 @@ fn main() {
             let deps_port = deps_port.clone();
             let event_tx = event_tx.clone();
             let dependency_outcome = dependency_outcome.clone();
+            let tray_activity = tray_activity.clone();
             let settings_view_slot = settings_view_slot.clone();
             let provisioning = provisioning.clone();
             let refresh_system_voices = refresh_system_voices.clone();
@@ -3840,18 +4015,39 @@ fn main() {
                     &[],
                     &[],
                 ));
+                let checked_selection = request.selection.clone();
+                tray_activity.borrow_mut().checking = true;
+                update_tray(
+                    cx,
+                    &tray_activity.borrow().visual(&dependency_outcome.borrow()),
+                );
+                if let Some(view) = settings_view_slot.borrow().clone() {
+                    view.update(cx, |view, cx| {
+                        view.set_dependency_outcome(DependencyOutcome::Pending, cx)
+                    });
+                }
                 let events = event_tx.clone();
                 let deps_port = deps_port.clone();
                 let check = cx.background_spawn(async move { deps_port.check(request, events) });
                 let dependency_outcome = dependency_outcome.clone();
+                let tray_activity = tray_activity.clone();
+                let settings_store = settings_store.clone();
                 let settings_view_slot = settings_view_slot.clone();
                 let provisioning = provisioning.clone();
                 cx.spawn(async move |cx| {
                     let Err(error) = check.await else { return };
+                    if settings_store
+                        .load()
+                        .is_ok_and(|state| state.backend_selection != checked_selection)
+                    {
+                        return;
+                    }
                     eprintln!("the dependency check could not run: {error}");
                     let outcome = DependencyOutcome::Failed(error.to_string());
+                    tray_activity.borrow_mut().checking = false;
                     *dependency_outcome.borrow_mut() = outcome.clone();
                     cx.update(|cx| {
+                        update_tray(cx, &tray_activity.borrow().visual(&outcome));
                         if let Some(view) = settings_view_slot.borrow().clone() {
                             // No report is coming to replace the view's
                             // map, so a row left "installing" after an `Ok`
@@ -4400,6 +4596,7 @@ fn main() {
                 // A modest centred window: with no bounds of its own it
                 // opened at the platform default, which filled the screen.
                 let options = WindowOptions {
+                    app_id: Some("voice-me".into()),
                     window_bounds: Some(WindowBounds::centered(
                         size(px(SETTINGS_WIDTH), px(SETTINGS_HEIGHT)),
                         cx,
@@ -4550,6 +4747,7 @@ fn main() {
                 #[cfg(target_os = "linux")]
                 let top_margin = overlay_top_margin(&window_bounds, cx);
                 let options_with = |kind: WindowKind| WindowOptions {
+                    app_id: Some("voice-me".into()),
                     titlebar: None,
                     // Client-side decorations are what make a borderless
                     // window possible at all on Linux.
@@ -4707,10 +4905,13 @@ fn main() {
                 &[],
                 &[],
             ));
+            let checked_selection = request.selection.clone();
             let events = event_tx.clone();
             let deps_port = deps_port.clone();
             let check = cx.background_spawn(async move { deps_port.check(request, events) });
             let dependency_outcome = dependency_outcome.clone();
+            let tray_activity = tray_activity.clone();
+            let settings_store = settings_store.clone();
             let settings_view_slot = settings_view_slot.clone();
             let open_dependencies = open_dependencies.clone();
             let dependencies_auto_opened = dependencies_auto_opened.clone();
@@ -4718,10 +4919,18 @@ fn main() {
                 // Only the failure needs handling here: a check that *ran*
                 // reports itself by event, below.
                 let Err(error) = check.await else { return };
+                if settings_store
+                    .load()
+                    .is_ok_and(|state| state.backend_selection != checked_selection)
+                {
+                    return;
+                }
                 eprintln!("the dependency check could not run: {error}");
                 let outcome = DependencyOutcome::Failed(error.to_string());
+                tray_activity.borrow_mut().checking = false;
                 *dependency_outcome.borrow_mut() = outcome.clone();
                 cx.update(|cx| {
+                    update_tray(cx, &tray_activity.borrow().visual(&outcome));
                     if let Some(view) = settings_view_slot.borrow().clone() {
                         view.update(cx, |view, cx| view.set_dependency_outcome(outcome, cx));
                     }
@@ -4740,6 +4949,16 @@ fn main() {
         cx.spawn(async move |cx| {
             while let Some(event) = event_rx.next().await {
                 match event {
+                    AppEvent::SpeechPhaseChanged { id, phase } => {
+                        tray_activity.borrow_mut().phase(id, phase);
+                        let visual = tray_activity.borrow().visual(&dependency_outcome.borrow());
+                        cx.update(|cx| update_tray(cx, &visual));
+                    }
+                    AppEvent::SpeechFinished { id, error } => {
+                        tray_activity.borrow_mut().finish(id, error);
+                        let visual = tray_activity.borrow().visual(&dependency_outcome.borrow());
+                        cx.update(|cx| update_tray(cx, &visual));
+                    }
                     AppEvent::SettingsRequested => {
                         cx.update(|cx| (*open_settings)(cx));
                     }
@@ -4778,32 +4997,36 @@ fn main() {
                         });
                     }
                     AppEvent::DependencyCheckCompleted { report } => {
+                        let selected = current_state(
+                            &settings_store,
+                            &DependencyOutcome::Pending,
+                            &[],
+                            &[],
+                            &[],
+                        )
+                        .backend_selection;
+                        if !tray_activity.borrow_mut().readiness_report(
+                            &report,
+                            &selected,
+                            engine.borrow().unavailable.clone(),
+                        ) {
+                            continue;
+                        }
                         let anything_missing = report.has_missing();
                         let runnable = report.speech_engine_blocker().is_none();
-                        // A late report about the previous selection must
-                        // not start a warm-up for the current one.
-                        let for_current_selection = report.backend
-                            == resolve_backend(
-                                &current_state(
-                                    &settings_store,
-                                    &DependencyOutcome::Pending,
-                                    &[],
-                                    &[],
-                                    &[],
-                                )
-                                .backend_selection,
-                            );
                         // A row the check now calls ready has nothing left
                         // to install; whatever was held against it goes.
                         retain_missing_rows(&mut provisioning.borrow_mut(), &report);
                         let rows = provisioning.borrow().clone();
                         let outcome = DependencyOutcome::Ready(report);
                         *dependency_outcome.borrow_mut() = outcome.clone();
+                        let visual = tray_activity.borrow().visual(&outcome);
 
                         let settings_view_slot = settings_view_slot.clone();
                         let open_dependencies = open_dependencies.clone();
                         let dependencies_auto_opened = dependencies_auto_opened.clone();
                         cx.update(|cx| {
+                            update_tray(cx, &visual);
                             // An open Settings window re-renders its rows
                             // from the new report, so "Check again" lands
                             // without the user leaving the window.
@@ -4842,7 +5065,7 @@ fn main() {
                                 .is_ok_and(|state| state.backend_selection.is_piper());
                             if should_warm_up(
                                 runnable,
-                                for_current_selection,
+                                true,
                                 has_active_sample,
                                 needs_no_sample,
                                 warmed_up.get(),
@@ -4979,16 +5202,39 @@ fn main() {
                         // engine actually built, or its own error.
                         *active_backend.borrow_mut() = match result {
                             Ok(backend) => ActiveBackend::Acquired(backend),
-                            Err(reason) => ActiveBackend::Failed(reason),
+                            Err(reason) => {
+                                tray_activity.borrow_mut().failed(reason.clone());
+                                ActiveBackend::Failed(reason)
+                            }
                         };
-                        cx.update(|cx| (*push_panel)(cx));
+                        let visual = tray_activity.borrow().visual(&dependency_outcome.borrow());
+                        cx.update(|cx| {
+                            update_tray(cx, &visual);
+                            (*push_panel)(cx);
+                        });
                     }
                     AppEvent::SpeakRequested { text } => {
+                        let speech_id = tray_activity.borrow_mut().start_speech();
+                        let visual = tray_activity.borrow().visual(&dependency_outcome.borrow());
+                        cx.update(|cx| update_tray(cx, &visual));
                         let settings_store = settings_store.clone();
                         let notifications = notification_port.clone();
                         let virtual_mic = virtual_mic_port.clone();
                         let current_engine = engine.borrow().port.clone();
                         let Some(tts) = current_engine else {
+                            tray_activity.borrow_mut().finish(
+                                speech_id,
+                                Some(
+                                    engine
+                                        .borrow()
+                                        .unavailable
+                                        .clone()
+                                        .unwrap_or_else(|| "Speech engine unavailable".into()),
+                                ),
+                            );
+                            let visual =
+                                tray_activity.borrow().visual(&dependency_outcome.borrow());
+                            cx.update(|cx| update_tray(cx, &visual));
                             // The engine never came up at startup. Say so
                             // rather than dropping the line silently — this
                             // is the same contract `speak` honours for every
@@ -5010,6 +5256,8 @@ fn main() {
                             });
                             continue;
                         };
+                        let phase_events = event_tx.clone();
+                        let finished_events = event_tx.clone();
                         cx.update(|cx| {
                             let state = current_state(
                                 &settings_store,
@@ -5022,12 +5270,20 @@ fn main() {
                                 // Generation *and* playback, on the blocking
                                 // pool: `play` blocks until the audio server
                                 // has drained the buffer (AD-5).
-                                let audio = voice_me_core::speak(
+                                let audio = voice_me_core::speak_with_phase(
                                     &text,
                                     &state,
                                     tts.as_ref(),
                                     virtual_mic.as_ref(),
                                     notifications.as_ref(),
+                                    |phase| {
+                                        let _ = phase_events.unbounded_send(
+                                            AppEvent::SpeechPhaseChanged {
+                                                id: speech_id,
+                                                phase,
+                                            },
+                                        );
+                                    },
                                 )?;
                                 // A working run is otherwise indistinguishable
                                 // from a broken one: nothing is written, and
@@ -5048,7 +5304,13 @@ fn main() {
                             // the user about any failure; this only logs.
                             let push_panel = push_panel.clone();
                             cx.spawn(async move |cx| {
-                                if let Err(error) = work.await {
+                                let result = work.await;
+                                let error = result.as_ref().err().map(ToString::to_string);
+                                let _ = finished_events.unbounded_send(AppEvent::SpeechFinished {
+                                    id: speech_id,
+                                    error,
+                                });
+                                if let Err(error) = result {
                                     eprintln!("speak failed: {error}");
                                 }
                                 // A remote line can have uploaded (or

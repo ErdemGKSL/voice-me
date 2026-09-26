@@ -812,7 +812,8 @@ impl DependencyProvisioningPort for DepsAdapter {
                 .chain(engine_rows)
                 .chain(virtual_microphone_row(&root))
                 .collect(),
-        );
+        )
+        .with_selection(request.selection.clone());
 
         // A closed receiver means the app is shutting down; there is
         // nowhere to report that to, and nothing this adapter could do
@@ -2474,7 +2475,7 @@ mod tests {
     }
 
     #[test]
-    fn the_report_carries_the_backend_it_was_computed_for() {
+    fn the_report_carries_the_exact_selection_it_was_computed_for() {
         let dir = provisioned(SpeechWeights::Q4);
         let _env = EnvGuard::new()
             .unset(assets::RUNTIME_DYLIB_ENV)
@@ -2489,6 +2490,7 @@ mod tests {
             panic!("the check sends exactly one kind of event");
         };
         assert_eq!(report.backend, SpeechBackend::CPU);
+        assert_eq!(report.selection, Some(BackendSelection::BUNDLED_CPU));
         assert!(
             report
                 .dependencies

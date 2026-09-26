@@ -8660,6 +8660,7 @@ dependencies = [
 name = "voice-me-app"
 version = "0.1.0"
 dependencies = [
+ "embed-resource",
  "futures",
  "gpui-kit",
  "raw-window-handle",

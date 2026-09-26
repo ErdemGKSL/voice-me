@@ -807,7 +807,7 @@ pub fn piper_voice_row(
                 } else {
                     row.manual([
                         "Download it again in Settings → Piper voices, or pick an installed \
-                         voice in Settings → Backend.",
+                         voice in Settings → Speech.",
                         "Press Check again.",
                     ])
                 }
@@ -819,7 +819,7 @@ pub fn piper_voice_row(
             "No installed Piper voice speaks the selected language.",
         )
         .manual([
-            "Choose another language or voice in Settings → Backend, or download one in \
+            "Choose another language or voice in Settings → Speech, or download one in \
              Settings → Piper voices.",
             "Press Check again.",
         ]),

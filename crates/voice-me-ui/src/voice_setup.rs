@@ -615,7 +615,7 @@ impl Render for VoiceSetupView {
                 div()
                     .text_color(cx.theme().muted_foreground)
                     .child(if is_first_run {
-                        "Record a short clip of your voice (5-60 seconds) to use as your Reference Voice Sample — you'll need one before you can use voice-me."
+                        "Record a short clip of your voice (5-60 seconds) as a Reference Voice Sample. Cloning speech engines use it to speak in your voice."
                     } else {
                         "Record a short clip of your voice (5-60 seconds) to use as your Reference Voice Sample."
                     }),

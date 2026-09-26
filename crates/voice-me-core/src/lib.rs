@@ -16,13 +16,13 @@ pub use error::VoiceMeError;
 pub use event::AppEvent;
 pub use ports::{
     CatalogResult, CheckRequest, DependencyProvisioningPort, HotkeyPort, NotificationPort,
-    PiperCatalogEntry, PiperCatalogPort, PiperSource, SettingsStore, TrayPort, TtsPort,
-    VirtualMicPort,
+    PiperCatalogEntry, PiperCatalogPort, PiperSource, SettingsStore, TrayPort, TrayVisualState,
+    TtsPort, VirtualMicPort,
 };
 pub use settings_store::FileSettingsStore;
 pub use speak::{
     GENERATION_FAILED_SUMMARY, PLAYBACK_FAILED_SUMMARY, STILL_WORKING_BODY, STILL_WORKING_SUMMARY,
-    speak,
+    SpeechPhase, speak, speak_with_phase,
 };
 pub use state::{
     AZURE_REGION_INVALID, ActiveBackend, ApiKeys, AppState, BackendSelection, DEFAULT_AZURE_LOCALE,

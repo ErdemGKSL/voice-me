@@ -97,6 +97,27 @@ pub trait VirtualMicPort: Send + Sync {
 }
 
 /// Driven adapter port: manages the OS system tray presence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrayVisualState {
+    Starting,
+    Ready,
+    Generating,
+    Playing,
+    Attention(String),
+}
+
+impl TrayVisualState {
+    pub fn tooltip(&self) -> String {
+        match self {
+            Self::Starting => "voice-me — starting speech engine".into(),
+            Self::Ready => "voice-me — ready to speak".into(),
+            Self::Generating => "voice-me — generating speech".into(),
+            Self::Playing => "voice-me — playing speech".into(),
+            Self::Attention(_) => "voice-me — attention needed; open Settings".into(),
+        }
+    }
+}
+
 pub trait TrayPort {
     /// Show the application's tray icon and menu.
     ///
@@ -112,6 +133,13 @@ pub trait TrayPort {
     /// the composition root, without depending on `voice-me-ui` or calling
     /// window APIs themselves.
     fn show(&self, cx: &mut gpui_kit::App, events: AppEventSender) -> Result<(), VoiceMeError>;
+
+    /// Change the native icon and tooltip on GPUI's main thread.
+    fn set_visual(
+        &self,
+        cx: &mut gpui_kit::App,
+        state: &TrayVisualState,
+    ) -> Result<(), VoiceMeError>;
 }
 
 /// Driven adapter port: generates speech with Chatterbox-Multilingual,
