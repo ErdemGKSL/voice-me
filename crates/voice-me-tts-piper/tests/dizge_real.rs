@@ -15,12 +15,12 @@ use std::time::Instant;
 use voice_me_core::{SAMPLE_RATE, TtsPort as _, VoiceMeError, assets};
 use voice_me_tts_piper::{DizgeG2p, Phonemizer, PiperTts, RuntimeInit, TurkishG2pPhonemizer};
 
-/// Never asked: every line here is Turkish.
+/// Never asked: every line here goes through the model.
 struct NoOther;
 
 impl Phonemizer for NoOther {
     fn phonemize(&self, voice: &str, _: &str) -> Result<String, String> {
-        Err(format!("{voice} is not Turkish"))
+        Err(format!("{voice} is not read by eSpeak NG here"))
     }
 }
 
@@ -60,10 +60,7 @@ fn turkish_text_is_phonemized_by_the_model() {
 
     let started = Instant::now();
     let ipa = phonemizer
-        .phonemize(
-            "tr",
-            "Merhaba Erdem, güneş ve çikolata 12 kahvaltı olduğunu",
-        )
+        .phonemize_dizge("Merhaba Erdem, güneş ve çikolata 12 kahvaltı olduğunu")
         .unwrap();
     eprintln!("{ipa} ({:?})", started.elapsed());
     let words: Vec<&str> = ipa.split(' ').collect();
@@ -77,7 +74,7 @@ fn turkish_text_is_phonemized_by_the_model() {
 
     let started = Instant::now();
     phonemizer
-        .phonemize("tr", "Bu yerel ve anında çalışan bir ses.")
+        .phonemize_dizge("Bu yerel ve anında çalışan bir ses.")
         .unwrap();
     assert!(
         started.elapsed().as_millis() < 500,

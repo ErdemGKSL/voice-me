@@ -9,8 +9,8 @@
 //!    ([`phonemes::split_clauses`]);
 //! 2. each clause is phonemized by `espeak-ng --ipa` (through
 //!    `voice-me-espeak` on Linux and Windows — the [`Phonemizer`] here) —
-//!    or, for a Turkish voice, by the DizgeBERT G2P model
-//!    ([`TurkishG2pPhonemizer`]) — its mark put back, and the result
+//!    or, for a voice whose `phoneme_type` is `"dizge"`, by the DizgeBERT
+//!    G2P model ([`TurkishG2pPhonemizer`]) — its mark put back, and the result
 //!    decomposed to NFD ([`phonemes::sentence_phonemes`]);
 //! 3. each sentence becomes ids ([`phonemes::to_ids`]) and one run of the
 //!    graph;
@@ -40,7 +40,7 @@ use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use rubato::{Fft, FixedSync, Resampler};
 use voice_me_core::{AudioBuffer, SAMPLE_RATE, TtsPort, VoiceMeError, assets};
 
-pub use config::PiperConfig;
+pub use config::{PhonemeSource, PiperConfig};
 pub use dizge::{DizgeG2p, TurkishG2pPhonemizer};
 
 /// The engine's name, as every failure names it.
@@ -56,6 +56,13 @@ const RESAMPLE_CHUNK: usize = 1024;
 /// what the program printed — or why not, in words.
 pub trait Phonemizer: Send + Sync {
     fn phonemize(&self, espeak_voice: &str, clause: &str) -> Result<String, String>;
+
+    /// One Turkish clause's phonemes from the Turkish G2P model — what a
+    /// voice whose `phoneme_type` is `"dizge"` is read through. A
+    /// phonemizer without the model says so.
+    fn phonemize_dizge(&self, _clause: &str) -> Result<String, String> {
+        Err("the Turkish G2P model is not available".to_string())
+    }
 }
 
 /// The real phonemizer: the `espeak-ng` program, through `voice-me-espeak`.
@@ -227,9 +234,11 @@ pub fn synthesize(
     let clauses = phonemes::split_clauses(text);
     let mut ipa = Vec::with_capacity(clauses.len());
     for clause in &clauses {
-        let printed = phonemizer
-            .phonemize(&config.espeak.voice, &clause.text)
-            .map_err(|reason| failure(format!("could not phonemize the text: {reason}")))?;
+        let printed = match config.phoneme_source() {
+            PhonemeSource::Espeak => phonemizer.phonemize(&config.espeak.voice, &clause.text),
+            PhonemeSource::Dizge => phonemizer.phonemize_dizge(&clause.text),
+        }
+        .map_err(|reason| failure(format!("could not phonemize the text: {reason}")))?;
         ipa.push(printed);
     }
 

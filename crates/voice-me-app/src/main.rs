@@ -825,7 +825,8 @@ fn build_engine(
     }
     // Story 3.15: Piper on the bundled runtime, committed through
     // `voice-me-tts`'s once-per-process guard, on its own device; phonemes
-    // from `espeak-ng`, or the Turkish G2P model for a Turkish voice.
+    // from `espeak-ng`, or the Turkish G2P model for a voice whose config says
+    // `"phoneme_type": "dizge"`.
     if state.backend_selection.is_piper() {
         return match build_piper(state) {
             Ok(port) => Engine {
@@ -858,7 +859,7 @@ fn build_engine(
 
 /// Piper's engine (Story 3.15; Windows since Story 3.16), or why there is
 /// none. The phonemizer finds `espeak-ng` on each call, so one installed
-/// after the engine was built is used; a Turkish voice's text goes through
+/// after the engine was built is used; a `"dizge"` voice's text goes through
 /// the Turkish G2P model instead, loaded on its first line.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn build_piper(state: &AppState) -> Result<Arc<dyn TtsPort>, String> {
@@ -874,9 +875,9 @@ fn build_piper(state: &AppState) -> Result<Arc<dyn TtsPort>, String> {
             &assets::resolve_runtime_dylib(&runtime_root, None).path,
         )
     });
-    // Turkish voices read text through the DizgeBERT G2P model under the
-    // cache root, on the same runtime; every other language through
-    // `espeak-ng`.
+    // A voice whose `phoneme_type` is `"dizge"` reads text through the
+    // DizgeBERT G2P model under the cache root, on the same runtime; every
+    // other voice through `espeak-ng`.
     let phonemizer = voice_me_tts_piper::TurkishG2pPhonemizer::new(
         voice_me_tts_piper::DizgeG2p::new(&root, runtime_init.clone()),
         Arc::new(voice_me_tts_piper::EspeakPhonemizer::new()),

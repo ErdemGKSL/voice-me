@@ -238,8 +238,8 @@ pub struct Sources {
     /// the Virtual Microphone row runs. `Some` on Windows only; elsewhere
     /// the row installs without downloading anything.
     pub virtual_mic: Option<Asset>,
-    /// The Turkish G2P model (DizgeBERT) Turkish Piper voices are
-    /// phonemized through: its graph and its `vocab.json`, which Install on
+    /// The Turkish G2P model (DizgeBERT) Piper voices with
+    /// `phoneme_type` `"dizge"` are phonemized through: its graph and its `vocab.json`, which Install on
     /// the Turkish G2P row fetches. Empty where it is not pinned.
     pub turkish_g2p: Vec<Asset>,
 }

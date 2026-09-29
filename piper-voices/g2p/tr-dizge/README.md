@@ -1,6 +1,8 @@
 # Turkish G2P model (DizgeBERT)
 
-Turkish Piper voices read text through this model instead of eSpeak NG. It is
+A Piper voice whose `config.json` sets `"phoneme_type": "dizge"` reads text
+through this model instead of eSpeak NG (`"espeak"`, or no `phoneme_type`, keeps
+eSpeak NG). The model is
 [`iatagun/dizge-g2p`](https://huggingface.co/iatagun/dizge-g2p) (MIT, revision
 `2afa9b7941a6feac766e040107561fe6d27ac8f1`), a BERT token classifier that
 labels each letter of a Turkish word with its IPA phoneme, exported to ONNX by

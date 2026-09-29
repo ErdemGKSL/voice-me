@@ -67,7 +67,8 @@ keeps the old copy; the next check picks the new one up.
 
 ## Turkish G2P model
 
-Turkish voices read text through DizgeBERT (`iatagun/dizge-g2p`), not eSpeak
-NG. `g2p/tr-dizge/` holds the model exported to ONNX, and its README describes
+A voice whose `config.json` sets `"phoneme_type": "dizge"` reads text through
+DizgeBERT (`iatagun/dizge-g2p`) instead of eSpeak NG; `"espeak"` (or nothing)
+keeps eSpeak NG. `g2p/tr-dizge/` holds the model exported to ONNX, and its README describes
 it. voice-me downloads it from `main` when the Dependency Check's Turkish G2P
 row is installed.

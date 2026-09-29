@@ -906,15 +906,13 @@ impl DepsAdapter {
             request.piper_voice.as_deref(),
             &known,
         ));
-        // A Turkish voice reads text through the Turkish G2P model, never
-        // eSpeak NG. With no voice named and none installed, the voice is
-        // the default one, which is Turkish.
-        let voice = request.piper_voice.as_deref().or_else(|| {
-            assets::installed_piper_voices(root)
-                .is_empty()
-                .then_some(assets::PIPER_DEFAULT_VOICE.key)
-        });
-        if voice.is_some_and(|key| piper::speaks_turkish(root, key)) {
+        // A voice whose `config.json` says `"phoneme_type": "dizge"` reads
+        // text through the Turkish G2P model instead of eSpeak NG.
+        if request
+            .piper_voice
+            .as_deref()
+            .is_some_and(|key| piper::uses_dizge(root, key))
+        {
             rows.push(piper::turkish_g2p_row(root, &self.sources.turkish_g2p));
         } else {
             rows.extend(self.piper_espeak_rows());
@@ -2962,12 +2960,11 @@ mod tests {
     }
 
     /// Story 3.15's First run row: Piper reports the shared runtime, "No
-    /// Piper voice installed" (Install) and — the default voice being
-    /// Turkish — the Turkish G2P model in place of eSpeak NG. No
-    /// Chatterbox model rows, and on Linux (and Windows, Story 3.16) no
-    /// capability row.
+    /// Piper voice installed" (Install) and eSpeak NG — the default voice
+    /// is phonemized by it. No Chatterbox model rows, and on Linux (and
+    /// Windows, Story 3.16) no capability row.
     #[test]
-    fn a_piper_selection_reports_runtime_voice_and_turkish_g2p_rows() {
+    fn a_piper_selection_reports_runtime_voice_and_espeak_rows() {
         let dir = tempfile::tempdir().unwrap();
 
         let report = check_with(
@@ -2996,7 +2993,7 @@ mod tests {
                 vec![
                     DependencyKind::OnnxRuntime,
                     DependencyKind::PiperVoice,
-                    DependencyKind::TurkishG2p
+                    DependencyKind::SystemVoiceEngine
                 ]
             );
             let voice = row(&report.dependencies, DependencyKind::PiperVoice);
@@ -3007,11 +3004,10 @@ mod tests {
                 Some(DependencyKind::OnnxRuntime),
                 "the runtime row comes first and blocks"
             );
-            let g2p = row(&report.dependencies, DependencyKind::TurkishG2p);
-            assert!(g2p.status.is_missing() && g2p.automatable, "{g2p:?}");
-            assert!(
-                g2p.detail.contains("Install downloads DizgeBERT"),
-                "{g2p:?}"
+            let espeak = row(&report.dependencies, DependencyKind::SystemVoiceEngine);
+            assert_eq!(
+                espeak.status.is_missing(),
+                voice_me_espeak::find_program().is_none()
             );
         }
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -3021,14 +3017,18 @@ mod tests {
         );
     }
 
-    /// A Piper voice in another language still reads text through eSpeak
-    /// NG: its row, and no Turkish G2P row.
+    /// A voice whose installed `config.json` says `"phoneme_type":
+    /// "dizge"` gets the Turkish G2P row in place of eSpeak NG's.
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
-    fn a_non_turkish_piper_voice_reports_the_espeak_row() {
+    fn a_dizge_piper_voice_reports_the_turkish_g2p_row() {
         let dir = tempfile::tempdir().unwrap();
+        let key = "tr_TR-custom";
+        let voice = assets::piper_voice_files(dir.path(), key).unwrap();
+        std::fs::create_dir_all(&voice.dir).unwrap();
+        std::fs::write(&voice.config, r#"{"phoneme_type":"dizge"}"#).unwrap();
 
-        let report = check_with(piper_request(Some("en_US-lessac-medium")), dir.path());
+        let report = check_with(piper_request(Some(key)), dir.path());
 
         let kinds: Vec<_> = report
             .dependencies
@@ -3041,19 +3041,20 @@ mod tests {
             vec![
                 DependencyKind::OnnxRuntime,
                 DependencyKind::PiperVoice,
-                DependencyKind::SystemVoiceEngine
+                DependencyKind::TurkishG2p
             ]
         );
-        let espeak = row(&report.dependencies, DependencyKind::SystemVoiceEngine);
-        assert_eq!(
-            espeak.status.is_missing(),
-            voice_me_espeak::find_program().is_none()
+        let g2p = row(&report.dependencies, DependencyKind::TurkishG2p);
+        assert!(g2p.status.is_missing() && g2p.automatable, "{g2p:?}");
+        assert!(
+            g2p.detail.contains("Install downloads DizgeBERT"),
+            "{g2p:?}"
         );
     }
 
     /// The Turkish G2P row is ready once both pinned files are on disk at
     /// their pinned sizes, and an installed voice's own `config.json`
-    /// decides whether it is Turkish.
+    /// (`phoneme_type`) decides whether it reads through the model.
     #[test]
     fn the_turkish_g2p_row_turns_ready_when_its_files_are_there() {
         let dir = tempfile::tempdir().unwrap();
@@ -3094,14 +3095,16 @@ mod tests {
         let unpinned = piper::turkish_g2p_row(dir.path(), &[]);
         assert!(unpinned.status.is_missing() && !unpinned.automatable);
 
-        assert!(piper::speaks_turkish(dir.path(), "tr_TR-fahrettin-medium"));
-        assert!(!piper::speaks_turkish(dir.path(), "en_US-lessac-medium"));
+        // Only the installed config's `phoneme_type` decides.
+        assert!(!piper::uses_dizge(dir.path(), "custom"));
         let voice = assets::piper_voice_files(dir.path(), "custom").unwrap();
         std::fs::create_dir_all(&voice.dir).unwrap();
+        std::fs::write(&voice.config, r#"{"phoneme_type":"espeak"}"#).unwrap();
+        assert!(!piper::uses_dizge(dir.path(), "custom"));
         std::fs::write(&voice.config, r#"{"espeak":{"voice":"tr"}}"#).unwrap();
-        assert!(piper::speaks_turkish(dir.path(), "custom"));
-        std::fs::write(&voice.config, r#"{"espeak":{"voice":"de"}}"#).unwrap();
-        assert!(!piper::speaks_turkish(dir.path(), "custom"));
+        assert!(!piper::uses_dizge(dir.path(), "custom"));
+        std::fs::write(&voice.config, r#"{"phoneme_type":"dizge"}"#).unwrap();
+        assert!(piper::uses_dizge(dir.path(), "custom"));
     }
 
     /// spec-backend-engine-and-device-selects: Piper on CUDA gets the same
@@ -3147,7 +3150,7 @@ mod tests {
                 DependencyKind::CudaProvider,
                 DependencyKind::NvidiaLibraries,
                 DependencyKind::PiperVoice,
-                DependencyKind::TurkishG2p,
+                DependencyKind::SystemVoiceEngine,
             ]
         );
         let capability = row(&cuda, DependencyKind::BackendCapability);
@@ -3165,7 +3168,7 @@ mod tests {
                 DependencyKind::BackendCapability,
                 DependencyKind::OnnxRuntime,
                 DependencyKind::PiperVoice,
-                DependencyKind::TurkishG2p,
+                DependencyKind::SystemVoiceEngine,
             ]
         );
         let capability = row(&webgpu, DependencyKind::BackendCapability);
@@ -3177,7 +3180,7 @@ mod tests {
             vec![
                 DependencyKind::OnnxRuntime,
                 DependencyKind::PiperVoice,
-                DependencyKind::TurkishG2p,
+                DependencyKind::SystemVoiceEngine,
             ]
         );
     }

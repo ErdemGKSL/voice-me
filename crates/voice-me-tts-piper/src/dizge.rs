@@ -1,6 +1,6 @@
 //! DizgeBERT (`iatagun/dizge-g2p`) run in-process on ONNX Runtime: the
-//! Turkish grapheme-to-phoneme model Turkish Piper voices are phonemized
-//! through instead of eSpeak NG.
+//! Turkish grapheme-to-phoneme model Piper voices with `"phoneme_type":
+//! "dizge"` are phonemized through instead of eSpeak NG.
 //!
 //! The model is a BERT token classifier over single letters: each word is
 //! `[CLS]`, one token per letter, `[SEP]`, and each letter's token is
@@ -240,9 +240,9 @@ fn run(
     vocab.decode(words, logits, width)
 }
 
-/// The phonemizer Piper voices speak through: DizgeBERT for a Turkish
-/// voice (`espeak.voice` of `tr`), and `other` — `espeak-ng` — for every
-/// other language.
+/// The phonemizer Piper voices speak through: `espeak-ng` (`other`) for a
+/// voice whose `phoneme_type` is `"espeak"`, DizgeBERT for one whose is
+/// `"dizge"`.
 pub struct TurkishG2pPhonemizer {
     dizge: DizgeG2p,
     other: Arc<dyn Phonemizer>,
@@ -254,19 +254,13 @@ impl TurkishG2pPhonemizer {
     }
 }
 
-/// Whether `espeak_voice` (a voice's `espeak.voice`) is Turkish.
-pub fn is_turkish(espeak_voice: &str) -> bool {
-    let language = espeak_voice.split(['-', '_']).next().unwrap_or_default();
-    language.eq_ignore_ascii_case("tr")
-}
-
 impl Phonemizer for TurkishG2pPhonemizer {
     fn phonemize(&self, espeak_voice: &str, clause: &str) -> Result<String, String> {
-        if is_turkish(espeak_voice) {
-            self.dizge.phonemize(clause)
-        } else {
-            self.other.phonemize(espeak_voice, clause)
-        }
+        self.other.phonemize(espeak_voice, clause)
+    }
+
+    fn phonemize_dizge(&self, clause: &str) -> Result<String, String> {
+        self.dizge.phonemize(clause)
     }
 }
 
@@ -327,12 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn only_turkish_voices_are_phonemized_by_the_model() {
-        assert!(is_turkish("tr"));
-        assert!(is_turkish("TR-tr"));
-        assert!(!is_turkish("en-us"));
-        assert!(!is_turkish("trk"));
-
+    fn espeak_voices_go_to_espeak_and_dizge_voices_to_the_model() {
         struct Echo;
         impl Phonemizer for Echo {
             fn phonemize(&self, voice: &str, clause: &str) -> Result<String, String> {
@@ -347,17 +336,10 @@ mod tests {
             ),
             Arc::new(Echo),
         );
-        assert_eq!(
-            phonemizer.phonemize("en-us", "hello").unwrap(),
-            "en-us:hello"
-        );
-        let error = phonemizer.phonemize("tr", "merhaba").unwrap_err();
+        assert_eq!(phonemizer.phonemize("tr", "merhaba").unwrap(), "tr:merhaba");
+        let error = phonemizer.phonemize_dizge("merhaba").unwrap_err();
         assert!(
             error.contains("Turkish G2P model is not installed"),
-            "{error}"
-        );
-        assert!(
-            error.contains("vocab.json") || error.contains("model.onnx"),
             "{error}"
         );
     }

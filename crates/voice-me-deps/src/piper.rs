@@ -831,37 +831,22 @@ pub fn piper_voice_row(
 /// The Turkish G2P row's name.
 pub const TURKISH_G2P_LABEL: &str = "Turkish G2P model";
 
-/// Whether the voice `key` speaks Turkish, so it reads text through the
-/// Turkish G2P model instead of eSpeak NG: its installed `config.json`
-/// names a Turkish eSpeak NG voice, or — not installed yet — its key is a
-/// Turkish locale's (`tr_TR-…`).
-pub fn speaks_turkish(root: &Path, key: &str) -> bool {
+/// Whether the installed voice `key` reads text through the Turkish G2P
+/// model: its `config.json`'s `phoneme_type` is `"dizge"`. A voice that is
+/// not installed, or says `"espeak"` or nothing, reads through eSpeak NG.
+pub fn uses_dizge(root: &Path, key: &str) -> bool {
     #[derive(Deserialize)]
     struct Config {
-        espeak: Espeak,
+        #[serde(default)]
+        phoneme_type: Option<String>,
     }
-    #[derive(Deserialize)]
-    struct Espeak {
-        voice: String,
-    }
-    let installed = assets::piper_voice_files(root, key)
+    assets::piper_voice_files(root, key)
         .and_then(|files| std::fs::read_to_string(files.config).ok())
-        .and_then(|json| serde_json::from_str::<Config>(&json).ok());
-    match installed {
-        Some(config) => is_turkish(&config.espeak.voice),
-        None => is_turkish(key),
-    }
+        .and_then(|json| serde_json::from_str::<Config>(&json).ok())
+        .is_some_and(|config| config.phoneme_type.as_deref() == Some("dizge"))
 }
 
-/// Whether an eSpeak NG voice or a locale names Turkish: `tr`, `tr-…`,
-/// `tr_…`.
-fn is_turkish(name: &str) -> bool {
-    name.split(['-', '_'])
-        .next()
-        .is_some_and(|language| language.eq_ignore_ascii_case("tr"))
-}
-
-/// The Turkish G2P row (a Turkish Piper voice's, in place of eSpeak NG's):
+/// The Turkish G2P row (a `"dizge"` voice's, in place of eSpeak NG's):
 /// ready when each of `files` is on disk at its pinned size, otherwise
 /// missing and speech-blocking — with Install where the model is pinned,
 /// manual steps where it is not.
@@ -881,7 +866,7 @@ pub fn turkish_g2p_row(root: &Path, files: &[Asset]) -> Dependency {
         return Dependency::missing(
             DependencyKind::TurkishG2p,
             TURKISH_G2P_LABEL,
-            "Turkish Piper voices read text through the Turkish G2P model, and this build \
+            "Piper voices set to the Turkish G2P model read text through it, and this build \
              has no download for it.",
         )
         .manual([
@@ -893,7 +878,7 @@ pub fn turkish_g2p_row(root: &Path, files: &[Asset]) -> Dependency {
         DependencyKind::TurkishG2p,
         TURKISH_G2P_LABEL,
         format!(
-            "The Turkish G2P model is not installed. Turkish Piper voices read text through \
+            "The Turkish G2P model is not installed. This voice reads text through \
              it. Install downloads DizgeBERT ({}, MIT).",
             format_bytes(files.iter().map(|asset| asset.size).sum())
         ),

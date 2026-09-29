@@ -340,8 +340,9 @@ pub fn espeak_dir(root: &Path) -> PathBuf {
 }
 
 /// Where the Turkish G2P model lives inside the cache root: DizgeBERT
-/// (`iatagun/dizge-g2p`), exported to ONNX. Turkish Piper voices are
-/// phonemized through it instead of eSpeak NG.
+/// (`iatagun/dizge-g2p`), exported to ONNX. Piper voices whose
+/// `config.json` says `"phoneme_type": "dizge"` are phonemized through it
+/// instead of eSpeak NG.
 pub const TURKISH_G2P_DIR: &str = "g2p-tr-dizge";
 
 /// The Turkish G2P model's graph, inside its directory.

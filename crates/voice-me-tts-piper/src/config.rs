@@ -17,10 +17,20 @@ pub struct PiperConfig {
     #[serde(default = "one")]
     pub num_speakers: u32,
     pub phoneme_id_map: PhonemeIdMap,
-    /// Where the phonemes come from. voice-me only phonemizes through
-    /// eSpeak NG, so anything but absent or `"espeak"` is refused.
+    /// Where the phonemes come from: absent or `"espeak"` for eSpeak NG,
+    /// `"dizge"` for the Turkish G2P model (DizgeBERT). Anything else is
+    /// refused.
     #[serde(default)]
     pub phoneme_type: Option<String>,
+}
+
+/// What phonemizes a voice's text, by its `config.json`'s `phoneme_type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhonemeSource {
+    /// The `espeak-ng` program, in the voice's `espeak.voice`.
+    Espeak,
+    /// The Turkish G2P model (DizgeBERT): Turkish text only.
+    Dizge,
 }
 
 fn one() -> u32 {
@@ -83,14 +93,22 @@ impl PiperConfig {
             return Err("its phoneme map is empty".to_string());
         }
         if let Some(kind) = config.phoneme_type.as_deref()
-            && kind != "espeak"
+            && !matches!(kind, "espeak" | "dizge")
         {
             return Err(format!(
                 "its phoneme type is \"{kind}\"; voice-me only reads voices phonemized by \
-                 eSpeak NG"
+                 eSpeak NG (\"espeak\") or the Turkish G2P model (\"dizge\")"
             ));
         }
         Ok(config)
+    }
+
+    /// What phonemizes this voice's text.
+    pub fn phoneme_source(&self) -> PhonemeSource {
+        match self.phoneme_type.as_deref() {
+            Some("dizge") => PhonemeSource::Dizge,
+            _ => PhonemeSource::Espeak,
+        }
     }
 
     /// `[noise_scale, length_scale, noise_w]`.
@@ -133,8 +151,8 @@ mod tests {
         assert_eq!(config.speaker_id(), Some(0));
     }
 
-    /// Only eSpeak-phonemized voices are accepted; `text` or `pinyin`
-    /// voices would speak garbage.
+    /// Only eSpeak- or dizge-phonemized voices are accepted; `text` or
+    /// `pinyin` voices would speak garbage.
     #[test]
     fn a_voice_not_phonemized_by_espeak_is_refused() {
         let json = |kind: &str| {
@@ -145,11 +163,20 @@ mod tests {
         };
         assert!(PiperConfig::from_json(&json("")).is_ok());
         assert!(PiperConfig::from_json(&json(r#","phoneme_type":"espeak""#)).is_ok());
+        let dizge = PiperConfig::from_json(&json(r#","phoneme_type":"dizge""#)).unwrap();
+        assert_eq!(dizge.phoneme_source(), PhonemeSource::Dizge);
+        assert_eq!(
+            PiperConfig::from_json(&json("")).unwrap().phoneme_source(),
+            PhonemeSource::Espeak
+        );
         for kind in ["text", "pinyin"] {
             let error =
                 PiperConfig::from_json(&json(&format!(r#","phoneme_type":"{kind}""#))).unwrap_err();
             assert!(error.contains(kind), "{error}");
-            assert!(error.contains("eSpeak NG"), "{error}");
+            assert!(
+                error.contains("eSpeak NG") && error.contains("dizge"),
+                "{error}"
+            );
         }
     }
 

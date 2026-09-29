@@ -1235,7 +1235,7 @@ pub enum DependencyKind {
     /// The Piper voice the selection speaks in (Story 3.15). Blocking; its
     /// Install downloads the voice named in the request.
     PiperVoice,
-    /// The Turkish G2P model (DizgeBERT) a Turkish Piper voice is
+    /// The Turkish G2P model (DizgeBERT) a Piper voice with `phoneme_type` `"dizge"` is
     /// phonemized through instead of eSpeak NG. Blocking; its Install
     /// downloads the model.
     TurkishG2p,
