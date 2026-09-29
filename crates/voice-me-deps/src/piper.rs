@@ -826,6 +826,80 @@ pub fn piper_voice_row(
     }
 }
 
+// ---- the Turkish G2P model ----------------------------------------------
+
+/// The Turkish G2P row's name.
+pub const TURKISH_G2P_LABEL: &str = "Turkish G2P model";
+
+/// Whether the voice `key` speaks Turkish, so it reads text through the
+/// Turkish G2P model instead of eSpeak NG: its installed `config.json`
+/// names a Turkish eSpeak NG voice, or — not installed yet — its key is a
+/// Turkish locale's (`tr_TR-…`).
+pub fn speaks_turkish(root: &Path, key: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Config {
+        espeak: Espeak,
+    }
+    #[derive(Deserialize)]
+    struct Espeak {
+        voice: String,
+    }
+    let installed = assets::piper_voice_files(root, key)
+        .and_then(|files| std::fs::read_to_string(files.config).ok())
+        .and_then(|json| serde_json::from_str::<Config>(&json).ok());
+    match installed {
+        Some(config) => is_turkish(&config.espeak.voice),
+        None => is_turkish(key),
+    }
+}
+
+/// Whether an eSpeak NG voice or a locale names Turkish: `tr`, `tr-…`,
+/// `tr_…`.
+fn is_turkish(name: &str) -> bool {
+    name.split(['-', '_'])
+        .next()
+        .is_some_and(|language| language.eq_ignore_ascii_case("tr"))
+}
+
+/// The Turkish G2P row (a Turkish Piper voice's, in place of eSpeak NG's):
+/// ready when each of `files` is on disk at its pinned size, otherwise
+/// missing and speech-blocking — with Install where the model is pinned,
+/// manual steps where it is not.
+pub fn turkish_g2p_row(root: &Path, files: &[Asset]) -> Dependency {
+    let dir = assets::turkish_g2p_files(root).dir;
+    let present = |asset: &Asset| {
+        std::fs::metadata(asset.destination(root)).is_ok_and(|meta| meta.len() == asset.size)
+    };
+    if !files.is_empty() && files.iter().all(present) {
+        return Dependency::ready(
+            DependencyKind::TurkishG2p,
+            TURKISH_G2P_LABEL,
+            format!("Installed in {}.", dir.display()),
+        );
+    }
+    if files.is_empty() {
+        return Dependency::missing(
+            DependencyKind::TurkishG2p,
+            TURKISH_G2P_LABEL,
+            "Turkish Piper voices read text through the Turkish G2P model, and this build \
+             has no download for it.",
+        )
+        .manual([
+            "Choose a Piper voice in another language in Settings → Speech.",
+            "Press Check again.",
+        ]);
+    }
+    Dependency::missing(
+        DependencyKind::TurkishG2p,
+        TURKISH_G2P_LABEL,
+        format!(
+            "The Turkish G2P model is not installed. Turkish Piper voices read text through \
+             it. Install downloads DizgeBERT ({}, MIT).",
+            format_bytes(files.iter().map(|asset| asset.size).sum())
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

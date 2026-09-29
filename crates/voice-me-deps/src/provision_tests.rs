@@ -281,6 +281,7 @@ impl Fixture {
                 nvidia_wheels: Vec::new(),
                 espeak: None,
                 virtual_mic: None,
+                turkish_g2p: Vec::new(),
             },
             cache,
             env,
@@ -2277,4 +2278,45 @@ fn a_piper_cuda_install_fetches_the_cuda_runtime_pieces() {
     for path in assets::required_model_files(root, voice_me_core::SpeechWeights::Fp16) {
         assert!(!path.exists(), "{}", path.display());
     }
+}
+
+/// Install on the Turkish G2P row fetches both pinned files into
+/// `<cache>/g2p-tr-dizge`, reporting on the row; a second Install finds
+/// them verified and fetches nothing.
+#[test]
+fn installing_the_turkish_g2p_model_fetches_its_two_files() {
+    let model = (0..5000).map(|n| (n % 251) as u8).collect::<Vec<u8>>();
+    let vocab = br#"{"labels":["a"]}"#.to_vec();
+    let model_rel = format!("{}/model.onnx", assets::TURKISH_G2P_DIR);
+    let vocab_rel = format!("{}/vocab.json", assets::TURKISH_G2P_DIR);
+    let mut fixture = Fixture::with_extra_files(
+        vec![
+            (model_rel.clone(), model.clone()),
+            (vocab_rel.clone(), vocab.clone()),
+        ],
+        None,
+    );
+    fixture.sources.turkish_g2p = [(&model_rel, &model), (&vocab_rel, &vocab)]
+        .into_iter()
+        .map(|(rel, bytes)| Asset {
+            relative_path: rel.clone(),
+            url: format!("{}/{rel}", fixture.server.base),
+            size: bytes.len() as u64,
+            digest: crate::sources::Digest::Sha256(sha256(bytes)),
+        })
+        .collect();
+
+    let (result, events) = fixture.provision(DependencyKind::TurkishG2p);
+
+    assert_eq!(result, Ok(()));
+    let files = assets::turkish_g2p_files(fixture.root());
+    assert_eq!(std::fs::read(&files.model).unwrap(), model);
+    assert_eq!(std::fs::read(&files.vocab).unwrap(), vocab);
+    let total = (model.len() + vocab.len()) as u64;
+    assert_eq!(progress(&events).last(), Some(&(total, total)));
+    assert_eq!(finished(&events), vec![Ok(())]);
+
+    let (again, events) = fixture.provision(DependencyKind::TurkishG2p);
+    assert_eq!(again, Ok(()));
+    assert!(progress(&events).is_empty(), "nothing is fetched twice");
 }

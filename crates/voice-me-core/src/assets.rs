@@ -339,6 +339,44 @@ pub fn espeak_dir(root: &Path) -> PathBuf {
     root.join(ESPEAK_DIR)
 }
 
+/// Where the Turkish G2P model lives inside the cache root: DizgeBERT
+/// (`iatagun/dizge-g2p`), exported to ONNX. Turkish Piper voices are
+/// phonemized through it instead of eSpeak NG.
+pub const TURKISH_G2P_DIR: &str = "g2p-tr-dizge";
+
+/// The Turkish G2P model's graph, inside its directory.
+pub const TURKISH_G2P_MODEL_FILE: &str = "model.onnx";
+
+/// The Turkish G2P model's input characters and output labels, inside its
+/// directory.
+pub const TURKISH_G2P_VOCAB_FILE: &str = "vocab.json";
+
+/// The files of the Turkish G2P model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurkishG2pFiles {
+    /// `<root>/g2p-tr-dizge`.
+    pub dir: PathBuf,
+    pub model: PathBuf,
+    pub vocab: PathBuf,
+}
+
+impl TurkishG2pFiles {
+    /// Whether both files are on disk.
+    pub fn is_complete(&self) -> bool {
+        self.model.is_file() && self.vocab.is_file()
+    }
+}
+
+/// Where the Turkish G2P model's files live under `root`.
+pub fn turkish_g2p_files(root: &Path) -> TurkishG2pFiles {
+    let dir = root.join(TURKISH_G2P_DIR);
+    TurkishG2pFiles {
+        model: dir.join(TURKISH_G2P_MODEL_FILE),
+        vocab: dir.join(TURKISH_G2P_VOCAB_FILE),
+        dir,
+    }
+}
+
 /// The directory eSpeak NG's MSI installs into, under Program Files — and,
 /// unpacked by voice-me, under [`ESPEAK_DIR`].
 pub const ESPEAK_WINDOWS_INSTALL_DIR: &str = "eSpeak NG";
@@ -491,6 +529,15 @@ pub fn installed_piper_stock_voices(root: &Path) -> Vec<StockVoice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_turkish_g2p_model_sits_in_its_own_directory() {
+        let files = turkish_g2p_files(Path::new("/cache"));
+        assert_eq!(files.dir, PathBuf::from("/cache/g2p-tr-dizge"));
+        assert_eq!(files.model, PathBuf::from("/cache/g2p-tr-dizge/model.onnx"));
+        assert_eq!(files.vocab, PathBuf::from("/cache/g2p-tr-dizge/vocab.json"));
+        assert!(!files.is_complete());
+    }
 
     #[test]
     fn espeak_ng_is_unpacked_next_to_the_piper_voices() {

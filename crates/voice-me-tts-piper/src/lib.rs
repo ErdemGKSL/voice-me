@@ -8,8 +8,10 @@
 //! 1. the text is split into clauses at `, : ; . ! ?`
 //!    ([`phonemes::split_clauses`]);
 //! 2. each clause is phonemized by `espeak-ng --ipa` (through
-//!    `voice-me-espeak` on Linux and Windows — the [`Phonemizer`] here), its mark put
-//!    back, and the result decomposed to NFD ([`phonemes::sentence_phonemes`]);
+//!    `voice-me-espeak` on Linux and Windows — the [`Phonemizer`] here) —
+//!    or, for a Turkish voice, by the DizgeBERT G2P model
+//!    ([`TurkishG2pPhonemizer`]) — its mark put back, and the result
+//!    decomposed to NFD ([`phonemes::sentence_phonemes`]);
 //! 3. each sentence becomes ids ([`phonemes::to_ids`]) and one run of the
 //!    graph;
 //! 4. each sentence's audio is peak-normalized and clipped, the sentences
@@ -22,7 +24,9 @@
 //! never downloads a runtime or a voice, and opens no socket (AD-8).
 
 pub mod config;
+pub mod dizge;
 pub mod phonemes;
+pub mod turkish;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,6 +41,7 @@ use rubato::{Fft, FixedSync, Resampler};
 use voice_me_core::{AudioBuffer, SAMPLE_RATE, TtsPort, VoiceMeError, assets};
 
 pub use config::PiperConfig;
+pub use dizge::{DizgeG2p, TurkishG2pPhonemizer};
 
 /// The engine's name, as every failure names it.
 pub const ENGINE_LABEL: &str = "Piper";

@@ -825,7 +825,7 @@ fn build_engine(
     }
     // Story 3.15: Piper on the bundled runtime, committed through
     // `voice-me-tts`'s once-per-process guard, on its own device; phonemes
-    // from `espeak-ng`.
+    // from `espeak-ng`, or the Turkish G2P model for a Turkish voice.
     if state.backend_selection.is_piper() {
         return match build_piper(state) {
             Ok(port) => Engine {
@@ -858,7 +858,8 @@ fn build_engine(
 
 /// Piper's engine (Story 3.15; Windows since Story 3.16), or why there is
 /// none. The phonemizer finds `espeak-ng` on each call, so one installed
-/// after the engine was built is used.
+/// after the engine was built is used; a Turkish voice's text goes through
+/// the Turkish G2P model instead, loaded on its first line.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 fn build_piper(state: &AppState) -> Result<Arc<dyn TtsPort>, String> {
     let root = assets::model_cache_root().map_err(|error| error.to_string())?;
@@ -868,16 +869,24 @@ fn build_piper(state: &AppState) -> Result<Arc<dyn TtsPort>, String> {
     // providers, restart rule and NVIDIA preload as Chatterbox's (AD-1:
     // injected, so `voice-me-tts-piper` never depends on `voice-me-tts`).
     let backend = resolve_backend(&state.backend_selection);
+    let runtime_init: voice_me_tts_piper::RuntimeInit = Arc::new(move || {
+        voice_me_tts::sessions::init_runtime(
+            &assets::resolve_runtime_dylib(&runtime_root, None).path,
+        )
+    });
+    // Turkish voices read text through the DizgeBERT G2P model under the
+    // cache root, on the same runtime; every other language through
+    // `espeak-ng`.
+    let phonemizer = voice_me_tts_piper::TurkishG2pPhonemizer::new(
+        voice_me_tts_piper::DizgeG2p::new(&root, runtime_init.clone()),
+        Arc::new(voice_me_tts_piper::EspeakPhonemizer::new()),
+    );
     Ok(Arc::new(
         voice_me_tts_piper::PiperTts::new(
             root,
             piper_voice_for(state),
-            Arc::new(voice_me_tts_piper::EspeakPhonemizer::new()),
-            Arc::new(move || {
-                voice_me_tts::sessions::init_runtime(
-                    &assets::resolve_runtime_dylib(&runtime_root, None).path,
-                )
-            }),
+            Arc::new(phonemizer),
+            runtime_init,
         )
         .with_providers(Arc::new(move || piper_providers(&providers_root, backend))),
     ))

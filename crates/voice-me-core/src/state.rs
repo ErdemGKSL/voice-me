@@ -1235,6 +1235,10 @@ pub enum DependencyKind {
     /// The Piper voice the selection speaks in (Story 3.15). Blocking; its
     /// Install downloads the voice named in the request.
     PiperVoice,
+    /// The Turkish G2P model (DizgeBERT) a Turkish Piper voice is
+    /// phonemized through instead of eSpeak NG. Blocking; its Install
+    /// downloads the model.
+    TurkishG2p,
     /// ONNX Runtime's CUDA execution provider, beside the bundled runtime
     /// (Story 3.8). Reported for a CUDA backend on the bundled runtime
     /// only; blocking.
@@ -1257,6 +1261,7 @@ impl DependencyKind {
                 | DependencyKind::SystemVoiceEngine
                 | DependencyKind::EdgeTtsProgram
                 | DependencyKind::PiperVoice
+                | DependencyKind::TurkishG2p
                 | DependencyKind::CudaProvider
                 | DependencyKind::NvidiaLibraries
         )
@@ -2191,6 +2196,7 @@ mod tests {
         assert!(selection.label().contains("stock voice"));
         assert_eq!(selection.language_backend(), LanguageBackend::SystemVoice);
         assert!(DependencyKind::SystemVoiceEngine.blocks_speech());
+        assert!(DependencyKind::TurkishG2p.blocks_speech());
     }
 
     fn azure_voice(short_name: &str, locale: &str, locale_name: &str, local: &str) -> StockVoice {

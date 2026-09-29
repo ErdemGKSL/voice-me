@@ -64,3 +64,10 @@ matches the installed copy is downloaded again (only the files that changed)
 and used from the next line spoken. No Delete and Download is needed. While
 GitHub's cache still serves the previous file, the check fails its checksum and
 keeps the old copy; the next check picks the new one up.
+
+## Turkish G2P model
+
+Turkish voices read text through DizgeBERT (`iatagun/dizge-g2p`), not eSpeak
+NG. `g2p/tr-dizge/` holds the model exported to ONNX, and its README describes
+it. voice-me downloads it from `main` when the Dependency Check's Turkish G2P
+row is installed.

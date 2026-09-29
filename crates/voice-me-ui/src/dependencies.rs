@@ -556,6 +556,7 @@ fn slug(kind: DependencyKind) -> &'static str {
         DependencyKind::SystemVoiceEngine => "system-voice-engine",
         DependencyKind::EdgeTtsProgram => "edge-tts-program",
         DependencyKind::PiperVoice => "piper-voice",
+        DependencyKind::TurkishG2p => "turkish-g2p",
         DependencyKind::CudaProvider => "cuda-provider",
         DependencyKind::NvidiaLibraries => "nvidia-libraries",
     }

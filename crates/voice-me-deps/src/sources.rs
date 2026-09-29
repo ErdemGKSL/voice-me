@@ -238,6 +238,10 @@ pub struct Sources {
     /// the Virtual Microphone row runs. `Some` on Windows only; elsewhere
     /// the row installs without downloading anything.
     pub virtual_mic: Option<Asset>,
+    /// The Turkish G2P model (DizgeBERT) Turkish Piper voices are
+    /// phonemized through: its graph and its `vocab.json`, which Install on
+    /// the Turkish G2P row fetches. Empty where it is not pinned.
+    pub turkish_g2p: Vec<Asset>,
 }
 
 impl Default for Sources {
@@ -270,6 +274,7 @@ impl Sources {
             nvidia_wheels: pinned_nvidia_wheels(),
             espeak: pinned_espeak(),
             virtual_mic: pinned_virtual_mic(),
+            turkish_g2p: turkish_g2p_files(),
         }
     }
 
@@ -750,6 +755,38 @@ fn pinned_espeak() -> Option<Asset> {
 #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
 fn pinned_espeak() -> Option<Asset> {
     None
+}
+
+/// Where the Turkish G2P model is served from: this repository's own copy
+/// of `iatagun/dizge-g2p` (MIT) exported to ONNX, beside the Piper voice
+/// catalog, fetched straight from `main` like the Erdem voice. The pinned
+/// size and SHA-256 are what make it safe: a file replaced under the same
+/// path fails its check instead of being used.
+pub const TURKISH_G2P_URL: &str =
+    "https://raw.githubusercontent.com/ErdemGKSL/voice-me/main/piper-voices/g2p/tr-dizge";
+
+/// The Turkish G2P model's files, pinned by URL, size and SHA-256.
+pub fn turkish_g2p_files() -> Vec<Asset> {
+    [
+        (
+            assets::TURKISH_G2P_MODEL_FILE,
+            87_999_901,
+            "2b1b0bacad11be62c04248799aa91a07cae4161129a0b51eed46cda566656343",
+        ),
+        (
+            assets::TURKISH_G2P_VOCAB_FILE,
+            1_314,
+            "42a9d200d3683c32abef623fc7215d1acbc3a4b0d7dfbfa64433418d274b8a4c",
+        ),
+    ]
+    .into_iter()
+    .map(|(file, size, sha256)| Asset {
+        relative_path: format!("{}/{file}", assets::TURKISH_G2P_DIR),
+        url: format!("{TURKISH_G2P_URL}/{file}"),
+        size,
+        digest: Digest::Sha256(sha256.to_string()),
+    })
+    .collect()
 }
 
 /// Where the VB-CABLE pack lands under the cache root, and the directory

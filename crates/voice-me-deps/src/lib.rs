@@ -253,6 +253,7 @@ impl DepsAdapter {
             | DependencyKind::NvidiaLibraries => self.provision_runtime(kind, backend, events),
             DependencyKind::VirtualMicrophone => self.provision_virtual_mic(events),
             DependencyKind::PiperVoice => self.provision_piper_voice(request, events),
+            DependencyKind::TurkishG2p => self.provision_turkish_g2p(events),
             // Story 3.16: where eSpeak NG has a pinned download (Windows
             // x64), Install unpacks the official MSI into the cache.
             DependencyKind::SystemVoiceEngine if self.sources.espeak.is_some() => {
@@ -274,6 +275,31 @@ impl DepsAdapter {
                     .to_string(),
             )),
         }
+    }
+
+    /// Install on the Turkish G2P row: each pinned file not already the
+    /// pinned one is fetched with progress on the row, verified, and moved
+    /// into `<cache>/g2p-tr-dizge`.
+    fn provision_turkish_g2p(&self, events: &AppEventSender) -> Result<(), VoiceMeError> {
+        if self.sources.turkish_g2p.is_empty() {
+            return Err(VoiceMeError::Other(
+                "voice-me has no download for the Turkish G2P model in this build.".to_string(),
+            ));
+        }
+        let root = assets::model_cache_root()?;
+        let plan: Vec<PlannedDownload> = self
+            .sources
+            .turkish_g2p
+            .iter()
+            .filter_map(|asset| {
+                let destination = asset.destination(&root);
+                (!provision::is_verified(asset, &destination)).then(|| PlannedDownload {
+                    asset: asset.clone(),
+                    destination,
+                })
+            })
+            .collect();
+        fetch(DependencyKind::TurkishG2p, &plan, events)
     }
 
     /// Story 3.16: Install on the Windows eSpeak NG row. The pinned MSI is
@@ -880,7 +906,19 @@ impl DepsAdapter {
             request.piper_voice.as_deref(),
             &known,
         ));
-        rows.extend(self.piper_espeak_rows());
+        // A Turkish voice reads text through the Turkish G2P model, never
+        // eSpeak NG. With no voice named and none installed, the voice is
+        // the default one, which is Turkish.
+        let voice = request.piper_voice.as_deref().or_else(|| {
+            assets::installed_piper_voices(root)
+                .is_empty()
+                .then_some(assets::PIPER_DEFAULT_VOICE.key)
+        });
+        if voice.is_some_and(|key| piper::speaks_turkish(root, key)) {
+            rows.push(piper::turkish_g2p_row(root, &self.sources.turkish_g2p));
+        } else {
+            rows.extend(self.piper_espeak_rows());
+        }
         rows
     }
 
@@ -2924,11 +2962,12 @@ mod tests {
     }
 
     /// Story 3.15's First run row: Piper reports the shared runtime, "No
-    /// Piper voice installed" (Install) and eSpeak NG — no Chatterbox
-    /// model rows, and on Linux (and Windows, Story 3.16) no capability
-    /// row.
+    /// Piper voice installed" (Install) and — the default voice being
+    /// Turkish — the Turkish G2P model in place of eSpeak NG. No
+    /// Chatterbox model rows, and on Linux (and Windows, Story 3.16) no
+    /// capability row.
     #[test]
-    fn a_piper_selection_reports_runtime_voice_and_espeak_rows() {
+    fn a_piper_selection_reports_runtime_voice_and_turkish_g2p_rows() {
         let dir = tempfile::tempdir().unwrap();
 
         let report = check_with(
@@ -2957,7 +2996,7 @@ mod tests {
                 vec![
                     DependencyKind::OnnxRuntime,
                     DependencyKind::PiperVoice,
-                    DependencyKind::SystemVoiceEngine
+                    DependencyKind::TurkishG2p
                 ]
             );
             let voice = row(&report.dependencies, DependencyKind::PiperVoice);
@@ -2968,10 +3007,11 @@ mod tests {
                 Some(DependencyKind::OnnxRuntime),
                 "the runtime row comes first and blocks"
             );
-            let espeak = row(&report.dependencies, DependencyKind::SystemVoiceEngine);
-            assert_eq!(
-                espeak.status.is_missing(),
-                voice_me_espeak::find_program().is_none()
+            let g2p = row(&report.dependencies, DependencyKind::TurkishG2p);
+            assert!(g2p.status.is_missing() && g2p.automatable, "{g2p:?}");
+            assert!(
+                g2p.detail.contains("Install downloads DizgeBERT"),
+                "{g2p:?}"
             );
         }
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -2979,6 +3019,89 @@ mod tests {
             report.dependencies[0].kind,
             DependencyKind::BackendCapability
         );
+    }
+
+    /// A Piper voice in another language still reads text through eSpeak
+    /// NG: its row, and no Turkish G2P row.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn a_non_turkish_piper_voice_reports_the_espeak_row() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let report = check_with(piper_request(Some("en_US-lessac-medium")), dir.path());
+
+        let kinds: Vec<_> = report
+            .dependencies
+            .iter()
+            .map(|row| row.kind)
+            .filter(|kind| *kind != DependencyKind::VirtualMicrophone)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                DependencyKind::OnnxRuntime,
+                DependencyKind::PiperVoice,
+                DependencyKind::SystemVoiceEngine
+            ]
+        );
+        let espeak = row(&report.dependencies, DependencyKind::SystemVoiceEngine);
+        assert_eq!(
+            espeak.status.is_missing(),
+            voice_me_espeak::find_program().is_none()
+        );
+    }
+
+    /// The Turkish G2P row is ready once both pinned files are on disk at
+    /// their pinned sizes, and an installed voice's own `config.json`
+    /// decides whether it is Turkish.
+    #[test]
+    fn the_turkish_g2p_row_turns_ready_when_its_files_are_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = vec![
+            sources::Asset {
+                relative_path: format!("{}/model.onnx", assets::TURKISH_G2P_DIR),
+                url: "https://example.invalid/model.onnx".to_string(),
+                size: 3,
+                digest: sources::Digest::Sha256("00".repeat(32)),
+            },
+            sources::Asset {
+                relative_path: format!("{}/vocab.json", assets::TURKISH_G2P_DIR),
+                url: "https://example.invalid/vocab.json".to_string(),
+                size: 2,
+                digest: sources::Digest::Sha256("00".repeat(32)),
+            },
+        ];
+        let g2p = assets::turkish_g2p_files(dir.path());
+        std::fs::create_dir_all(&g2p.dir).unwrap();
+        std::fs::write(&g2p.model, b"abc").unwrap();
+        assert!(
+            piper::turkish_g2p_row(dir.path(), &files)
+                .status
+                .is_missing()
+        );
+        std::fs::write(&g2p.vocab, b"toolong").unwrap();
+        assert!(
+            piper::turkish_g2p_row(dir.path(), &files)
+                .status
+                .is_missing(),
+            "a file of another size is not the pinned one"
+        );
+        std::fs::write(&g2p.vocab, b"{}").unwrap();
+        let ready = piper::turkish_g2p_row(dir.path(), &files);
+        assert_eq!(ready.status, voice_me_core::DependencyStatus::Ready);
+        assert!(ready.detail.contains("g2p-tr-dizge"), "{}", ready.detail);
+
+        let unpinned = piper::turkish_g2p_row(dir.path(), &[]);
+        assert!(unpinned.status.is_missing() && !unpinned.automatable);
+
+        assert!(piper::speaks_turkish(dir.path(), "tr_TR-fahrettin-medium"));
+        assert!(!piper::speaks_turkish(dir.path(), "en_US-lessac-medium"));
+        let voice = assets::piper_voice_files(dir.path(), "custom").unwrap();
+        std::fs::create_dir_all(&voice.dir).unwrap();
+        std::fs::write(&voice.config, r#"{"espeak":{"voice":"tr"}}"#).unwrap();
+        assert!(piper::speaks_turkish(dir.path(), "custom"));
+        std::fs::write(&voice.config, r#"{"espeak":{"voice":"de"}}"#).unwrap();
+        assert!(!piper::speaks_turkish(dir.path(), "custom"));
     }
 
     /// spec-backend-engine-and-device-selects: Piper on CUDA gets the same
@@ -3024,7 +3147,7 @@ mod tests {
                 DependencyKind::CudaProvider,
                 DependencyKind::NvidiaLibraries,
                 DependencyKind::PiperVoice,
-                DependencyKind::SystemVoiceEngine,
+                DependencyKind::TurkishG2p,
             ]
         );
         let capability = row(&cuda, DependencyKind::BackendCapability);
@@ -3042,7 +3165,7 @@ mod tests {
                 DependencyKind::BackendCapability,
                 DependencyKind::OnnxRuntime,
                 DependencyKind::PiperVoice,
-                DependencyKind::SystemVoiceEngine,
+                DependencyKind::TurkishG2p,
             ]
         );
         let capability = row(&webgpu, DependencyKind::BackendCapability);
@@ -3054,14 +3177,15 @@ mod tests {
             vec![
                 DependencyKind::OnnxRuntime,
                 DependencyKind::PiperVoice,
-                DependencyKind::SystemVoiceEngine,
+                DependencyKind::TurkishG2p,
             ]
         );
     }
 
     /// Story 3.16: the Windows Piper check reports the eSpeak NG row from
     /// voice-me's cache — Missing with Install while nothing is found, then
-    /// Ready naming the unpacked program.
+    /// Ready naming the unpacked program. For a voice in a language other
+    /// than Turkish: a Turkish one reads through the Turkish G2P model.
     #[cfg(target_os = "windows")]
     #[test]
     fn a_windows_piper_check_finds_espeak_ng_in_the_cache() {
@@ -3070,7 +3194,7 @@ mod tests {
         let espeak_row = || {
             let (tx, mut rx) = futures::channel::mpsc::unbounded();
             DepsAdapter::new()
-                .check(piper_request(Some(assets::PIPER_DEFAULT_VOICE.key)), tx)
+                .check(piper_request(Some("en_US-lessac-medium")), tx)
                 .unwrap();
             let Ok(AppEvent::DependencyCheckCompleted { report }) = rx.try_recv() else {
                 panic!("the check reports by event");
