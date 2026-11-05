@@ -106,6 +106,39 @@ const MODEL_FILES: [(&str, u64, &str); 13] = [
     ),
 ];
 
+/// What a downloaded file is checked against before it takes its final
+/// name: lowercase hex, of the kind its source publishes (Story 3.15).
+///
+/// Everything pinned in code is SHA-256. A user-chosen Piper voice is
+/// checked with whatever its catalog gives — MD5 for `rhasspy/piper-voices`,
+/// the Git blob SHA-1 Hugging Face reports for a small non-LFS file — since
+/// that is the only integrity data there is for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Digest {
+    Sha256(String),
+    Md5(String),
+    /// SHA-1 of `blob <len>\0` followed by the bytes: Git's object id.
+    GitBlobSha1(String),
+}
+
+impl Digest {
+    /// The expected value, lowercase hex.
+    pub fn expected(&self) -> &str {
+        match self {
+            Digest::Sha256(hex) | Digest::Md5(hex) | Digest::GitBlobSha1(hex) => hex,
+        }
+    }
+
+    /// The checksum's name, for messages.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Digest::Sha256(_) => "SHA-256",
+            Digest::Md5(_) => "MD5",
+            Digest::GitBlobSha1(_) => "Git blob SHA-1",
+        }
+    }
+}
+
 /// One file this crate knows how to fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Asset {
@@ -116,8 +149,8 @@ pub struct Asset {
     /// Its exact size — the progress total, and how an early end of the
     /// body is told apart from a finished one.
     pub size: u64,
-    /// Lowercase hex. Nothing takes its final name without matching this.
-    pub sha256: String,
+    /// Nothing takes its final name without matching this.
+    pub digest: Digest,
 }
 
 impl Asset {
@@ -137,14 +170,34 @@ impl Asset {
     }
 }
 
-/// The runtime ships inside an archive; this names the one entry in it
-/// that is the real shared library (the others are symlinks to it,
-/// headers, and a provider bridge the CPU path never loads).
+/// One file taken out of an archive: the entry's path inside it, and the
+/// file name it takes in the directory it is extracted into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryEntry {
+    pub entry: String,
+    pub file_name: String,
+}
+
+impl LibraryEntry {
+    pub fn new(entry: impl Into<String>, file_name: impl Into<String>) -> Self {
+        Self {
+            entry: entry.into(),
+            file_name: file_name.into(),
+        }
+    }
+}
+
+/// An archive and the shared libraries taken out of it — nothing else in
+/// it (headers, import libraries, licences, symlinks) is ever extracted.
+///
+/// The ONNX Runtime archives (Microsoft's CPU one, voice-me's own core and
+/// CUDA provider archives, Story 3.8) and NVIDIA's wheels, which are zip
+/// files, all have this shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeArchive {
     pub archive: Asset,
-    /// The entry's path inside the archive.
-    pub library_entry: String,
+    /// Every library to extract, in order.
+    pub library_entries: Vec<LibraryEntry>,
 }
 
 /// One file still to fetch, and where it goes.
@@ -159,10 +212,36 @@ pub struct PlannedDownload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sources {
     pub model_files: Vec<Asset>,
-    /// `None` where no runtime can be installed automatically — every
-    /// target but Linux x64 and Windows x64 (Decision 1, extended by
-    /// spec 3-2 for Windows).
+    /// The core runtime, extracted into `<cache>/runtime/`. `None` where
+    /// no runtime can be installed automatically — every target but Linux
+    /// x64 and Windows x64 (Decision 1, extended by spec 3-2 for Windows).
     pub runtime: Option<RuntimeArchive>,
+    /// Story 3.8: whether [`Self::runtime`] is voice-me's own build, with
+    /// the WebGPU and CUDA execution providers in it, rather than
+    /// Microsoft's CPU-only one. Until the release is pinned it is the
+    /// latter, and a GPU backend's runtime row stays manual (decision 7).
+    pub runtime_all_providers: bool,
+    /// Story 3.8: the CUDA execution provider that goes with the core
+    /// runtime, extracted beside it. Fetched only for a CUDA backend.
+    /// `None` until the release is pinned.
+    pub cuda_runtime: Option<RuntimeArchive>,
+    /// Story 3.8: NVIDIA's own wheels (cudart, cuBLAS, cuFFT, cuDNN) from
+    /// PyPI, whose shared libraries are extracted into
+    /// `<cache>/runtime/cuda/`. Fetched only for a CUDA backend. Empty
+    /// until every one of them is pinned.
+    pub nvidia_wheels: Vec<RuntimeArchive>,
+    /// Story 3.16: eSpeak NG's official `espeak-ng.msi`, which Install on
+    /// the eSpeak NG row unpacks into the cache. `None` where eSpeak NG is
+    /// not installed automatically — every target but Windows x64.
+    pub espeak: Option<Asset>,
+    /// Story 2.8: VB-Audio's VB-CABLE driver pack, whose setup Install on
+    /// the Virtual Microphone row runs. `Some` on Windows only; elsewhere
+    /// the row installs without downloading anything.
+    pub virtual_mic: Option<Asset>,
+    /// The Turkish G2P model (DizgeBERT) Piper voices with
+    /// `phoneme_type` `"dizge"` are phonemized through: its graph and its `vocab.json`, which Install on
+    /// the Turkish G2P row fetches. Empty where it is not pinned.
+    pub turkish_g2p: Vec<Asset>,
 }
 
 impl Default for Sources {
@@ -180,13 +259,29 @@ impl Sources {
                 relative_path: (*relative_path).to_string(),
                 url: format!("{MODEL_REPO_URL}/{MODEL_REVISION}/{relative_path}"),
                 size: *size,
-                sha256: (*sha256).to_string(),
+                digest: Digest::Sha256((*sha256).to_string()),
             })
             .collect();
+        let (runtime, runtime_all_providers) = match voiceme_runtime() {
+            Some(core) => (Some(core), true),
+            None => (microsoft_runtime(), false),
+        };
         Self {
             model_files,
-            runtime: pinned_runtime(),
+            runtime,
+            runtime_all_providers,
+            cuda_runtime: voiceme_cuda_runtime(),
+            nvidia_wheels: pinned_nvidia_wheels(),
+            espeak: pinned_espeak(),
+            virtual_mic: pinned_virtual_mic(),
+            turkish_g2p: turkish_g2p_files(),
         }
+    }
+
+    /// Whether a CUDA backend's runtime pieces — the CUDA provider and the
+    /// NVIDIA libraries — can be installed with one click.
+    pub fn cuda_installable(&self) -> bool {
+        self.runtime_all_providers && self.cuda_runtime.is_some() && !self.nvidia_wheels.is_empty()
     }
 
     /// The model files `weights` needs under `root` that are not there
@@ -225,8 +320,10 @@ impl Sources {
     }
 }
 
+/// Microsoft's CPU-only archive: the runtime until voice-me's own build is
+/// pinned (decision 7).
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn pinned_runtime() -> Option<RuntimeArchive> {
+fn microsoft_runtime() -> Option<RuntimeArchive> {
     Some(RuntimeArchive {
         archive: Asset {
             relative_path: format!(
@@ -239,16 +336,21 @@ fn pinned_runtime() -> Option<RuntimeArchive> {
             size: 9_128_991,
             // GitHub's own digest for the release asset, and the hash of
             // the copy this spec was written against.
-            sha256: "d7209b8751b27b862b0c76332c2e20e203396edb5dab700ecf4bb485cf147415".to_string(),
+            digest: Digest::Sha256(
+                "d7209b8751b27b862b0c76332c2e20e203396edb5dab700ecf4bb485cf147415".to_string(),
+            ),
         },
-        library_entry: format!(
-            "onnxruntime-linux-x64-{RUNTIME_VERSION}/lib/libonnxruntime.so.{RUNTIME_VERSION}"
-        ),
+        library_entries: vec![LibraryEntry::new(
+            format!(
+                "onnxruntime-linux-x64-{RUNTIME_VERSION}/lib/libonnxruntime.so.{RUNTIME_VERSION}"
+            ),
+            assets::runtime_dylib_file_name(),
+        )],
     })
 }
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-fn pinned_runtime() -> Option<RuntimeArchive> {
+fn microsoft_runtime() -> Option<RuntimeArchive> {
     Some(RuntimeArchive {
         archive: Asset {
             relative_path: format!(
@@ -261,9 +363,14 @@ fn pinned_runtime() -> Option<RuntimeArchive> {
             size: 78_620_837,
             // GitHub's own digest for the release asset (the same API
             // returns the Linux pin above).
-            sha256: "c4eedd29489d5feca21866d054638416f3655bf6b18851b3b6b85c8313e95c35".to_string(),
+            digest: Digest::Sha256(
+                "c4eedd29489d5feca21866d054638416f3655bf6b18851b3b6b85c8313e95c35".to_string(),
+            ),
         },
-        library_entry: format!("onnxruntime-win-x64-{RUNTIME_VERSION}/lib/onnxruntime.dll"),
+        library_entries: vec![LibraryEntry::new(
+            format!("onnxruntime-win-x64-{RUNTIME_VERSION}/lib/onnxruntime.dll"),
+            assets::runtime_dylib_file_name(),
+        )],
     })
 }
 
@@ -271,13 +378,472 @@ fn pinned_runtime() -> Option<RuntimeArchive> {
     all(target_os = "linux", target_arch = "x86_64"),
     all(target_os = "windows", target_arch = "x86_64")
 )))]
-fn pinned_runtime() -> Option<RuntimeArchive> {
+fn microsoft_runtime() -> Option<RuntimeArchive> {
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Story 3.8: voice-me's own ONNX Runtime, and NVIDIA's libraries for CUDA.
+//
+// Everything below is data. Pinning a published release is filling in the
+// `pin` fields (from the release's `SHA256SUMS.txt` and `SIZES.txt`) and,
+// if the workflow's `*-contents.txt` lists more shared libraries in an
+// archive than the table below does (Dawn, `dxil.dll`, `dxcompiler.dll`),
+// adding them to its `libraries`. Until a pin is there, `Sources::pinned`
+// keeps Microsoft's CPU archive and the GPU rows stay manual (decision 7).
+// ---------------------------------------------------------------------------
+
+/// The GitHub Release voice-me's ONNX Runtime build is mirrored on
+/// (decision 6): built by `.github/workflows/onnxruntime.yml`, never
+/// replaced under the same tag.
+pub const VOICEME_RUNTIME_TAG: &str = "onnxruntime-1.28.2-voiceme.1";
+
+/// This repository's release downloads.
+const VOICEME_RELEASES_URL: &str = "https://github.com/ErdemGKSL/voice-me/releases/download";
+
+/// A published file's exact size and SHA-256 (lowercase hex).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pin {
+    pub size: u64,
+    pub sha256: &'static str,
+}
+
+/// One archive of the voice-me release, as the workflow's Package step
+/// names it: `<dir>.tgz` on Linux, `<dir>.zip` on Windows, holding
+/// `<dir>/lib/<library>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseArchive {
+    /// The archive's top-level directory, which is also its file name
+    /// without the extension.
+    pub dir: &'static str,
+    /// `tgz` or `zip`.
+    pub extension: &'static str,
+    /// `None` until the release is published and pinned.
+    pub pin: Option<Pin>,
+    /// The shared libraries under `<dir>/lib/`, extracted under the same
+    /// name — except the core library on Linux, whose versioned file
+    /// (`libonnxruntime.so.<version>`) becomes `libonnxruntime.so`.
+    pub libraries: &'static [(&'static str, &'static str)],
+}
+
+impl ReleaseArchive {
+    pub fn file_name(&self) -> String {
+        format!("{}.{}", self.dir, self.extension)
+    }
+
+    /// The archive as a source, when it is pinned: its release URL, and
+    /// where it is downloaded to (`<cache>/runtime/<file name>`).
+    pub fn source(&self) -> Option<RuntimeArchive> {
+        let pin = self.pin?;
+        let file_name = self.file_name();
+        Some(RuntimeArchive {
+            archive: Asset {
+                relative_path: format!("{}/{file_name}", assets::RUNTIME_DIR),
+                url: format!("{VOICEME_RELEASES_URL}/{VOICEME_RUNTIME_TAG}/{file_name}"),
+                size: pin.size,
+                digest: Digest::Sha256(pin.sha256.to_string()),
+            },
+            library_entries: self
+                .libraries
+                .iter()
+                .map(|(entry, file_name)| {
+                    LibraryEntry::new(format!("{}/lib/{entry}", self.dir), *file_name)
+                })
+                .collect(),
+        })
+    }
+}
+
+/// Linux x64 core: `onnxruntime` (CPU and WebGPU) and the provider bridge.
+pub const VOICEME_LINUX_CORE: ReleaseArchive = ReleaseArchive {
+    dir: "onnxruntime-voiceme-linux-x64-1.28.2",
+    extension: "tgz",
+    pin: Some(Pin {
+        size: 14_704_763,
+        sha256: "95578240ef4a11b15aaaaa491a357b329549e05000a5dd105d41d602cb3c4590",
+    }),
+    libraries: &[
+        ("libonnxruntime.so.1.28.2", "libonnxruntime.so"),
+        (
+            "libonnxruntime_providers_shared.so",
+            "libonnxruntime_providers_shared.so",
+        ),
+    ],
+};
+
+/// Linux x64 CUDA provider.
+pub const VOICEME_LINUX_CUDA: ReleaseArchive = ReleaseArchive {
+    dir: "onnxruntime-voiceme-linux-x64-cuda12-1.28.2",
+    extension: "tgz",
+    pin: Some(Pin {
+        size: 160_115_833,
+        sha256: "75c2930fba866d8996a5a1925beee3fd5136c13a5ac43dad16101735c1b9e8b3",
+    }),
+    libraries: &[(
+        "libonnxruntime_providers_cuda.so",
+        "libonnxruntime_providers_cuda.so",
+    )],
+};
+
+/// Windows x64 core.
+pub const VOICEME_WINDOWS_CORE: ReleaseArchive = ReleaseArchive {
+    dir: "onnxruntime-voiceme-win-x64-1.28.2",
+    extension: "zip",
+    pin: Some(Pin {
+        size: 16_744_869,
+        sha256: "1f35b9125bfa2d612ac1c35812554db123df03fe968ec5e45a70ee4d3bb7dab6",
+    }),
+    libraries: &[
+        ("onnxruntime.dll", "onnxruntime.dll"),
+        (
+            "onnxruntime_providers_shared.dll",
+            "onnxruntime_providers_shared.dll",
+        ),
+        // Dawn's shader compiler for WebGPU on Direct3D 12; Dawn itself is
+        // linked into onnxruntime.dll.
+        ("dxil.dll", "dxil.dll"),
+        ("dxcompiler.dll", "dxcompiler.dll"),
+    ],
+};
+
+/// Windows x64 CUDA provider.
+pub const VOICEME_WINDOWS_CUDA: ReleaseArchive = ReleaseArchive {
+    dir: "onnxruntime-voiceme-win-x64-cuda12-1.28.2",
+    extension: "zip",
+    pin: Some(Pin {
+        size: 154_285_811,
+        sha256: "b4a9b477cb5b5941859db2d7533b5b4497efac7d9cf6ec6c7dad72abae3d50ef",
+    }),
+    libraries: &[(
+        "onnxruntime_providers_cuda.dll",
+        "onnxruntime_providers_cuda.dll",
+    )],
+};
+
+/// This target's `(core, CUDA provider)` archives, if it has any.
+pub fn voiceme_release_archives() -> Option<(ReleaseArchive, ReleaseArchive)> {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some((VOICEME_LINUX_CORE, VOICEME_LINUX_CUDA))
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Some((VOICEME_WINDOWS_CORE, VOICEME_WINDOWS_CUDA))
+    } else {
+        None
+    }
+}
+
+/// The core runtime from voice-me's release, once pinned.
+fn voiceme_runtime() -> Option<RuntimeArchive> {
+    voiceme_release_archives()?.0.source()
+}
+
+/// The CUDA provider from voice-me's release, once pinned — and only with
+/// the core it was built with.
+fn voiceme_cuda_runtime() -> Option<RuntimeArchive> {
+    let (core, cuda) = voiceme_release_archives()?;
+    core.source()?;
+    cuda.source()
+}
+
+/// Where a wheel is published on PyPI: its `files.pythonhosted.org` URL,
+/// size and SHA-256 (PyPI's own digest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WheelPin {
+    pub url: &'static str,
+    pub size: u64,
+    pub sha256: &'static str,
+}
+
+/// One NVIDIA wheel (decision 3). Only the shared libraries in `members`
+/// are extracted, each into `<cache>/runtime/cuda/` under its own file
+/// name. The member paths are the wheels' real layout (read from the
+/// published wheels of the versions below).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NvidiaWheel {
+    /// The PyPI project.
+    pub package: &'static str,
+    pub version: &'static str,
+    /// `None` until pinned, together with the voice-me release.
+    pub pin: Option<WheelPin>,
+    pub members: &'static [&'static str],
+}
+
+impl NvidiaWheel {
+    /// The wheel as a source, when it is pinned. It is downloaded to
+    /// `<cache>/runtime/cuda/<package>-<version>.whl`.
+    pub fn source(&self) -> Option<RuntimeArchive> {
+        let pin = self.pin?;
+        Some(RuntimeArchive {
+            archive: Asset {
+                relative_path: format!(
+                    "{}/{}/{}-{}.whl",
+                    assets::RUNTIME_DIR,
+                    assets::CUDA_LIBRARIES_DIR,
+                    self.package,
+                    self.version
+                ),
+                url: pin.url.to_string(),
+                size: pin.size,
+                digest: Digest::Sha256(pin.sha256.to_string()),
+            },
+            library_entries: self
+                .members
+                .iter()
+                .map(|member| {
+                    let file_name = member.rsplit('/').next().unwrap_or(member);
+                    LibraryEntry::new(*member, file_name)
+                })
+                .collect(),
+        })
+    }
+}
+
+/// CUDA 12.8 (decision 5) and cuDNN 9.8, the versions the workflow builds
+/// against. Linux x64 (`manylinux` wheels).
+pub const NVIDIA_WHEELS_LINUX: [NvidiaWheel; 4] = [
+    NvidiaWheel {
+        package: "nvidia-cuda-runtime-cu12",
+        version: "12.8.90",
+        pin: Some(WheelPin {
+            url: "https://files.pythonhosted.org/packages/0d/9b/a997b638fcd068ad6e4d53b8551a7d30fe8b404d6f1804abf1df69838932/nvidia_cuda_runtime_cu12-12.8.90-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+            size: 954_765,
+            sha256: "adade8dcbd0edf427b7204d480d6066d33902cab2a4707dcfc48a2d0fd44ab90",
+        }),
+        members: &["nvidia/cuda_runtime/lib/libcudart.so.12"],
+    },
+    NvidiaWheel {
+        package: "nvidia-cublas-cu12",
+        version: "12.8.4.1",
+        pin: Some(WheelPin {
+            url: "https://files.pythonhosted.org/packages/dc/61/e24b560ab2e2eaeb3c839129175fb330dfcfc29e5203196e5541a4c44682/nvidia_cublas_cu12-12.8.4.1-py3-none-manylinux_2_27_x86_64.whl",
+            size: 594_346_921,
+            sha256: "8ac4e771d5a348c551b2a426eda6193c19aa630236b418086020df5ba9667142",
+        }),
+        members: &[
+            "nvidia/cublas/lib/libcublasLt.so.12",
+            "nvidia/cublas/lib/libcublas.so.12",
+        ],
+    },
+    NvidiaWheel {
+        package: "nvidia-cufft-cu12",
+        version: "11.3.3.83",
+        pin: Some(WheelPin {
+            url: "https://files.pythonhosted.org/packages/1f/13/ee4e00f30e676b66ae65b4f08cb5bcbb8392c03f54f2d5413ea99a5d1c80/nvidia_cufft_cu12-11.3.3.83-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+            size: 193_118_695,
+            sha256: "4d2dd21ec0b88cf61b62e6b43564355e5222e4a3fb394cac0db101f2dd0d4f74",
+        }),
+        members: &["nvidia/cufft/lib/libcufft.so.11"],
+    },
+    NvidiaWheel {
+        package: "nvidia-cudnn-cu12",
+        version: "9.8.0.87",
+        pin: Some(WheelPin {
+            url: "https://files.pythonhosted.org/packages/77/f0/8236c886a061d203e51247aec2b8e3a8f5350178251ab57237daf2140680/nvidia_cudnn_cu12-9.8.0.87-py3-none-manylinux_2_27_x86_64.whl",
+            size: 697_999_707,
+            sha256: "d6b02cd0e3e24aa31d0193a8c39fec239354360d7d81055edddb69f35d53a4c8",
+        }),
+        members: &[
+            "nvidia/cudnn/lib/libcudnn_graph.so.9",
+            "nvidia/cudnn/lib/libcudnn_engines_precompiled.so.9",
+            "nvidia/cudnn/lib/libcudnn_engines_runtime_compiled.so.9",
+            "nvidia/cudnn/lib/libcudnn_heuristic.so.9",
+            "nvidia/cudnn/lib/libcudnn_ops.so.9",
+            "nvidia/cudnn/lib/libcudnn_cnn.so.9",
+            "nvidia/cudnn/lib/libcudnn_adv.so.9",
+            "nvidia/cudnn/lib/libcudnn.so.9",
+        ],
+    },
+];
+
+/// The same wheels for Windows x64 (`win_amd64`).
+pub const NVIDIA_WHEELS_WINDOWS: [NvidiaWheel; 4] = [
+    NvidiaWheel {
+        package: "nvidia-cuda-runtime-cu12",
+        version: "12.8.90",
+        pin: Some(WheelPin {
+            url: "https://files.pythonhosted.org/packages/30/a5/a515b7600ad361ea14bfa13fb4d6687abf500adc270f19e89849c0590492/nvidia_cuda_runtime_cu12-12.8.90-py3-none-win_amd64.whl",
+            size: 944_318,
+            sha256: "c0c6027f01505bfed6c3b21ec546f69c687689aad5f1a377554bc6ca4aa993a8",
+        }),
+        members: &["nvidia/cuda_runtime/bin/cudart64_12.dll"],
+    },
+    NvidiaWheel {
+        package: "nvidia-cublas-cu12",
+        version: "12.8.4.1",
+        pin: Some(WheelPin {
+            url: "https://files.pythonhosted.org/packages/70/61/7d7b3c70186fb651d0fbd35b01dbfc8e755f69fd58f817f3d0f642df20c3/nvidia_cublas_cu12-12.8.4.1-py3-none-win_amd64.whl",
+            size: 567_544_208,
+            sha256: "47e9b82132fa8d2b4944e708049229601448aaad7e6f296f630f2d1a32de35af",
+        }),
+        members: &[
+            "nvidia/cublas/bin/cublasLt64_12.dll",
+            "nvidia/cublas/bin/cublas64_12.dll",
+        ],
+    },
+    NvidiaWheel {
+        package: "nvidia-cufft-cu12",
+        version: "11.3.3.83",
+        pin: Some(WheelPin {
+            url: "https://files.pythonhosted.org/packages/7d/ec/ce1629f1e478bb5ccd208986b5f9e0316a78538dd6ab1d0484f012f8e2a1/nvidia_cufft_cu12-11.3.3.83-py3-none-win_amd64.whl",
+            size: 192_216_559,
+            sha256: "7a64a98ef2a7c47f905aaf8931b69a3a43f27c55530c698bb2ed7c75c0b42cb7",
+        }),
+        members: &["nvidia/cufft/bin/cufft64_11.dll"],
+    },
+    NvidiaWheel {
+        package: "nvidia-cudnn-cu12",
+        version: "9.8.0.87",
+        pin: Some(WheelPin {
+            url: "https://files.pythonhosted.org/packages/39/6a/5e9910b2b2c9dcddee9aaef372b3db0f08b9f7eaf1d462f859461a79caf9/nvidia_cudnn_cu12-9.8.0.87-py3-none-win_amd64.whl",
+            size: 684_630_375,
+            sha256: "b4b5cfddc32aa4180f9d390ee99e9a9f55a89e7087329b41aba4319327e22466",
+        }),
+        members: &[
+            "nvidia/cudnn/bin/cudnn_graph64_9.dll",
+            "nvidia/cudnn/bin/cudnn_engines_precompiled64_9.dll",
+            "nvidia/cudnn/bin/cudnn_engines_runtime_compiled64_9.dll",
+            "nvidia/cudnn/bin/cudnn_heuristic64_9.dll",
+            "nvidia/cudnn/bin/cudnn_ops64_9.dll",
+            "nvidia/cudnn/bin/cudnn_cnn64_9.dll",
+            "nvidia/cudnn/bin/cudnn_adv64_9.dll",
+            "nvidia/cudnn/bin/cudnn64_9.dll",
+        ],
+    },
+];
+
+/// This target's NVIDIA wheels, if it has any.
+pub fn nvidia_wheels() -> Option<&'static [NvidiaWheel]> {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        Some(&NVIDIA_WHEELS_LINUX)
+    } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+        Some(&NVIDIA_WHEELS_WINDOWS)
+    } else {
+        None
+    }
+}
+
+/// Every wheel as a source — or none at all while any one is unpinned: a
+/// CUDA install that fetched three of four would still not run.
+fn pinned_nvidia_wheels() -> Vec<RuntimeArchive> {
+    nvidia_wheels()
+        .and_then(|wheels| wheels.iter().map(NvidiaWheel::source).collect())
+        .unwrap_or_default()
+}
+
+/// The eSpeak NG release Windows' Install fetches (Story 3.16).
+pub const ESPEAK_VERSION: &str = "1.52.0";
+
+/// eSpeak NG's own release asset, pinned by URL, size and SHA-256.
+/// Whatever the target, so the pin itself is testable anywhere.
+pub fn espeak_msi() -> Asset {
+    Asset {
+        relative_path: "espeak-ng.msi".to_string(),
+        url: format!(
+            "https://github.com/espeak-ng/espeak-ng/releases/download/{ESPEAK_VERSION}/espeak-ng.msi"
+        ),
+        size: 12_765_862,
+        digest: Digest::Sha256(
+            "7f673c709ea5dd579d3b5ebb98688cc575328a6ab7438d2bc405b88cedaeafb9".to_string(),
+        ),
+    }
+}
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn pinned_espeak() -> Option<Asset> {
+    Some(espeak_msi())
+}
+
+#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+fn pinned_espeak() -> Option<Asset> {
+    None
+}
+
+/// Where the Turkish G2P model is served from: this repository's own copy
+/// of `iatagun/dizge-g2p` (MIT) exported to ONNX, beside the Piper voice
+/// catalog, fetched straight from `main` like the Erdem voice. The pinned
+/// size and SHA-256 are what make it safe: a file replaced under the same
+/// path fails its check instead of being used.
+pub const TURKISH_G2P_URL: &str =
+    "https://raw.githubusercontent.com/ErdemGKSL/voice-me/main/piper-voices/g2p/tr-dizge";
+
+/// The Turkish G2P model's files, pinned by URL, size and SHA-256.
+pub fn turkish_g2p_files() -> Vec<Asset> {
+    [
+        (
+            assets::TURKISH_G2P_MODEL_FILE,
+            87_999_901,
+            "2b1b0bacad11be62c04248799aa91a07cae4161129a0b51eed46cda566656343",
+        ),
+        (
+            assets::TURKISH_G2P_VOCAB_FILE,
+            1_314,
+            "42a9d200d3683c32abef623fc7215d1acbc3a4b0d7dfbfa64433418d274b8a4c",
+        ),
+    ]
+    .into_iter()
+    .map(|(file, size, sha256)| Asset {
+        relative_path: format!("{}/{file}", assets::TURKISH_G2P_DIR),
+        url: format!("{TURKISH_G2P_URL}/{file}"),
+        size,
+        digest: Digest::Sha256(sha256.to_string()),
+    })
+    .collect()
+}
+
+/// Where the VB-CABLE pack lands under the cache root, and the directory
+/// it is unpacked into.
+pub const VB_CABLE_DIR: &str = "vb-cable";
+
+/// VB-Audio's official VB-CABLE driver pack (donationware,
+/// www.vb-cable.com). Downloaded from VB-Audio itself and never bundled in
+/// voice-me's own package or release assets: VB's licence forbids
+/// embedding it in another installer, so voice-me only fetches it and runs
+/// VB's own setup, which the user confirms.
+pub fn vb_cable_pack() -> Asset {
+    Asset {
+        relative_path: format!("{VB_CABLE_DIR}/VBCABLE_Driver_Pack45.zip"),
+        url: "https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack45.zip".to_string(),
+        size: 1_318_877,
+        digest: Digest::Sha256(
+            "b950e39f01af1d04ea623c8f6d8eb9b6ea5c477c637295fabf20631c85116bfb".to_string(),
+        ),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn pinned_virtual_mic() -> Option<Asset> {
+    Some(vb_cable_pack())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn pinned_virtual_mic() -> Option<Asset> {
     None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Story 3.16: the one eSpeak NG download is the official 1.52.0 MSI,
+    /// fully pinned, and only Windows x64 installs it.
+    #[test]
+    fn espeak_ng_is_pinned_to_its_official_msi_on_windows_x64_only() {
+        let msi = espeak_msi();
+        assert_eq!(
+            msi.url,
+            "https://github.com/espeak-ng/espeak-ng/releases/download/1.52.0/espeak-ng.msi"
+        );
+        assert_eq!(msi.size, 12_765_862);
+        assert_eq!(
+            msi.digest,
+            Digest::Sha256(
+                "7f673c709ea5dd579d3b5ebb98688cc575328a6ab7438d2bc405b88cedaeafb9".to_string()
+            )
+        );
+        assert_eq!(
+            Sources::pinned().espeak.is_some(),
+            cfg!(all(target_os = "windows", target_arch = "x86_64"))
+        );
+    }
 
     fn total(plan: &[PlannedDownload]) -> u64 {
         plan.iter().map(|planned| planned.asset.size).sum()
@@ -299,7 +865,11 @@ mod tests {
         for asset in Sources::pinned().model_files {
             assert!(asset.url.contains(MODEL_REVISION), "{}", asset.url);
             assert!(asset.url.starts_with("https://"), "{}", asset.url);
-            assert_eq!(asset.sha256.len(), 64, "{}", asset.relative_path);
+            assert!(
+                matches!(&asset.digest, Digest::Sha256(hex) if hex.len() == 64),
+                "{}",
+                asset.relative_path
+            );
         }
     }
 
@@ -347,11 +917,38 @@ mod tests {
         );
         assert!(runtime.archive.url.starts_with("https://"));
         assert!(runtime.archive.url.contains(RUNTIME_VERSION));
-        assert_eq!(runtime.archive.sha256.len(), 64);
+        assert!(matches!(&runtime.archive.digest, Digest::Sha256(hex) if hex.len() == 64));
+        if !Sources::pinned().runtime_all_providers {
+            assert_eq!(runtime.library_entries.len(), 1);
+        }
         assert!(
-            runtime.library_entry.ends_with("/lib/onnxruntime.dll"),
+            runtime.library_entries[0]
+                .entry
+                .ends_with("/lib/onnxruntime.dll"),
+            "{:?}",
+            runtime.library_entries
+        );
+        assert_eq!(runtime.library_entries[0].file_name, "onnxruntime.dll");
+    }
+
+    /// Story 2.8: the VB-CABLE pack is pinned like everything else — an
+    /// HTTPS URL on VB-Audio's own server, an exact size and a full
+    /// SHA-256 — and only Windows downloads it.
+    #[test]
+    fn the_vb_cable_pack_is_pinned_and_windows_only() {
+        let pack = vb_cable_pack();
+        assert!(
+            pack.url
+                .starts_with("https://download.vb-audio.com/Download_CABLE/"),
             "{}",
-            runtime.library_entry
+            pack.url
+        );
+        assert_eq!(pack.file_name(), "VBCABLE_Driver_Pack45.zip");
+        assert_eq!(pack.size, 1_318_877);
+        assert!(matches!(&pack.digest, Digest::Sha256(hex) if hex.len() == 64));
+        assert_eq!(
+            Sources::pinned().virtual_mic.is_some(),
+            cfg!(target_os = "windows")
         );
     }
 
@@ -374,6 +971,181 @@ mod tests {
                 .map(|planned| planned.destination.clone())
                 .collect::<Vec<_>>(),
             required[7..].to_vec()
+        );
+    }
+
+    /// Story 3.8: the release tables name exactly what the workflow's
+    /// Package steps produce, for the runtime version this crate pins.
+    #[test]
+    fn the_voiceme_release_tables_match_the_workflows_archives() {
+        assert!(
+            VOICEME_RUNTIME_TAG.starts_with(&format!("onnxruntime-{RUNTIME_VERSION}-voiceme."))
+        );
+        let archives = [
+            (
+                VOICEME_LINUX_CORE,
+                "onnxruntime-voiceme-linux-x64-1.28.2.tgz",
+            ),
+            (
+                VOICEME_LINUX_CUDA,
+                "onnxruntime-voiceme-linux-x64-cuda12-1.28.2.tgz",
+            ),
+            (
+                VOICEME_WINDOWS_CORE,
+                "onnxruntime-voiceme-win-x64-1.28.2.zip",
+            ),
+            (
+                VOICEME_WINDOWS_CUDA,
+                "onnxruntime-voiceme-win-x64-cuda12-1.28.2.zip",
+            ),
+        ];
+        for (archive, file_name) in archives {
+            assert_eq!(archive.file_name(), file_name);
+            assert!(archive.dir.ends_with(RUNTIME_VERSION), "{}", archive.dir);
+            if let Some(pin) = archive.pin {
+                assert!(pin.sha256.len() == 64 && pin.size > 0, "{file_name}");
+            }
+        }
+        // The core carries the runtime and the provider bridge; the CUDA
+        // archive only its provider.
+        assert_eq!(
+            VOICEME_LINUX_CORE.libraries[0],
+            ("libonnxruntime.so.1.28.2", "libonnxruntime.so")
+        );
+        assert!(VOICEME_WINDOWS_CORE.libraries.contains(&(
+            "onnxruntime_providers_shared.dll",
+            "onnxruntime_providers_shared.dll"
+        )));
+        assert_eq!(VOICEME_LINUX_CUDA.libraries.len(), 1);
+        assert_eq!(VOICEME_WINDOWS_CUDA.libraries.len(), 1);
+    }
+
+    /// Pinning is data: a pin turns an archive into a release source at the
+    /// tag's URL, with every library taken from `<dir>/lib/`.
+    #[test]
+    fn a_pinned_release_archive_is_a_source_at_the_release_tag() {
+        assert_eq!(
+            VOICEME_LINUX_CORE.pin.map(|_| ()),
+            VOICEME_LINUX_CORE.source().map(|_| ())
+        );
+        let pinned = ReleaseArchive {
+            pin: Some(Pin {
+                size: 42,
+                sha256: "ab",
+            }),
+            ..VOICEME_LINUX_CORE
+        };
+
+        let source = pinned.source().unwrap();
+
+        assert_eq!(
+            source.archive.url,
+            "https://github.com/ErdemGKSL/voice-me/releases/download/\
+             onnxruntime-1.28.2-voiceme.1/onnxruntime-voiceme-linux-x64-1.28.2.tgz"
+        );
+        assert_eq!(
+            source.archive.relative_path,
+            "runtime/onnxruntime-voiceme-linux-x64-1.28.2.tgz"
+        );
+        assert_eq!(source.archive.size, 42);
+        assert_eq!(
+            source.library_entries,
+            vec![
+                LibraryEntry::new(
+                    "onnxruntime-voiceme-linux-x64-1.28.2/lib/libonnxruntime.so.1.28.2",
+                    "libonnxruntime.so"
+                ),
+                LibraryEntry::new(
+                    "onnxruntime-voiceme-linux-x64-1.28.2/lib/libonnxruntime_providers_shared.so",
+                    "libonnxruntime_providers_shared.so"
+                ),
+            ]
+        );
+    }
+
+    /// A pinned wheel lands in `runtime/cuda/`, and only its shared
+    /// libraries come out, each under its own file name.
+    #[test]
+    fn a_pinned_wheel_extracts_its_libraries_into_runtime_cuda() {
+        let wheel = NvidiaWheel {
+            pin: Some(WheelPin {
+                url: "https://files.pythonhosted.org/x.whl",
+                size: 7,
+                sha256: "cd",
+            }),
+            ..NVIDIA_WHEELS_LINUX[3]
+        };
+
+        let source = wheel.source().unwrap();
+
+        assert_eq!(
+            source.archive.relative_path,
+            "runtime/cuda/nvidia-cudnn-cu12-9.8.0.87.whl"
+        );
+        assert!(source.library_entries.contains(&LibraryEntry::new(
+            "nvidia/cudnn/lib/libcudnn.so.9",
+            "libcudnn.so.9"
+        )));
+        for wheels in [&NVIDIA_WHEELS_LINUX, &NVIDIA_WHEELS_WINDOWS] {
+            let packages: Vec<_> = wheels.iter().map(|wheel| wheel.package).collect();
+            assert_eq!(
+                packages,
+                [
+                    "nvidia-cuda-runtime-cu12",
+                    "nvidia-cublas-cu12",
+                    "nvidia-cufft-cu12",
+                    "nvidia-cudnn-cu12"
+                ]
+            );
+            for wheel in wheels {
+                assert!(
+                    wheel
+                        .members
+                        .iter()
+                        .all(|member| member.starts_with("nvidia/")
+                            && (member.ends_with(".dll") || member.contains(".so."))),
+                    "{wheel:?}"
+                );
+            }
+        }
+    }
+
+    /// Decision 7: until voice-me's release is pinned, the runtime is
+    /// Microsoft's CPU archive and nothing CUDA can be installed. Once
+    /// pinned, the core replaces it for everyone.
+    #[test]
+    fn the_default_runtime_follows_whether_the_release_is_pinned() {
+        let sources = Sources::pinned();
+        let Some((core, cuda)) = voiceme_release_archives() else {
+            assert!(!sources.runtime_all_providers);
+            assert!(!sources.cuda_installable());
+            return;
+        };
+        assert_eq!(sources.runtime_all_providers, core.pin.is_some());
+        let runtime = sources
+            .runtime
+            .clone()
+            .expect("this target installs a runtime");
+        if core.pin.is_some() {
+            assert_eq!(runtime.archive.url, core.source().unwrap().archive.url);
+        } else {
+            assert!(
+                runtime
+                    .archive
+                    .url
+                    .starts_with("https://github.com/microsoft/onnxruntime/"),
+                "{}",
+                runtime.archive.url
+            );
+            assert!(sources.cuda_runtime.is_none());
+        }
+        let wheels_pinned = nvidia_wheels()
+            .unwrap()
+            .iter()
+            .all(|wheel| wheel.pin.is_some());
+        assert_eq!(
+            sources.cuda_installable(),
+            core.pin.is_some() && cuda.pin.is_some() && wheels_pinned
         );
     }
 }

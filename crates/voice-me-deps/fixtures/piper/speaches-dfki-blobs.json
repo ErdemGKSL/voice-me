@@ -1,0 +1,66 @@
+{
+    "_id": "67dba5282a8359ac1f80f5a0",
+    "id": "speaches-ai/piper-tr_TR-dfki-medium",
+    "private": false,
+    "pipeline_tag": "text-to-speech",
+    "library_name": "piper",
+    "tags": [
+        "piper",
+        "onnx",
+        "speaches",
+        "text-to-speech",
+        "tr",
+        "region:us"
+    ],
+    "downloads": 31,
+    "likes": 0,
+    "modelId": "speaches-ai/piper-tr_TR-dfki-medium",
+    "author": "speaches-ai",
+    "sha": "f7b897c16fc09f627b14b40b492a5d70a1dc455a",
+    "lastModified": "2025-03-20T05:18:36.000Z",
+    "gated": false,
+    "disabled": false,
+    "model-index": null,
+    "config": {},
+    "cardData": {
+        "language": "tr",
+        "pipeline_tag": "text-to-speech",
+        "tags": [
+            "speaches",
+            "piper"
+        ],
+        "library": "onnx"
+    },
+    "siblings": [
+        {
+            "rfilename": ".gitattributes",
+            "blobId": "a6344aac8c09253b3b630fb776ae94478aa0275b",
+            "size": 1519
+        },
+        {
+            "rfilename": "README.md",
+            "blobId": "dd702fac90bb726fdd4c7191b7374b100fade7e1",
+            "size": 162
+        },
+        {
+            "rfilename": "config.json",
+            "blobId": "ea4036df5c9e4e07b8c2f42acce4d77d0fb6afdc",
+            "size": 4960
+        },
+        {
+            "rfilename": "model.onnx",
+            "blobId": "4b74e9c8975c0ab1bfd8ebf78643c02b662e94e9",
+            "size": 63201294,
+            "lfs": {
+                "sha256": "2844717f524ab965d3fe86e60562cbb601d3e456836efcc2196cc3a14112a8fb",
+                "size": 63201294,
+                "pointerSize": 133
+            }
+        }
+    ],
+    "spaces": [
+        "matroks/dilay-reji"
+    ],
+    "createdAt": "2025-03-20T05:18:32.000Z",
+    "usedStorage": 63201294
+}

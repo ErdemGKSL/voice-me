@@ -5,6 +5,21 @@ use serde::{Deserialize, Serialize};
 /// The interface language when nothing has been saved yet.
 pub const DEFAULT_UI_LANGUAGE: &str = "en";
 
+/// The Prompt Overlay's default vertical position, in percent of the free
+/// vertical space: centred in the free area of the primary display's visible
+/// area (taskbar and panels excluded).
+pub const DEFAULT_OVERLAY_POSITION: u8 = 50;
+
+/// The top edge of a window placed `pct` percent of the way down the free
+/// vertical space of a visible area: `0` puts the window's top on the
+/// area's top, `100` its bottom on the area's bottom, `50` centres it.
+/// `pct` above 100 counts as 100. A window taller than the area gets the
+/// area's top, never a position above it.
+pub fn overlay_origin_y(visible_top: f32, visible_height: f32, window_height: f32, pct: u8) -> f32 {
+    let free = (visible_height - window_height).max(0.0);
+    visible_top + free * f32::from(pct.min(100)) / 100.0
+}
+
 /// The language generated speech is produced in when nothing has been saved
 /// yet (spec-2-6 Decision 2).
 ///
@@ -17,6 +32,10 @@ pub const DEFAULT_SPEECH_LANGUAGE: &str = "tr";
 /// Azure names its languages by locale, and Turkish is the default here as
 /// everywhere else.
 pub const DEFAULT_AZURE_LOCALE: &str = "tr-TR";
+
+/// Edge TTS's speech language when nothing has been saved yet (Story
+/// 3.17): its voices are named by locale, like Azure's.
+pub const DEFAULT_EDGE_TTS_LOCALE: &str = "tr-TR";
 
 /// Why an Azure region was not saved (Story 3.14).
 pub const AZURE_REGION_INVALID: &str =
@@ -157,6 +176,8 @@ impl SpeechBackend {
 ///
 /// DeepInfra generates since Story 3.6; fal.ai is selectable, and generates
 /// with Story 3.7. Azure (Story 3.14) speaks in a stock Microsoft voice.
+/// Edge TTS (Story 3.17) speaks in the same voices through the separately
+/// installed `edge-tts` program, with no key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RemoteProvider {
@@ -164,14 +185,16 @@ pub enum RemoteProvider {
     DeepInfra,
     FalAi,
     Azure,
+    EdgeTts,
 }
 
 impl RemoteProvider {
     /// Every provider, in the order the UI lists them.
-    pub const ALL: [RemoteProvider; 3] = [
+    pub const ALL: [RemoteProvider; 4] = [
         RemoteProvider::DeepInfra,
         RemoteProvider::FalAi,
         RemoteProvider::Azure,
+        RemoteProvider::EdgeTts,
     ];
 
     /// How the provider is named to the user.
@@ -180,14 +203,23 @@ impl RemoteProvider {
             RemoteProvider::DeepInfra => "DeepInfra",
             RemoteProvider::FalAi => "fal.ai",
             RemoteProvider::Azure => "Azure",
+            RemoteProvider::EdgeTts => "Edge TTS",
         }
+    }
+
+    /// Whether this provider needs the user's API key (Story 3.17): every
+    /// provider but Edge TTS, which runs a program that needs no account.
+    /// Every key check — the capability row, the Backend tab's key field,
+    /// the disclosure's key guard — asks this first.
+    pub fn needs_api_key(self) -> bool {
+        self != RemoteProvider::EdgeTts
     }
 
     /// Whether this provider speaks in a stock voice rather than cloning
     /// the user's (Story 3.14): it never receives the Reference Voice
     /// Sample.
     pub fn is_stock_voice(self) -> bool {
-        self == RemoteProvider::Azure
+        matches!(self, RemoteProvider::Azure | RemoteProvider::EdgeTts)
     }
 }
 
@@ -204,6 +236,9 @@ pub enum LanguageBackend {
     /// set is whatever the engine lists on this machine, so it has no
     /// static table: see [`LanguageBackend::language_options`].
     SystemVoice,
+    /// Piper (Story 3.15): its languages are the locales of the voices
+    /// installed in the cache, so it has no static table either.
+    Piper,
 }
 
 impl LanguageBackend {
@@ -214,6 +249,7 @@ impl LanguageBackend {
             LanguageBackend::Local => "local Chatterbox",
             LanguageBackend::Remote(provider) => provider.label(),
             LanguageBackend::SystemVoice => "System voice",
+            LanguageBackend::Piper => "Piper",
         }
     }
 
@@ -225,18 +261,24 @@ impl LanguageBackend {
         match self {
             LanguageBackend::Local => LOCAL_SPEECH_LANGUAGES,
             LanguageBackend::Remote(RemoteProvider::DeepInfra) => DEEPINFRA_SPEECH_LANGUAGES,
-            LanguageBackend::Remote(RemoteProvider::FalAi | RemoteProvider::Azure)
-            | LanguageBackend::SystemVoice => &[],
+            LanguageBackend::Remote(
+                RemoteProvider::FalAi | RemoteProvider::Azure | RemoteProvider::EdgeTts,
+            )
+            | LanguageBackend::SystemVoice
+            | LanguageBackend::Piper => &[],
         }
     }
 
     /// Whether this backend's languages and voices come from a list read
     /// at run time rather than a static table: the System voice's engine
-    /// (Story 3.12) and Azure's voice list (Story 3.14).
+    /// (Story 3.12), Azure's voice list (Story 3.14), the installed Piper
+    /// voices (Story 3.15) and `edge-tts --list-voices` (Story 3.17).
     pub fn has_voice_list(self) -> bool {
         matches!(
             self,
-            LanguageBackend::SystemVoice | LanguageBackend::Remote(RemoteProvider::Azure)
+            LanguageBackend::SystemVoice
+                | LanguageBackend::Remote(RemoteProvider::Azure | RemoteProvider::EdgeTts)
+                | LanguageBackend::Piper
         )
     }
 
@@ -283,6 +325,14 @@ impl LanguageBackend {
     /// backend with a voice list the listed language it matches (trimmed,
     /// compared without regard to ASCII case). `None` outside the set,
     /// never a default.
+    ///
+    /// Story 3.13 (decision 1): with no exact match, the fallback treats
+    /// `_` and `-` alike (`tr_TR` finds `tr-TR`), then a bare primary subtag
+    /// matches a listed tag with that primary subtag, and the other way
+    /// round — the saved `tr` finds Windows' `tr-TR`, the first listed one
+    /// when several share it. Two tags that both carry a region never
+    /// match each other (`en-gb` never finds `en-us`), so every code that
+    /// resolved before still resolves to the same language.
     pub fn resolve_language(self, saved: &str, voices: &[StockVoice]) -> Option<String> {
         match self {
             backend if backend.has_voice_list() => {
@@ -290,6 +340,16 @@ impl LanguageBackend {
                 voices
                     .iter()
                     .find(|voice| voice.language.eq_ignore_ascii_case(saved))
+                    .or_else(|| {
+                        voices
+                            .iter()
+                            .find(|voice| same_tag_any_separator(saved, &voice.language))
+                    })
+                    .or_else(|| {
+                        voices
+                            .iter()
+                            .find(|voice| same_primary_language(saved, &voice.language))
+                    })
                     .map(|voice| voice.language.clone())
             }
             _ => self
@@ -338,6 +398,33 @@ pub struct StockVoice {
     pub name: String,
     /// The priority within the language: lower is preferred.
     pub priority: u32,
+}
+
+/// Whether `a` and `b` are the same tag once `_` and `-` are read alike,
+/// without regard to ASCII case: `tr_TR` and `tr-TR` (decision 1's
+/// fallback, Story 3.13).
+fn same_tag_any_separator(a: &str, b: &str) -> bool {
+    let separator = |byte: u8| if byte == b'_' { b'-' } else { byte };
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .all(|(x, y)| separator(x).eq_ignore_ascii_case(&separator(y)))
+}
+
+/// A language tag's primary subtag: `tr` of `tr-TR`, `en` of `en_gb` (the
+/// fallback reads `_` and `-` alike).
+fn primary_subtag(tag: &str) -> &str {
+    tag.split(['-', '_']).next().unwrap_or(tag)
+}
+
+/// Decision 1's fallback (Story 3.13): `a` and `b` share a primary subtag
+/// (without regard to ASCII case) and at least one of them is nothing but
+/// that subtag — `tr` ↔ `tr-TR`, never `en-gb` ↔ `en-us`.
+fn same_primary_language(a: &str, b: &str) -> bool {
+    let (primary_a, primary_b) = (primary_subtag(a), primary_subtag(b));
+    !primary_a.is_empty()
+        && primary_a.eq_ignore_ascii_case(primary_b)
+        && (primary_a.len() == a.len() || primary_b.len() == b.len())
 }
 
 /// The distinct languages `voices` speak (compared without regard to ASCII
@@ -400,7 +487,7 @@ impl std::fmt::Display for StockVoiceRefusal {
         match self {
             StockVoiceRefusal::NoVoices(backend) => write!(
                 f,
-                "{} has no voices listed yet — check Settings → Backend",
+                "{} has no voices listed yet — check Settings → Speech",
                 backend.label()
             ),
             StockVoiceRefusal::Language { backend, language } => write!(
@@ -415,12 +502,12 @@ impl std::fmt::Display for StockVoiceRefusal {
                 voice,
             } => write!(
                 f,
-                "{} has no voice {voice:?} for {language:?} — choose one in Settings → Backend",
+                "{} has no voice {voice:?} for {language:?} — choose one in Settings → Speech",
                 backend.label()
             ),
             StockVoiceRefusal::NoVoice(backend) => write!(
                 f,
-                "{} has no voice selected — pick one in Settings → Backend",
+                "{} has no voice selected — pick one in Settings → Speech",
                 backend.label()
             ),
         }
@@ -508,6 +595,10 @@ const DEEPINFRA_SPEECH_LANGUAGES: &[SpeechLanguage] = &[
     language("tr", "Turkish"),
 ];
 
+/// Piper's speech language when nothing has been saved yet (Story 3.15):
+/// the default voice's locale.
+pub const DEFAULT_PIPER_LOCALE: &str = crate::assets::PIPER_DEFAULT_VOICE.locale;
+
 /// The saved speech language of each backend that has one (Story 3.11).
 /// Persisted. Values are stored as written — a hand-edited value outside the
 /// backend's set is kept, and refused by name at the next Speak Action.
@@ -520,6 +611,12 @@ pub struct SpeechLanguages {
     /// Story 3.14: an Azure locale. Defaults to `tr-TR`; the legacy key
     /// never seeds it.
     pub azure: String,
+    /// Story 3.17: an Edge TTS locale. Defaults to `tr-TR`; the legacy key
+    /// never seeds it.
+    pub edge_tts: String,
+    /// Story 3.15: a Piper locale (`tr_TR`). Defaults to the default
+    /// voice's; the legacy key never seeds it.
+    pub piper: String,
 }
 
 impl Default for SpeechLanguages {
@@ -529,18 +626,36 @@ impl Default for SpeechLanguages {
             deepinfra: DEFAULT_SPEECH_LANGUAGE.to_string(),
             system_voice: DEFAULT_SPEECH_LANGUAGE.to_string(),
             azure: DEFAULT_AZURE_LOCALE.to_string(),
+            edge_tts: DEFAULT_EDGE_TTS_LOCALE.to_string(),
+            piper: DEFAULT_PIPER_LOCALE.to_string(),
         }
     }
 }
 
 /// The saved voice of each backend that has a voice choice (Stories 3.12,
-/// 3.14). Persisted. For the System voice `None` is the language's
-/// top-priority voice; for Azure it is no voice at all (D4).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// 3.14, 3.15). Persisted. For the System voice and Piper `None` is the
+/// language's top-priority voice; for Azure it is no voice at all (D4).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpeechVoices {
     pub system_voice: Option<String>,
     /// Azure's `ShortName` (`tr-TR-EmelNeural`).
     pub azure: Option<String>,
+    /// Story 3.17: an Edge TTS voice id (`tr-TR-EmelNeural`). `None` is the
+    /// language's first listed voice.
+    pub edge_tts: Option<String>,
+    /// Story 3.15: a Piper voice key. Starts at the default voice.
+    pub piper: Option<String>,
+}
+
+impl Default for SpeechVoices {
+    fn default() -> Self {
+        Self {
+            system_voice: None,
+            azure: None,
+            edge_tts: None,
+            piper: Some(crate::assets::PIPER_DEFAULT_VOICE.key.to_string()),
+        }
+    }
 }
 
 impl SpeechVoices {
@@ -549,6 +664,8 @@ impl SpeechVoices {
         match backend {
             LanguageBackend::SystemVoice => self.system_voice.as_deref(),
             LanguageBackend::Remote(RemoteProvider::Azure) => self.azure.as_deref(),
+            LanguageBackend::Remote(RemoteProvider::EdgeTts) => self.edge_tts.as_deref(),
+            LanguageBackend::Piper => self.piper.as_deref(),
             _ => None,
         }
     }
@@ -562,7 +679,9 @@ impl SpeechLanguages {
             LanguageBackend::Remote(RemoteProvider::DeepInfra) => Some(&self.deepinfra),
             LanguageBackend::Remote(RemoteProvider::FalAi) => None,
             LanguageBackend::Remote(RemoteProvider::Azure) => Some(&self.azure),
+            LanguageBackend::Remote(RemoteProvider::EdgeTts) => Some(&self.edge_tts),
             LanguageBackend::SystemVoice => Some(&self.system_voice),
+            LanguageBackend::Piper => Some(&self.piper),
         }
     }
 }
@@ -588,11 +707,24 @@ pub enum BackendSelection {
     /// The OS's own speech engine in a stock voice (Story 3.12): eSpeak NG
     /// on Linux. Local, but never an ONNX target.
     SystemVoice,
+    /// A Piper neural stock voice (Story 3.15), run on the bundled runtime
+    /// — on CPU, or on CUDA or WebGPU once the bundled runtime has every
+    /// provider (spec-backend-engine-and-device-selects). Local, but not a
+    /// Chatterbox target.
+    Piper { target: SpeechExecutionTarget },
 }
 
+/// What an unsaved selection is (Story 3.15): Piper where this OS's build
+/// has it (Linux; Windows since Story 3.16), the bundled CPU runtime
+/// everywhere else. Only ever the answer for a profile with *no* saved
+/// selection — an explicit one is never rewritten.
 impl Default for BackendSelection {
     fn default() -> Self {
-        Self::BUNDLED_CPU
+        if cfg!(any(target_os = "linux", target_os = "windows")) {
+            Self::PIPER_CPU
+        } else {
+            Self::BUNDLED_CPU
+        }
     }
 }
 
@@ -604,11 +736,63 @@ impl BackendSelection {
         target: SpeechExecutionTarget::Cpu,
     };
 
-    /// The local ONNX execution target, or `None` for a remote provider
-    /// and for the System voice, which runs no ONNX session.
+    /// Piper on the bundled CPU runtime — the first-run default on Linux
+    /// and Windows.
+    pub const PIPER_CPU: Self = Self::Piper {
+        target: SpeechExecutionTarget::Cpu,
+    };
+
+    /// The ONNX execution target this selection runs on — Chatterbox's or
+    /// Piper's — or `None` for a remote provider and for the System voice,
+    /// which runs no ONNX session.
     pub fn local_target(&self) -> Option<SpeechExecutionTarget> {
         match self {
-            BackendSelection::Local { target, .. } => Some(*target),
+            BackendSelection::Local { target, .. } | BackendSelection::Piper { target } => {
+                Some(*target)
+            }
+            BackendSelection::Remote(_) | BackendSelection::SystemVoice => None,
+        }
+    }
+
+    /// Whether this is Chatterbox (a [`BackendSelection::Local`] entry): the
+    /// one engine that needs the speech model files.
+    pub fn is_chatterbox(&self) -> bool {
+        matches!(self, BackendSelection::Local { .. })
+    }
+
+    /// The local engine this selection runs, or `None` for a remote one.
+    pub fn engine(&self) -> Option<LocalEngine> {
+        match self {
+            BackendSelection::Piper { .. } => Some(LocalEngine::Piper),
+            BackendSelection::Local { .. } => Some(LocalEngine::Chatterbox),
+            BackendSelection::SystemVoice => Some(LocalEngine::SystemVoice),
+            BackendSelection::Remote(_) => None,
+        }
+    }
+
+    /// The same engine on the CPU — what "Use CPU backend" selects: Piper
+    /// on CPU for Piper, the bundled CPU runtime for anything else.
+    pub fn on_cpu(&self) -> Self {
+        match self {
+            BackendSelection::Piper { .. } => Self::PIPER_CPU,
+            _ => Self::BUNDLED_CPU,
+        }
+    }
+
+    /// How the device reads in the device `Select`: "CPU", "CUDA",
+    /// "WebGPU", or "CUDA — libonnxruntime.so" for an added runtime's.
+    /// `None` for a selection with no device.
+    pub fn device_label(&self) -> Option<String> {
+        match self {
+            BackendSelection::Local {
+                runtime: Some(path),
+                target,
+            } => Some(format!("{} — {}", target.label(), file_name(path))),
+            BackendSelection::Local {
+                runtime: None,
+                target,
+            }
+            | BackendSelection::Piper { target } => Some(target.label().to_string()),
             BackendSelection::Remote(_) | BackendSelection::SystemVoice => None,
         }
     }
@@ -618,7 +802,7 @@ impl BackendSelection {
     /// 3.14): the System voice and Azure.
     pub fn is_stock_voice(&self) -> bool {
         match self {
-            BackendSelection::SystemVoice => true,
+            BackendSelection::SystemVoice | BackendSelection::Piper { .. } => true,
             BackendSelection::Remote(provider) => provider.is_stock_voice(),
             BackendSelection::Local { .. } => false,
         }
@@ -629,6 +813,11 @@ impl BackendSelection {
     /// but not this.
     pub fn is_system_voice(&self) -> bool {
         matches!(self, BackendSelection::SystemVoice)
+    }
+
+    /// Whether this is Piper (Story 3.15).
+    pub fn is_piper(&self) -> bool {
+        matches!(self, BackendSelection::Piper { .. })
     }
 
     /// The added runtime library this selection loads, if it is one the
@@ -650,6 +839,7 @@ impl BackendSelection {
             BackendSelection::Local { .. } => LanguageBackend::Local,
             BackendSelection::Remote(provider) => LanguageBackend::Remote(*provider),
             BackendSelection::SystemVoice => LanguageBackend::SystemVoice,
+            BackendSelection::Piper { .. } => LanguageBackend::Piper,
         }
     }
 
@@ -659,20 +849,67 @@ impl BackendSelection {
         self.local_target() == Some(SpeechExecutionTarget::Cpu)
     }
 
-    /// How the entry reads in the backend `Select`: "CPU (bundled
-    /// runtime)", "CUDA (libonnxruntime.so)", "DeepInfra (remote)".
+    /// How the selection reads on the *Selected* line: the engine, then
+    /// its device — "Chatterbox — your voice · CUDA — libonnxruntime.so",
+    /// "Piper — natural, instant (stock voice) · WebGPU" — or the remote
+    /// provider, "DeepInfra (remote)".
     pub fn label(&self) -> String {
         match self {
-            BackendSelection::Local {
-                runtime: None,
-                target,
-            } => format!("{} (bundled runtime)", target.label()),
-            BackendSelection::Local {
-                runtime: Some(path),
-                target,
-            } => format!("{} ({})", target.label(), file_name(path)),
+            // Story 3.17: the UX's own entry for the keyless one.
+            BackendSelection::Remote(RemoteProvider::EdgeTts) => {
+                "Edge TTS — free, online (stock voice)".to_string()
+            }
             BackendSelection::Remote(provider) => format!("{} (remote)", provider.label()),
-            BackendSelection::SystemVoice => "System voice — instant (stock voice)".to_string(),
+            local => {
+                let engine = local.engine().map(LocalEngine::label).unwrap_or_default();
+                match local.device_label() {
+                    Some(device) => format!("{engine} · {device}"),
+                    None => engine.to_string(),
+                }
+            }
+        }
+    }
+}
+
+/// A local engine — what the Local backend `Select` lists
+/// (spec-backend-engine-and-device-selects). Piper and Chatterbox run on
+/// ONNX Runtime and so also have a device; the System voice has none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LocalEngine {
+    Piper,
+    Chatterbox,
+    SystemVoice,
+}
+
+impl LocalEngine {
+    /// Every local engine, in the order the `Select` lists them.
+    pub const ALL: [LocalEngine; 3] = [
+        LocalEngine::Piper,
+        LocalEngine::Chatterbox,
+        LocalEngine::SystemVoice,
+    ];
+
+    /// How the engine reads in the backend `Select`, without a device.
+    pub fn label(self) -> &'static str {
+        match self {
+            LocalEngine::Piper => "Piper — natural, instant (stock voice)",
+            LocalEngine::Chatterbox => "Chatterbox — your voice",
+            LocalEngine::SystemVoice => "System voice — instant (stock voice)",
+        }
+    }
+
+    /// Whether the engine runs on an ONNX device, and so has a device
+    /// `Select`.
+    pub fn has_device(self) -> bool {
+        !matches!(self, LocalEngine::SystemVoice)
+    }
+
+    /// The engine on the CPU: its default device.
+    pub fn on_cpu(self) -> BackendSelection {
+        match self {
+            LocalEngine::Piper => BackendSelection::PIPER_CPU,
+            LocalEngine::Chatterbox => BackendSelection::BUNDLED_CPU,
+            LocalEngine::SystemVoice => BackendSelection::SystemVoice,
         }
     }
 }
@@ -727,13 +964,93 @@ impl LocalRuntime {
     }
 }
 
-/// Every entry the backend `Select` lists, in order: the bundled CPU
-/// runtime, each added runtime's entries, the System voice, then the
-/// remote providers.
-pub fn backend_choices(runtimes: &[LocalRuntime]) -> Vec<BackendSelection> {
-    std::iter::once(BackendSelection::BUNDLED_CPU)
-        .chain(runtimes.iter().flat_map(LocalRuntime::entries))
-        .chain(std::iter::once(BackendSelection::SystemVoice))
+/// The local engines the backend `Select` lists under Local, in order:
+/// Piper, Chatterbox, the System voice.
+pub fn engine_choices() -> Vec<LocalEngine> {
+    LocalEngine::ALL.to_vec()
+}
+
+/// The devices `engine` can run on, in the order the device `Select` lists
+/// them: CPU on the bundled runtime, then CUDA and WebGPU on it when it
+/// has every provider (`all_providers`, Story 3.8), then — for Chatterbox
+/// only, since Piper runs on the bundled runtime — each added runtime's
+/// entries. Empty for the System voice.
+pub fn device_choices(
+    engine: LocalEngine,
+    runtimes: &[LocalRuntime],
+    all_providers: bool,
+) -> Vec<BackendSelection> {
+    let bundled_targets: &[SpeechExecutionTarget] = if all_providers {
+        &[
+            SpeechExecutionTarget::Cpu,
+            SpeechExecutionTarget::Cuda,
+            SpeechExecutionTarget::WebGpu,
+        ]
+    } else {
+        &[SpeechExecutionTarget::Cpu]
+    };
+    match engine {
+        LocalEngine::SystemVoice => Vec::new(),
+        LocalEngine::Piper => bundled_targets
+            .iter()
+            .map(|&target| BackendSelection::Piper { target })
+            .collect(),
+        LocalEngine::Chatterbox => bundled_targets
+            .iter()
+            .map(|&target| BackendSelection::Local {
+                runtime: None,
+                target,
+            })
+            .chain(runtimes.iter().flat_map(LocalRuntime::entries))
+            .collect(),
+    }
+}
+
+/// The selection a switch to `engine` saves: the same device when `engine`
+/// offers it, otherwise CPU. An added runtime's device is only Chatterbox's,
+/// so Piper keeps its target on the bundled runtime when that has it.
+pub fn switch_engine(
+    current: &BackendSelection,
+    engine: LocalEngine,
+    runtimes: &[LocalRuntime],
+    all_providers: bool,
+) -> BackendSelection {
+    let devices = device_choices(engine, runtimes, all_providers);
+    if devices.contains(current) {
+        return current.clone();
+    }
+    let wanted = match (engine, current) {
+        (LocalEngine::Piper, BackendSelection::Local { target, .. }) => {
+            Some(BackendSelection::Piper { target: *target })
+        }
+        (LocalEngine::Chatterbox, BackendSelection::Piper { target }) => {
+            Some(BackendSelection::Local {
+                runtime: None,
+                target: *target,
+            })
+        }
+        _ => None,
+    };
+    wanted
+        .filter(|wanted| devices.contains(wanted))
+        .unwrap_or_else(|| engine.on_cpu())
+}
+
+/// Every entry a backend can be, grouped as the tab lists them: each local
+/// engine's devices (or the System voice itself), then the remote
+/// providers. Only the tests enumerate them all.
+#[cfg(test)]
+fn backend_choices(runtimes: &[LocalRuntime], all_providers: bool) -> Vec<BackendSelection> {
+    LocalEngine::ALL
+        .into_iter()
+        .flat_map(|engine| {
+            let devices = device_choices(engine, runtimes, all_providers);
+            if devices.is_empty() {
+                vec![engine.on_cpu()]
+            } else {
+                devices
+            }
+        })
         .chain(
             RemoteProvider::ALL
                 .into_iter()
@@ -765,6 +1082,8 @@ impl ApiKeys {
             RemoteProvider::DeepInfra => self.deepinfra.as_deref(),
             RemoteProvider::FalAi => self.fal_ai.as_deref(),
             RemoteProvider::Azure => self.azure.as_deref(),
+            // Story 3.17: Edge TTS has no key.
+            RemoteProvider::EdgeTts => None,
         }
         .filter(|key| !key.trim().is_empty())
     }
@@ -784,6 +1103,8 @@ impl ApiKeys {
             RemoteProvider::DeepInfra => self.deepinfra = key,
             RemoteProvider::FalAi => self.fal_ai = key,
             RemoteProvider::Azure => self.azure = key,
+            // Story 3.17: Edge TTS has no key, so there is nothing to set.
+            RemoteProvider::EdgeTts => {}
         }
     }
 }
@@ -904,9 +1225,28 @@ pub enum DependencyKind {
     /// selection that cannot run is never quietly run on CPU instead.
     BackendCapability,
     /// The OS speech engine the System voice runs (Story 3.12: the
-    /// `espeak-ng` program). Blocking, with manual steps: it is a system
-    /// package voice-me cannot install.
+    /// `espeak-ng` program). Blocking, with manual steps on Linux: it is a
+    /// system package voice-me cannot install. Piper phonemizes through it
+    /// too; on Windows (Story 3.16) Piper's row installs it with one click.
     SystemVoiceEngine,
+    /// The `edge-tts` program Edge TTS runs (Story 3.17). Blocking, with
+    /// manual steps only: voice-me never runs pip for the user.
+    EdgeTtsProgram,
+    /// The Piper voice the selection speaks in (Story 3.15). Blocking; its
+    /// Install downloads the voice named in the request.
+    PiperVoice,
+    /// The Turkish G2P model (DizgeBERT) a Piper voice with `phoneme_type` `"dizge"` is
+    /// phonemized through instead of eSpeak NG. Blocking; its Install
+    /// downloads the model.
+    TurkishG2p,
+    /// ONNX Runtime's CUDA execution provider, beside the bundled runtime
+    /// (Story 3.8). Reported for a CUDA backend on the bundled runtime
+    /// only; blocking.
+    CudaProvider,
+    /// NVIDIA's CUDA libraries — cudart, cuBLAS, cuFFT, cuDNN — the CUDA
+    /// provider loads (Story 3.8). Reported with [`Self::CudaProvider`];
+    /// blocking.
+    NvidiaLibraries,
 }
 
 impl DependencyKind {
@@ -919,6 +1259,11 @@ impl DependencyKind {
                 | DependencyKind::ModelWeights
                 | DependencyKind::BackendCapability
                 | DependencyKind::SystemVoiceEngine
+                | DependencyKind::EdgeTtsProgram
+                | DependencyKind::PiperVoice
+                | DependencyKind::TurkishG2p
+                | DependencyKind::CudaProvider
+                | DependencyKind::NvidiaLibraries
         )
     }
 }
@@ -1016,6 +1361,8 @@ pub fn format_bytes(bytes: u64) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DependencyReport {
     pub backend: SpeechBackend,
+    /// Exact selection checked; `None` for reports built by older callers.
+    pub selection: Option<BackendSelection>,
     pub dependencies: Vec<Dependency>,
 }
 
@@ -1023,8 +1370,14 @@ impl DependencyReport {
     pub fn new(backend: SpeechBackend, dependencies: Vec<Dependency>) -> Self {
         Self {
             backend,
+            selection: None,
             dependencies,
         }
+    }
+
+    pub fn with_selection(mut self, selection: BackendSelection) -> Self {
+        self.selection = Some(selection);
+        self
     }
 
     /// Whether anything at all is missing — what decides whether Settings →
@@ -1085,7 +1438,7 @@ pub struct AppState {
     pub reference_voice_sample: Option<PathBuf>,
     pub ui_language: String,
     /// The language generated speech is produced in (FR5), per backend
-    /// (Story 3.11). Persisted, and set from Settings → Backend. Read on
+    /// (Story 3.11). Persisted, and set from Settings → Speech. Read on
     /// every Speak Action through [`Self::speech_language`].
     pub speech_languages: SpeechLanguages,
     /// The saved voice of each backend with a voice choice (Story 3.12).
@@ -1131,6 +1484,17 @@ pub struct AppState {
     /// Azure selected (Story 3.14, D1). Cached by the composition root for
     /// the session and never persisted.
     pub azure_voices: Vec<StockVoice>,
+    /// The voices `edge-tts --list-voices` listed at the last Dependency
+    /// Check with Edge TTS selected and the program found (Story 3.17).
+    /// Merged in by the composition root; never persisted.
+    pub edge_tts_voices: Vec<StockVoice>,
+    /// The Piper voices installed in the cache (Story 3.15), read from disk
+    /// by the composition root. Not persisted.
+    pub piper_voices: Vec<StockVoice>,
+    /// Where the Prompt Overlay opens vertically, 0 (top) to 100 (bottom)
+    /// percent of the free space in the primary display's visible area.
+    /// Persisted; set from Settings → Hotkey. Always `0..=100`.
+    pub overlay_position: u8,
 }
 
 /// Hand-written rather than derived so the two language fields default to
@@ -1156,6 +1520,9 @@ impl Default for AppState {
             system_voices: Vec::new(),
             azure_region: None,
             azure_voices: Vec::new(),
+            edge_tts_voices: Vec::new(),
+            piper_voices: Vec::new(),
+            overlay_position: DEFAULT_OVERLAY_POSITION,
         }
     }
 }
@@ -1175,6 +1542,8 @@ impl AppState {
         match backend {
             LanguageBackend::SystemVoice => &self.system_voices,
             LanguageBackend::Remote(RemoteProvider::Azure) => &self.azure_voices,
+            LanguageBackend::Remote(RemoteProvider::EdgeTts) => &self.edge_tts_voices,
+            LanguageBackend::Piper => &self.piper_voices,
             _ => &[],
         }
     }
@@ -1195,6 +1564,23 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_overlay_sits_its_percentage_down_the_free_space() {
+        // A 1080 px visible area starting under a 40 px panel, 200 px window.
+        assert_eq!(overlay_origin_y(40.0, 1000.0, 200.0, 0), 40.0);
+        assert_eq!(overlay_origin_y(40.0, 1000.0, 200.0, 100), 840.0);
+        assert_eq!(overlay_origin_y(40.0, 1000.0, 200.0, 50), 440.0);
+        assert_eq!(overlay_origin_y(40.0, 1000.0, 200.0, 20), 200.0);
+        // Out of range counts as the bottom; a too-tall window, the top.
+        assert_eq!(overlay_origin_y(40.0, 1000.0, 200.0, 250), 840.0);
+        assert_eq!(overlay_origin_y(40.0, 100.0, 200.0, 70), 40.0);
+    }
+
+    #[test]
+    fn the_overlay_defaults_to_centred() {
+        assert_eq!(AppState::default().overlay_position, 50);
+    }
 
     #[test]
     fn byte_figures_read_the_way_the_spec_writes_them() {
@@ -1236,6 +1622,43 @@ mod tests {
         }
     }
 
+    /// Story 3.17: only Edge TTS goes without a key; it is a stock voice
+    /// listed after Azure, and its program blocks speech.
+    #[test]
+    fn edge_tts_needs_no_key_and_its_program_blocks_speech() {
+        for provider in RemoteProvider::ALL {
+            assert_eq!(
+                provider.needs_api_key(),
+                provider != RemoteProvider::EdgeTts,
+                "{provider:?}"
+            );
+        }
+        assert_eq!(RemoteProvider::ALL[3], RemoteProvider::EdgeTts);
+        assert_eq!(RemoteProvider::EdgeTts.label(), "Edge TTS");
+        assert!(RemoteProvider::EdgeTts.is_stock_voice());
+        assert!(DependencyKind::EdgeTtsProgram.blocks_speech());
+
+        let edge = LanguageBackend::Remote(RemoteProvider::EdgeTts);
+        assert!(edge.has_voice_list());
+        assert!(!edge.requires_voice());
+        assert_eq!(SpeechLanguages::default().get(edge), Some("tr-TR"));
+
+        let mut keys = ApiKeys::default();
+        keys.set(RemoteProvider::EdgeTts, Some("anything".to_string()));
+        assert_eq!(keys, ApiKeys::default());
+        assert!(!keys.has(RemoteProvider::EdgeTts));
+
+        #[derive(Serialize, Deserialize)]
+        struct Wrapper {
+            provider: RemoteProvider,
+        }
+        let written = toml::to_string(&Wrapper {
+            provider: RemoteProvider::EdgeTts,
+        })
+        .unwrap();
+        assert_eq!(written.trim(), "provider = \"edge_tts\"");
+    }
+
     #[test]
     fn a_blank_key_is_no_key() {
         let mut keys = ApiKeys::default();
@@ -1274,24 +1697,193 @@ mod tests {
                 target: SpeechExecutionTarget::Cuda,
             }]
         );
-        assert_eq!(cuda.entries()[0].label(), "CUDA (libonnxruntime.so)");
+        assert_eq!(
+            cuda.entries()[0].device_label().as_deref(),
+            Some("CUDA — libonnxruntime.so")
+        );
 
         let cpu_only = LocalRuntime {
             path: PathBuf::from("/opt/cpu/libonnxruntime.so"),
             targets: vec![SpeechExecutionTarget::Cpu],
         };
-        assert_eq!(cpu_only.entries()[0].label(), "CPU (libonnxruntime.so)");
+        assert_eq!(
+            cpu_only.entries()[0].device_label().as_deref(),
+            Some("CPU — libonnxruntime.so")
+        );
 
-        let choices = backend_choices(&[cuda]);
-        assert_eq!(choices.first(), Some(&BackendSelection::BUNDLED_CPU));
-        assert_eq!(choices[0].label(), "CPU (bundled runtime)");
+        let choices = backend_choices(&[cuda], false);
+        // Piper first under Local, then Chatterbox's devices.
+        assert_eq!(choices.first(), Some(&BackendSelection::PIPER_CPU));
+        assert_eq!(choices[1], BackendSelection::BUNDLED_CPU);
+        assert_eq!(choices[1].label(), "Chatterbox — your voice · CPU");
         assert_eq!(
             choices.last(),
-            Some(&BackendSelection::Remote(RemoteProvider::Azure))
+            Some(&BackendSelection::Remote(RemoteProvider::EdgeTts))
         );
-        assert_eq!(choices.len(), 6);
+        assert_eq!(choices.len(), 8);
         // The System voice comes after the local runtimes, before remote.
-        assert_eq!(choices[2], BackendSelection::SystemVoice);
+        assert_eq!(choices[3], BackendSelection::SystemVoice);
+    }
+
+    /// The Engine list row: Piper, Chatterbox, the System voice, without a
+    /// device in any label.
+    #[test]
+    fn the_engine_list_is_piper_chatterbox_then_the_system_voice() {
+        assert_eq!(
+            engine_choices(),
+            vec![
+                LocalEngine::Piper,
+                LocalEngine::Chatterbox,
+                LocalEngine::SystemVoice
+            ]
+        );
+        for engine in engine_choices() {
+            let label = engine.label();
+            for device in ["CPU", "CUDA", "WebGPU", "runtime"] {
+                assert!(!label.contains(device), "{label}");
+            }
+        }
+        assert!(LocalEngine::Piper.has_device());
+        assert!(LocalEngine::Chatterbox.has_device());
+        assert!(!LocalEngine::SystemVoice.has_device());
+        assert_eq!(
+            BackendSelection::Piper {
+                target: SpeechExecutionTarget::Cuda
+            }
+            .engine(),
+            Some(LocalEngine::Piper)
+        );
+        assert_eq!(
+            BackendSelection::BUNDLED_CPU.engine(),
+            Some(LocalEngine::Chatterbox)
+        );
+        assert_eq!(
+            BackendSelection::Remote(RemoteProvider::Azure).engine(),
+            None
+        );
+    }
+
+    /// The Device list and No device rows.
+    #[test]
+    fn the_device_list_follows_the_engine_and_the_bundled_runtime() {
+        let added = LocalRuntime {
+            path: PathBuf::from("/opt/ort/libonnxruntime.so"),
+            targets: vec![SpeechExecutionTarget::Cpu, SpeechExecutionTarget::Cuda],
+        };
+        let runtimes = [added];
+
+        let chatterbox = device_choices(LocalEngine::Chatterbox, &runtimes, true);
+        let labels: Vec<_> = chatterbox
+            .iter()
+            .map(|selection| selection.device_label().unwrap())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["CPU", "CUDA", "WebGPU", "CUDA — libonnxruntime.so"]
+        );
+
+        // Before the all-provider runtime: the bundled runtime offers CPU
+        // only.
+        let labels: Vec<_> = device_choices(LocalEngine::Chatterbox, &runtimes, false)
+            .iter()
+            .map(|selection| selection.device_label().unwrap())
+            .collect();
+        assert_eq!(labels, vec!["CPU", "CUDA — libonnxruntime.so"]);
+
+        // Piper runs on the bundled runtime only.
+        assert_eq!(
+            device_choices(LocalEngine::Piper, &runtimes, true),
+            vec![
+                BackendSelection::PIPER_CPU,
+                BackendSelection::Piper {
+                    target: SpeechExecutionTarget::Cuda
+                },
+                BackendSelection::Piper {
+                    target: SpeechExecutionTarget::WebGpu
+                },
+            ]
+        );
+        assert_eq!(
+            device_choices(LocalEngine::Piper, &runtimes, false),
+            vec![BackendSelection::PIPER_CPU]
+        );
+        assert!(device_choices(LocalEngine::SystemVoice, &runtimes, true).is_empty());
+        assert_eq!(BackendSelection::SystemVoice.device_label(), None);
+        assert_eq!(
+            BackendSelection::Remote(RemoteProvider::DeepInfra).device_label(),
+            None
+        );
+    }
+
+    /// The Engine switch row: the device is kept when the new engine offers
+    /// it, otherwise CPU.
+    #[test]
+    fn switching_engine_keeps_the_device_when_the_new_engine_offers_it() {
+        let webgpu = BackendSelection::Local {
+            runtime: None,
+            target: SpeechExecutionTarget::WebGpu,
+        };
+        assert_eq!(
+            switch_engine(&webgpu, LocalEngine::Piper, &[], true),
+            BackendSelection::Piper {
+                target: SpeechExecutionTarget::WebGpu
+            }
+        );
+        assert_eq!(
+            switch_engine(
+                &BackendSelection::Piper {
+                    target: SpeechExecutionTarget::Cuda
+                },
+                LocalEngine::Chatterbox,
+                &[],
+                true
+            ),
+            BackendSelection::Local {
+                runtime: None,
+                target: SpeechExecutionTarget::Cuda
+            }
+        );
+        // Not offered → CPU.
+        assert_eq!(
+            switch_engine(&webgpu, LocalEngine::Piper, &[], false),
+            BackendSelection::PIPER_CPU
+        );
+        // An added runtime's device is Chatterbox's only; Piper takes the
+        // same target on the bundled runtime.
+        let added = BackendSelection::Local {
+            runtime: Some(PathBuf::from("/opt/ort/libonnxruntime.so")),
+            target: SpeechExecutionTarget::Cuda,
+        };
+        assert_eq!(
+            switch_engine(&added, LocalEngine::Piper, &[], true),
+            BackendSelection::Piper {
+                target: SpeechExecutionTarget::Cuda
+            }
+        );
+        assert_eq!(
+            switch_engine(&added, LocalEngine::Piper, &[], false),
+            BackendSelection::PIPER_CPU
+        );
+        assert_eq!(
+            switch_engine(
+                &BackendSelection::SystemVoice,
+                LocalEngine::Chatterbox,
+                &[],
+                true
+            ),
+            BackendSelection::BUNDLED_CPU
+        );
+        assert_eq!(
+            switch_engine(&webgpu, LocalEngine::SystemVoice, &[], true),
+            BackendSelection::SystemVoice
+        );
+        assert_eq!(
+            BackendSelection::Piper {
+                target: SpeechExecutionTarget::Cuda
+            }
+            .on_cpu(),
+            BackendSelection::PIPER_CPU
+        );
     }
 
     #[test]
@@ -1360,11 +1952,12 @@ mod tests {
             path: PathBuf::from("/opt/cpu/libonnxruntime.so"),
             targets: vec![SpeechExecutionTarget::Cpu],
         };
-        for selection in backend_choices(&[runtime, cpu_only]) {
+        for selection in backend_choices(&[runtime, cpu_only], true) {
             let expected = match &selection {
                 BackendSelection::Local { .. } => LanguageBackend::Local,
                 BackendSelection::Remote(provider) => LanguageBackend::Remote(*provider),
                 BackendSelection::SystemVoice => LanguageBackend::SystemVoice,
+                BackendSelection::Piper { .. } => LanguageBackend::Piper,
             };
             assert_eq!(selection.language_backend(), expected);
         }
@@ -1412,6 +2005,116 @@ mod tests {
                 5,
             ),
         ]
+    }
+
+    /// Windows' voices report BCP-47 tags (Story 3.13).
+    fn windows_voices() -> Vec<StockVoice> {
+        vec![
+            voice("tolga", "tr-TR", "Microsoft Tolga", 0),
+            voice("david", "en-US", "Microsoft David", 1),
+            voice("zira", "en-US", "Microsoft Zira", 2),
+            voice("hazel", "en-GB", "Microsoft Hazel", 3),
+        ]
+    }
+
+    /// Decision 1: the saved `tr` finds `tr-TR` — and `tr-TR` finds a bare
+    /// `tr` the other way round.
+    #[test]
+    fn a_bare_primary_subtag_falls_back_to_a_listed_regional_tag() {
+        let backend = LanguageBackend::SystemVoice;
+        assert_eq!(
+            backend.resolve_language("tr", &windows_voices()).as_deref(),
+            Some("tr-TR")
+        );
+        assert_eq!(
+            backend
+                .resolve_language(" TR ", &windows_voices())
+                .as_deref(),
+            Some("tr-TR")
+        );
+        // Several share the subtag: the first listed.
+        assert_eq!(
+            backend.resolve_language("en", &windows_voices()).as_deref(),
+            Some("en-US")
+        );
+        assert_eq!(
+            resolve_stock_voice(backend, &windows_voices(), "tr", None)
+                .unwrap()
+                .id,
+            "tolga"
+        );
+        assert_eq!(
+            backend.resolve_language("tr-TR", &some_voices()).as_deref(),
+            Some("tr")
+        );
+        // No language with that subtag at all.
+        assert_eq!(backend.resolve_language("de", &windows_voices()), None);
+        assert_eq!(backend.resolve_language("", &windows_voices()), None);
+        // Azure's and Edge TTS's lists get the same fallback.
+        assert_eq!(
+            LanguageBackend::Remote(RemoteProvider::Azure)
+                .resolve_language("tr", &windows_voices())
+                .as_deref(),
+            Some("tr-TR")
+        );
+    }
+
+    /// Decision 1's fallback reads `_` and `-` alike.
+    #[test]
+    fn an_underscore_tag_finds_the_same_tag_with_a_hyphen() {
+        let backend = LanguageBackend::SystemVoice;
+        assert_eq!(
+            backend
+                .resolve_language("tr_TR", &windows_voices())
+                .as_deref(),
+            Some("tr-TR")
+        );
+        assert_eq!(
+            backend
+                .resolve_language("en_gb", &windows_voices())
+                .as_deref(),
+            Some("en-GB")
+        );
+        // Still never another region.
+        assert_eq!(backend.resolve_language("en_AU", &windows_voices()), None);
+    }
+
+    #[test]
+    fn an_exact_match_wins_over_the_primary_subtag() {
+        let mut voices = windows_voices();
+        voices.push(voice("bare", "en", "Bare English", 9));
+        assert_eq!(
+            LanguageBackend::SystemVoice
+                .resolve_language("en", &voices)
+                .as_deref(),
+            Some("en")
+        );
+        assert_eq!(
+            LanguageBackend::SystemVoice
+                .resolve_language("en-gb", &voices)
+                .as_deref(),
+            Some("en-GB")
+        );
+    }
+
+    /// eSpeak's codes resolve exactly as before: `en-gb` stays `en-gb`,
+    /// and two regional tags never match each other.
+    #[test]
+    fn espeak_regional_codes_are_unchanged() {
+        let backend = LanguageBackend::SystemVoice;
+        assert_eq!(
+            backend.resolve_language("en-gb", &some_voices()).as_deref(),
+            Some("en-gb")
+        );
+        assert_eq!(
+            backend.resolve_language("en-us", &some_voices()).as_deref(),
+            Some("en-us")
+        );
+        assert_eq!(backend.resolve_language("en-029", &some_voices()), None);
+        assert_eq!(
+            backend.resolve_language("yue", &some_voices()).as_deref(),
+            Some("yue")
+        );
     }
 
     #[test]
@@ -1493,6 +2196,7 @@ mod tests {
         assert!(selection.label().contains("stock voice"));
         assert_eq!(selection.language_backend(), LanguageBackend::SystemVoice);
         assert!(DependencyKind::SystemVoiceEngine.blocks_speech());
+        assert!(DependencyKind::TurkishG2p.blocks_speech());
     }
 
     fn azure_voice(short_name: &str, locale: &str, locale_name: &str, local: &str) -> StockVoice {
@@ -1587,5 +2291,84 @@ mod tests {
         for bad in ["west europe!", "evil.com/", "a-b", "westeurope.attacker"] {
             assert!(parse_azure_region(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn piper_is_a_local_stock_voice_listed_first_with_a_voice_list() {
+        let piper = BackendSelection::PIPER_CPU;
+        assert_eq!(piper.local_target(), Some(SpeechExecutionTarget::Cpu));
+        assert!(piper.is_cpu());
+        assert!(!piper.is_chatterbox());
+        let piper_cuda = BackendSelection::Piper {
+            target: SpeechExecutionTarget::Cuda,
+        };
+        assert_eq!(piper_cuda.local_target(), Some(SpeechExecutionTarget::Cuda));
+        assert!(!piper_cuda.is_cpu());
+        assert!(piper_cuda.is_piper());
+        assert!(piper.is_stock_voice());
+        assert!(!piper.is_system_voice());
+        assert!(piper.is_piper());
+        assert_eq!(
+            piper.label(),
+            "Piper — natural, instant (stock voice) · CPU"
+        );
+        assert_eq!(backend_choices(&[], false)[0], piper);
+        let backend = piper.language_backend();
+        assert_eq!(backend, LanguageBackend::Piper);
+        assert!(backend.has_voice_list() && backend.has_voice_choice());
+        assert!(!backend.requires_voice());
+        assert!(backend.has_speech_language(), "even with nothing installed");
+        assert_eq!(SpeechLanguages::default().get(backend), Some("tr_TR"));
+        assert_eq!(
+            SpeechVoices::default().get(backend),
+            Some("tr_TR-fahrettin-medium")
+        );
+        assert!(DependencyKind::PiperVoice.blocks_speech());
+        assert!(DependencyKind::CudaProvider.blocks_speech());
+        assert!(DependencyKind::NvidiaLibraries.blocks_speech());
+    }
+
+    /// The First run row at core level: with nothing saved, Linux and
+    /// Windows (Story 3.16) speak with Piper and fahrettin; every other OS
+    /// keeps the bundled CPU.
+    #[test]
+    fn an_unsaved_selection_is_piper_on_linux_and_the_bundled_cpu_elsewhere() {
+        let state = AppState::default();
+        if cfg!(any(target_os = "linux", target_os = "windows")) {
+            assert_eq!(state.backend_selection, BackendSelection::PIPER_CPU);
+            assert_eq!(state.speech_language(), Some("tr_TR"));
+            assert_eq!(
+                state.speech_voices.get(LanguageBackend::Piper),
+                Some("tr_TR-fahrettin-medium")
+            );
+        } else {
+            assert_eq!(state.backend_selection, BackendSelection::BUNDLED_CPU);
+        }
+    }
+
+    #[test]
+    fn piper_languages_are_the_installed_voices_locales() {
+        let voices = vec![
+            voice("tr_TR-fahrettin-medium", "tr_TR", "Turkish", 0),
+            voice("tr_TR-dfki-medium", "tr_TR", "Turkish", 0),
+            voice("en_US-lessac-medium", "en_US", "English", 0),
+        ];
+        let state = AppState {
+            piper_voices: voices.clone(),
+            ..AppState::default()
+        };
+        assert_eq!(state.stock_voices(LanguageBackend::Piper), &voices[..]);
+        let codes: Vec<_> = LanguageBackend::Piper
+            .language_options(&voices)
+            .into_iter()
+            .map(|language| language.code)
+            .collect();
+        assert_eq!(codes, vec!["en_US", "tr_TR"]);
+        assert_eq!(
+            resolve_stock_voice(LanguageBackend::Piper, &voices, "tr_TR", None)
+                .unwrap()
+                .id,
+            "tr_TR-fahrettin-medium"
+        );
     }
 }

@@ -1,5 +1,8 @@
-//! One bounded run of the engine program: no shell, input on stdin, every
+//! One bounded run of a fixed program: no shell, input on stdin, every
 //! pipe drained on its own thread, killed and reaped at the deadline.
+//!
+//! Program-agnostic (Story 3.17): the one runner both `espeak-ng` and
+//! `edge-tts` go through (AD-12).
 
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
@@ -10,12 +13,20 @@ use std::time::{Duration, Instant};
 /// How often a running child is asked whether it has exited.
 const POLL: Duration = Duration::from_millis(5);
 
+/// `CREATE_NO_WINDOW`: every child on Windows is spawned without a console
+/// window (Story 3.16).
+#[cfg(target_os = "windows")]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Why a run produced no usable output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunError {
-    /// The program could not be started at all (not on PATH, not
-    /// executable).
+    /// The program could not be started at all (not executable, say).
     Spawn(String),
+    /// The program does not exist: spawning it failed with
+    /// [`std::io::ErrorKind::NotFound`] (Story 3.17 — it can vanish after
+    /// the Dependency Check).
+    NotFound(String),
     /// It was still running at the deadline, and was killed.
     TimedOut(Duration),
     /// It exited unsuccessfully; carries the trimmed stderr.
@@ -25,7 +36,9 @@ pub enum RunError {
 impl std::fmt::Display for RunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RunError::Spawn(reason) => write!(f, "could not be started: {reason}"),
+            RunError::Spawn(reason) | RunError::NotFound(reason) => {
+                write!(f, "could not be started: {reason}")
+            }
             RunError::TimedOut(deadline) => {
                 write!(f, "did not finish within {} seconds", deadline.as_secs())
             }
@@ -45,6 +58,41 @@ pub fn run(
     input: &[u8],
     deadline: Duration,
 ) -> Result<Vec<u8>, RunError> {
+    let mut command = Command::new(program);
+    command.args(args);
+    run_command(command, input, deadline)
+}
+
+/// Start `command`, retrying briefly on `ETXTBSY` ("text file busy"). On
+/// Linux a program file that was just written can still be open for
+/// writing in a child another thread forked in the meantime (until that
+/// child execs), and exec refuses it for that moment. It clears within
+/// milliseconds, so a handful of short retries is enough; any other error
+/// is returned at once.
+fn spawn(command: &mut Command) -> std::io::Result<std::process::Child> {
+    const TEXT_FILE_BUSY: i32 = 26;
+    let mut attempts = 0;
+    loop {
+        match command.spawn() {
+            Err(error)
+                if cfg!(target_os = "linux")
+                    && error.raw_os_error() == Some(TEXT_FILE_BUSY)
+                    && attempts < 10 =>
+            {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// One bounded run of `command`, whose program and arguments are set.
+fn run_command(
+    mut command: Command,
+    input: &[u8],
+    deadline: Duration,
+) -> Result<Vec<u8>, RunError> {
     // No input (the voice list) is no stdin at all, rather than an empty
     // pipe.
     let stdin = if input.is_empty() {
@@ -52,13 +100,21 @@ pub fn run(
     } else {
         Stdio::piped()
     };
-    let mut child = Command::new(program)
-        .args(args)
+    command
         .stdin(stdin)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| RunError::Spawn(error.to_string()))?;
+        .stderr(Stdio::piped());
+    // Story 3.16: a console program started from the GUI app would flash a
+    // console window on every run.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = spawn(&mut command).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => RunError::NotFound(error.to_string()),
+        _ => RunError::Spawn(error.to_string()),
+    })?;
 
     // Each pipe on its own thread: a child blocked writing a full stdout
     // pipe while we block writing its stdin would otherwise deadlock.

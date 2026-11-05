@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::SystemTime;
 
 use ort::ep::ExecutionProviderDispatch;
 use ort::session::Session;
@@ -186,26 +187,50 @@ impl ModelCache {
 /// Recording it here is what lets [`init_runtime`] refuse that honestly,
 /// and lets the composition root tell a switch that needs a restart from
 /// one that does not (Decision 2).
-static COMMITTED_RUNTIME: Mutex<Option<PathBuf>> = Mutex::new(None);
+static COMMITTED_RUNTIME: Mutex<Option<Committed>> = Mutex::new(None);
+
+/// The committed library, and what its file looked like when it was
+/// loaded (Story 3.8: Install can replace the bundled library in place).
+struct Committed {
+    path: PathBuf,
+    identity: Option<FileIdentity>,
+}
+
+/// Enough of a file's metadata to tell that it was replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FileIdentity {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+fn committed() -> std::sync::MutexGuard<'static, Option<Committed>> {
+    COMMITTED_RUNTIME
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// The runtime library this process has committed, or `None` if no session
 /// build has loaded one yet.
 pub fn committed_runtime() -> Option<PathBuf> {
-    COMMITTED_RUNTIME
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
+    committed().as_ref().map(|committed| committed.path.clone())
 }
 
-/// Load ONNX Runtime itself.
-///
-/// Under `webgpu-probe` there is no dylib to resolve — that build statically
-/// links pyke's Dawn-bundling distribution — so `dylib` is ignored and the
-/// environment is committed as-is.
-#[cfg(not(feature = "dynamic-runtime"))]
-pub fn init_runtime(_dylib: &Path) -> Result<(), VoiceMeError> {
-    let _ = ort::init().with_name("voice-me").commit();
-    Ok(())
+/// Whether the committed library's file has been replaced on disk since it
+/// was loaded (Story 3.8: Install put voice-me's all-provider build where
+/// a CPU-only one was). The process keeps running the library it loaded,
+/// so only a restart picks up the new one.
+pub fn committed_runtime_replaced() -> bool {
+    committed().as_ref().is_some_and(|committed| {
+        file_identity(&committed.path).is_some_and(|now| Some(now) != committed.identity)
+    })
 }
 
 /// Load ONNX Runtime itself, from `dylib` — the path the caller resolved
@@ -217,18 +242,15 @@ pub fn init_runtime(_dylib: &Path) -> Result<(), VoiceMeError> {
 /// library is a no-op; one naming a *different* library is refused with a
 /// sentence saying a restart is needed, because `ort` would otherwise keep
 /// running the first library while the caller believed it had switched.
-#[cfg(feature = "dynamic-runtime")]
 pub fn init_runtime(dylib: &Path) -> Result<(), VoiceMeError> {
-    let mut committed = COMMITTED_RUNTIME
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut committed = committed();
     if let Some(loaded) = committed.as_ref() {
-        if loaded == dylib {
+        if loaded.path == dylib {
             return Ok(());
         }
         return Err(VoiceMeError::SpeechEngine(format!(
             "ONNX Runtime is already loaded from {} in this session; restart voice-me to use {}",
-            loaded.display(),
+            loaded.path.display(),
             dylib.display()
         )));
     }
@@ -239,6 +261,7 @@ pub fn init_runtime(dylib: &Path) -> Result<(), VoiceMeError> {
         });
     }
 
+    let identity = file_identity(dylib);
     // `commit()` returns `bool`, not `Result`: `false` means an environment
     // was already committed, which cannot happen here — this is the only
     // place that commits one, and it holds the lock.
@@ -248,9 +271,119 @@ pub fn init_runtime(dylib: &Path) -> Result<(), VoiceMeError> {
         })?
         .with_name("voice-me")
         .commit();
-    *committed = Some(dylib.to_path_buf());
+    *committed = Some(Committed {
+        path: dylib.to_path_buf(),
+        identity,
+    });
 
     Ok(())
+}
+
+/// NVIDIA libraries this process has loaded from the cache, held for its
+/// lifetime: unloading one under a live CUDA context would crash.
+static PRELOADED: Mutex<Vec<(PathBuf, libloading::Library)>> = Mutex::new(Vec::new());
+
+/// Story 3.8: load the NVIDIA `libraries` named (the ones the installed
+/// wheels recorded) from `dir` (`<cache>/runtime/cuda/`)
+/// before the CUDA provider is registered, so that when ONNX Runtime loads
+/// `onnxruntime_providers_cuda` its cudart, cuBLAS, cuFFT and cuDNN are
+/// already in the process — the user's `PATH` and `LD_LIBRARY_PATH` are
+/// never changed.
+///
+/// Linux: `dlopen` with `RTLD_GLOBAL`, so the provider's `DT_NEEDED`
+/// entries resolve to them by soname. Windows: each DLL is loaded by full
+/// path with its own folder searched for its dependencies; once loaded,
+/// cuDNN's loads of its sub-libraries by name find them in the process.
+/// A file not named — a library left by an older wheel, a `.part` — is
+/// never loaded.
+///
+/// Libraries depend on each other (cuBLAS on cuBLASLt, cuDNN's engines on
+/// its graph library), so loading repeats until a pass loads nothing more.
+/// Returns one line per library that still would not load, with the
+/// loader's reason — the caller adds them to the CUDA provider's own error
+/// if it then fails. A directory that is not there loads nothing.
+pub fn preload_cuda_libraries(dir: &Path, libraries: &[String]) -> Vec<String> {
+    let mut pending: Vec<PathBuf> = libraries
+        .iter()
+        .map(|name| dir.join(name))
+        .filter(|path| path.is_file() && is_shared_library(path))
+        .collect();
+
+    let mut loaded = PRELOADED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    pending.retain(|path| !loaded.iter().any(|(done, _)| done == path));
+    if pending.is_empty() {
+        return Vec::new();
+    }
+    let mut reasons: Vec<(PathBuf, String)> = Vec::new();
+    loop {
+        let before = pending.len();
+        let mut still = Vec::new();
+        for path in pending {
+            match open_library(&path) {
+                Ok(library) => loaded.push((path, library)),
+                Err(error) => {
+                    reasons.retain(|(seen, _)| seen != &path);
+                    reasons.push((path.clone(), error.to_string()));
+                    still.push(path);
+                }
+            }
+        }
+        pending = still;
+        if pending.is_empty() || pending.len() == before {
+            break;
+        }
+    }
+    reasons
+        .into_iter()
+        .filter(|(path, _)| pending.contains(path))
+        .map(|(path, reason)| {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            format!("{name}: {reason}")
+        })
+        .collect()
+}
+
+/// A `.dll` on Windows; `lib*.so` or `lib*.so.<n>` elsewhere. A `.part`
+/// left by an interrupted install is neither.
+fn is_shared_library(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if name.ends_with(".part") {
+        return false;
+    }
+    if cfg!(target_os = "windows") {
+        name.to_ascii_lowercase().ends_with(".dll")
+    } else {
+        name.ends_with(".so") || name.contains(".so.")
+    }
+}
+
+#[cfg(unix)]
+fn open_library(path: &Path) -> Result<libloading::Library, libloading::Error> {
+    use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
+    // SAFETY: NVIDIA's own libraries, from the pinned wheels voice-me
+    // installed; their initialisers only set up their own state.
+    unsafe { Library::open(Some(path), RTLD_NOW | RTLD_GLOBAL) }.map(Into::into)
+}
+
+#[cfg(windows)]
+fn open_library(path: &Path) -> Result<libloading::Library, libloading::Error> {
+    use libloading::os::windows::{
+        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, Library,
+    };
+    // SAFETY: as on unix. By full path, with this DLL's own folder searched
+    // for its dependencies — the process's DLL search path is not changed.
+    unsafe {
+        Library::load_with_flags(
+            path,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+        )
+    }
+    .map(Into::into)
 }
 
 /// Load the ONNX Runtime library at `dylib` and report which of the CPU,
@@ -363,6 +496,14 @@ fn engine<R>(what: &str, error: ort::Error<R>) -> VoiceMeError {
     VoiceMeError::SpeechEngine(format!("{what}: {error}"))
 }
 
+/// Held by every test that commits, or depends on, this process's runtime
+/// record, so none sees another's.
+#[cfg(test)]
+pub(crate) fn committed_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,9 +567,9 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "dynamic-runtime")]
     #[test]
     fn a_missing_onnx_runtime_names_the_dylib_rather_than_panicking() {
+        let _lock = committed_test_lock();
         let path = Path::new("/nonexistent/libonnxruntime.so");
         let error = init_runtime(path).unwrap_err();
         assert!(
@@ -460,13 +601,108 @@ mod tests {
         assert!(cuda.contains("CUDAExecutionProvider"), "{cuda}");
     }
 
-    #[cfg(feature = "dynamic-runtime")]
     #[test]
     fn a_file_that_is_not_there_is_refused_by_the_probe_naming_it() {
+        let _lock = committed_test_lock();
         let error = probe_runtime(Path::new("/nonexistent/libonnxruntime.so")).unwrap_err();
         assert!(
             matches!(&error, VoiceMeError::MissingRuntimeAsset { .. }),
             "got {error:?}"
         );
+    }
+
+    /// Story 3.8: a directory that is not there loads nothing and reports
+    /// nothing — the CUDA provider's own error says what is missing.
+    #[test]
+    fn preloading_a_missing_nvidia_directory_loads_nothing() {
+        assert!(
+            preload_cuda_libraries(
+                Path::new("/nonexistent/voice-me/runtime/cuda"),
+                &["libcudnn.so.9".to_string()]
+            )
+            .is_empty()
+        );
+    }
+
+    /// A named file that will not load is named with the loader's reason;
+    /// files not named (one left by an older wheel) or not libraries (a
+    /// `.part`, a wheel) are never tried.
+    #[test]
+    fn a_nvidia_library_that_will_not_load_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = if cfg!(target_os = "windows") {
+            "cudnn64_9.dll"
+        } else {
+            "libcudnn.so.9"
+        };
+        std::fs::write(dir.path().join(bogus), b"not a library").unwrap();
+        std::fs::write(dir.path().join(format!("{bogus}.part")), b"half").unwrap();
+        std::fs::write(dir.path().join("nvidia-cudnn.whl"), b"zip").unwrap();
+        let stale = if cfg!(target_os = "windows") {
+            "cudnn_old64_9.dll"
+        } else {
+            "libcudnn_old.so.9"
+        };
+        std::fs::write(dir.path().join(stale), b"not a library either").unwrap();
+
+        let failures = preload_cuda_libraries(
+            dir.path(),
+            &[
+                bogus.to_string(),
+                format!("{bogus}.part"),
+                "nvidia-cudnn.whl".to_string(),
+                "libnot-there.so.1".to_string(),
+            ],
+        );
+
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].starts_with(&format!("{bogus}: ")),
+            "{failures:?}"
+        );
+    }
+
+    #[test]
+    fn only_shared_libraries_are_preloaded() {
+        let unix = !cfg!(target_os = "windows");
+        assert_eq!(is_shared_library(Path::new("/c/libcudart.so.12")), unix);
+        assert_eq!(is_shared_library(Path::new("/c/libcufft.so")), unix);
+        assert_eq!(is_shared_library(Path::new("/c/cudart64_12.dll")), !unix);
+        assert!(!is_shared_library(Path::new("/c/libcudart.so.12.part")));
+        assert!(!is_shared_library(Path::new("/c/nvidia-cudnn.whl")));
+    }
+
+    /// Nothing committed: nothing can have been replaced.
+    #[test]
+    fn a_runtime_never_loaded_is_never_replaced() {
+        let _lock = committed_test_lock();
+        let previous = committed().take();
+
+        assert!(committed_runtime().is_none());
+        assert!(!committed_runtime_replaced());
+
+        *committed() = previous;
+    }
+
+    /// Story 3.8: a committed library whose file Install rewrote reads as
+    /// replaced; until then it does not.
+    #[test]
+    fn a_rewritten_committed_runtime_reads_as_replaced() {
+        let _lock = committed_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let library = dir.path().join("libonnxruntime.so");
+        std::fs::write(&library, b"the cpu build").unwrap();
+        let previous = committed().replace(Committed {
+            path: library.clone(),
+            identity: file_identity(&library),
+        });
+
+        let before = committed_runtime_replaced();
+        std::fs::write(&library, b"voice-me's all-provider build").unwrap();
+        let after = committed_runtime_replaced();
+
+        *committed() = previous;
+        assert!(!before);
+        assert!(after);
     }
 }

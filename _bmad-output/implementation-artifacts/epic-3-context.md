@@ -4,7 +4,7 @@
 
 ## Goal
 
-The app finds its own missing runtime dependencies and fixes them with one click from inside its UI. Anything it cannot fix automatically is named, with short manual steps. The user chooses which backend speaks for them in a dedicated Settings → Backend tab: local Chatterbox (CPU/CUDA/WebGPU), an instant local system voice, or a remote provider with their own key. Each backend has its own options and speech language. The app is honest about whether that backend can actually run on this machine. One executable per OS carries every backend, so every story here depends on the **selected** backend rather than on a build variant. For a user who installed no toolchain and reads no docs, this is the difference between voice-me working and not working.
+Make voice-me self-sufficient and honest about setup. The app detects the runtime dependencies it needs, provisions them with one click where it can, and gives manual steps where it can't. The user picks the speech backend in Settings → Backend: Local (Piper, Chatterbox on CPU/CUDA/WebGPU, or the instant system voice) or Remote (DeepInfra, fal.ai, Azure Neural TTS, Edge TTS). Each backend keeps its own options and speech language. The app always tells the truth about whether the selected backend can run on this machine. One executable per OS carries every backend, so every story here depends on the backend that is selected, not on a build variant. A user should never need a terminal, a wiki, or guesswork to get speaking.
 
 ## Stories
 
@@ -22,37 +22,83 @@ The app finds its own missing runtime dependencies and fixes them with one click
 - Story 3.12: Speak Instantly With eSpeak NG on Linux
 - Story 3.13: Speak Instantly With the Windows Speech Engine
 - Story 3.14: Generate Through Azure Neural TTS
+- Story 3.15: Speak Naturally and Instantly With Piper on Linux
+- Story 3.16: Speak With Piper on Windows
+- Story 3.17: Speak With Edge TTS on Linux
 
 ## Requirements & Constraints
 
-- The dependency check runs on first run and on demand. It needs no terminal and no external docs. The required list comes from the selected backend: the CPU backend never asks for GPU provider libraries or FP16 weights, and a GPU backend never asks for Q4 weights. A remote backend is ready when it has a key and a reachable provider, not when files are present.
-- Provisioning fetches only what the selected backend needs. For CPU that is about 1.56 GB: the core runtime plus the Q4 weights. For a GPU backend it is the provider-enabled runtime plus the FP16 weights. It never fetches both sets, and fetches nothing for a remote backend. Large downloads report progress and can resume. A failure names the file and the reason. A dependency that cannot be automated shows inline manual steps instead of an Install button, never a link to external docs.
-- **The CPU runtime is only the core ONNX Runtime shared library, with no execution-provider libraries.** It is the floor and is always shipped. It must stay fully usable whether or not the GPU runtime (Story 3.8) exists. Model weights and their pins are the same on every OS. Only the runtime library differs per platform: `libonnxruntime.so` on Linux, `onnxruntime.dll` on Windows.
-- Fail honestly (NFR4). A backend that cannot run here is described in words, together with what selecting CPU would do. The app never silently switches to another backend. "CPU mode" is an informational badge, not an error. Every generation, provisioning or check failure reaches the user as a specific notification or row message.
-- No installer or setup wizard (NFR6). Runtime assets are installed by the app on first run, and a finished install unblocks the overlay without a restart.
-- Remote backends: before the first request, the app tells the user what is sent and asks once per provider, and core enforces this. The key is stored as plaintext in settings, the UI says so, and the key is never logged. Failures name the provider and are never re-sent automatically. Stock-voice backends never receive the Reference Voice Sample.
-- Speech language is set per backend. Local Chatterbox offers only languages that need no Python normalization (Turkish, English). Remote and system backends offer their own language sets. The UI language is independent of the speech language.
+- **Dependencies follow the selected backend.** The required list is derived from the selected backend. CPU never reports GPU provider libraries. A GPU backend never reports Q4 weights. A remote backend's readiness means a key and a reachable provider, not files. Checks run on first run and on demand, and need no terminal.
+- **Asset sets per backend:**
+  - CPU: core ONNX Runtime plus `language_model_q4`, about 1.56 GB in total.
+  - GPU: provider libraries plus `language_model_fp16`, never both sets.
+  - Piper: the shared CPU runtime plus about 63 MB per voice.
+  - Remote: nothing.
+  - Model weights (354 MB to 1.04 GB) download with progress and can resume.
+- **Fail honestly.** A backend that can't run here is named in words, with what selecting CPU would do and a one-click CPU selection. There is no silent substitution. The UI shows the backend that was actually acquired at session build, not what was requested. Choosing CPU on a machine with a GPU is a normal state ("CPU mode" badge), not an error.
+- **Blocking behaviour.** While a required dependency is missing, pressing the hotkey auto-opens Settings → Dependencies naming the blocker. The overlay still opens but shows an inline notice and accepts no input. Once the blocker is resolved, the overlay works normally again without a restart.
+- **Selection.** Backend, per-backend speech language, stock voice and GPU device persist through `SettingsStore`. Changes apply to the next Speak Action without a restart; a local switch rebuilds the session. When nothing is selected, the default is Piper with `tr_TR-fahrettin-medium` where this OS has Piper, otherwise CPU with no device preference. An explicit selection is never rewritten. A GPU device that has disappeared is reported and the default is used. A device that loses its context mid-generation is an error, and its audio is never played.
+- **Remote providers:**
+  - Before the first request to each provider, a one-time disclosure states what is sent (text, language tag, and the sample for cloning providers, or the voice for stock-voice providers). Core enforces it, not the adapter.
+  - The only request allowed before the disclosure is a stock-voice provider's voice-list fetch, sent with the key alone.
+  - Keys are stored in plaintext in settings, with a notice where the key is entered, and are never logged. Azure also stores its region.
+  - A cloning provider uploads the sample once, keyed by (provider, sample hash), so re-recording invalidates it. The UI shows that the sample is held on the provider and offers a way to delete it.
+  - Failures produce one notification naming the provider and the reason. There is no automatic retry that re-sends data.
+- **Stock-voice backends** (Piper, system voice, Azure, Edge TTS) are labelled "stock voice" and never receive the Reference Voice Sample. The local ones open no socket and need no disclosure. While Piper is selected, Settings does not auto-open for a missing voice sample.
+- **Speech languages are per backend.** Core validates each Speak Action's language against the selected backend's own list:
+  - Local Chatterbox: Turkish and English only.
+  - DeepInfra: its 23 languages.
+  - eSpeak NG, Windows voices, Piper and Edge TTS: their own lists.
+  - An existing `speech_language` value seeds the Local and DeepInfra choices on first load.
+  - Speech language is independent of the UI language (Epic 4).
+- Any failure (generation, provisioning or dependency check) reaches the user as a specific in-app message or OS notification naming the backend or dependency.
 
 ## Technical Decisions
 
-- **Runtime assets are hosted on this repo's GitHub Releases (AD-7).** Any runtime asset that is small enough and legally redistributable should be mirrored as a versioned GitHub Release asset. This includes the ONNX Runtime shared library and the Windows virtual-audio driver installer. Provisioning must support more than one trusted source. An asset may come from any stable, versioned, resumable HTTPS URL: the pinned upstream origin such as Microsoft's ONNX Runtime GitHub release or Hugging Face at a pinned revision, or this repo's mirror. The right choice is a URL that cannot change.
-- **Current sources, until the mirror exists:** weights come from `onnx-community/chatterbox-multilingual-ONNX` at a pinned Hugging Face revision. The runtime comes from Microsoft's official ONNX Runtime 1.28.2 release asset. All sources live in one table in `voice-me-deps`, with URL, size and **SHA-256 pinned in code** for each asset, so a later mirror only changes URLs. Each file downloads to `.part`, is checked against its SHA-256, and gets its final name only by an atomic rename. From an archive, only the real shared library is extracted, into the deps-owned cache path the core asset vocabulary resolves.
-- **Network egress is limited to two crates (AD-8):** `voice-me-deps` (asset fetches from trusted sources) and `voice-me-tts-remote` (the provider the user selected). A CI allowlist enforces this. It uses plain HTTPS GETs through `reqwest` with rustls, and no Hugging Face Hub client. `voice-me-tts-onnx`, and both system-voice crates, open no sockets. `ort` uses `load-dynamic`: the runtime is provisioned locally and resolved at run time (for example through `ORT_DYLIB_PATH` or the bundled cache path). It is never downloaded at build or run time.
-- **One runtime carries every provider (AD-7, Story 3.8).** `ort` loads exactly one ONNX Runtime library per process. So the GPU path is a single CI build from source (`--use_cuda --use_webgpu --build_shared_lib`), matched to the pinned `ort` rc (2.0.0-rc.13) and mirrored as a versioned, resumable release asset. With that runtime installed, switching between CPU, CUDA and WebGPU rebuilds the session without restarting the process. Until 3.8 lands, a GPU backend's runtime row is manual and says its runtime is not available yet. Windows GPU (DirectML/D3D12) is still unresolved.
-- **Backend resolution happens in core (AD-9).** It combines the user's persisted selection with the capability `voice-me-deps` detects. Deps reports only through `AppEvent` and never calls a TTS adapter. Adapters read the resolved backend, device and weight variant (FP16 on GPU, Q4 on CPU) from `AppState`. The UI shows what the session **actually acquired** when it was built, not what was requested. If nothing is selected, the backend is CPU.
-- Settings and the key go through `SettingsStore`, in one TOML file. Runtime and weight files live in a separate OS cache directory that only `voice-me-deps` writes (AD-6).
-- `voice-me-tts-remote` holds one `SpeechProvider` per vendor. Cloning providers upload the sample once and cache its id by (provider, sample hash). Stock-voice providers such as Azure take a voice name instead (AD-13). All backends return the shared 24 kHz mono f32 buffer (AD-11).
-- eSpeak NG runs as a child process: found by fixed name on PATH, text passed on stdin, no shell, 10 s deadline. This is the only exception to the no-child-process rule. The Windows system voice uses WinRT `SpeechSynthesizer` writing to a stream, never to the speaker.
-- Never run a clean build. Build incrementally.
+- **Hexagonal boundaries:**
+  - `voice-me-deps` owns detection, provisioning and the cache directory. It reports capability, including a list of candidate GPU devices, only by emitting `AppEvent`.
+  - `voice-me-core` reconciles the user's selection with the detected capability into one `AppState` value: active backend, device and weight variant.
+  - TTS adapters read `AppState`. They never call `voice-me-deps`, and `voice-me-deps` never calls them.
+- **Network egress** is allowed only in `voice-me-deps` and `voice-me-tts-remote`, enforced by a CI allowlist. `hf-hub` and similar clients are banned elsewhere. The `edge-tts` child process reaches the network itself; it is spawned only while Edge TTS is selected and its disclosure is confirmed.
+- **Asset sources:**
+  - Runtime and weights are mirrored on this repo's GitHub Releases, versioned and resumable.
+  - Assets too large to mirror use a pinned static URL, such as Hugging Face at a pinned revision.
+  - Piper voices are not mirrored. They come from three catalogs merged in order: voice-me's `piper-voices/catalog.json` (SHA-256), `rhasspy/piper-voices` at a pinned revision (MD5), and `speaches-ai` (LFS SHA-256 / Git blob SHA-1). Each file is checked against its source's digest.
+  - Voices are cached at `<cache>/piper/<key>/` with a `voice.toml`.
+  - The VB-CABLE driver is not redistributable and is always fetched from VB-Audio.
+  - eSpeak NG for Windows comes from its official release, with the URL and SHA-256 pinned.
+- **One ONNX Runtime per process.** CI builds it from source with `--use_cuda --use_webgpu --build_shared_lib`, so CPU, CUDA and WebGPU all live in one library and switching between them is a session rebuild. `voice-me-tts-onnx` removes the `webgpu-probe` feature and its build-time download. CPU must stay usable without this build.
+- **Backend crates, all behind `TtsPort`:**
+  - `voice-me-tts-onnx`: Chatterbox, FP16 on GPU, Q4 on CPU.
+  - `voice-me-tts-remote`: one `SpeechProvider` per vendor. Cloning providers are DeepInfra and fal.ai; stock-voice providers are Azure and Edge TTS. No provider-specific type reaches core or UI.
+  - `voice-me-tts-piper`: VITS on `ort`, CPU execution provider only, built once per voice. Phonemes come from `espeak-ng --ipa`, never `--ipa=3`.
+  - `voice-me-tts-system-linux`, `voice-me-tts-system-windows` (WinRT `SpeechSynthesizer`, never to the speaker), and `voice-me-tts-edge`.
+- **Child processes.** Only `voice-me-espeak` spawns processes: `espeak-ng` and `edge-tts`. Each is resolved by fixed name (`edge-tts` also in `~/.local/bin`), text goes on stdin, no shell is used, and deadlines are 10 s (espeak) or 30 s (edge-tts). No GPL engine code is linked.
+- **Audio format.** Every backend returns the shared 24 kHz mono f32 buffer. Adapters resample or decode internally: Azure requests `riff-24khz-16bit-mono-pcm`; Edge TTS returns MP3, decoded with `symphonia`.
+- Errors are mapped to the single domain error enum at the adapter boundary. Generation runs on `spawn_blocking`, with one generation in flight at a time.
 
 ## UX & Interaction Patterns
 
-- Settings → Dependencies: one row per dependency, each with a status badge (ready / missing / installing), plus Install with a progress bar, or inline "Show steps". Status is never shown by color alone. A blocking missing dependency opens this tab automatically. The overlay still opens, but shows an inline notice instead of taking input.
-- Settings → Backend has two steps: Local or Remote, then a backend. Only that backend's options are shown: added runtimes, API key with the plaintext notice, sample state, GPU device, speech language and voice. The Selected and Active lines and the "CPU mode" badge are here too. Stock-voice backends are labelled "stock voice".
+- **Settings → Backend:**
+  - Two steps: Local or Remote, then a backend.
+  - Only the selected backend's options appear: speech language, voice picker, key and region, remote sample state, GPU device selector.
+  - Read-only Selected and Active lines plus the "CPU mode" badge.
+  - Piper is listed first. Edge TTS is always selectable and has no key field.
+- **Settings → Dependencies** holds only dependency rows (name, a status badge that uses words, "Install" or a manual-steps link) and a speech-blocking capability row that links to the Backend tab.
+- **Manual-steps rows:**
+  - "eSpeak NG is not installed" with the distro's command. It is shared by the system voice and Piper.
+  - "edge-tts is not installed. Please install it: pipx install edge-tts". voice-me never runs pip.
+  - A Windows language with no installed voice.
+- **Settings → Piper voices** lists voices, filterable by language and by search. Each row offers Download (with a progress bar), Delete and Use. A catalog that fails shows as one inline line while the others still appear. Catalogs are fetched only when the tab is opened or refreshed.
+- The remote disclosure is a `Dialog`. Declining leaves the backend selected but unusable, never switched.
+- Use gpui-kit components and follow the Design Guides. Status is never shown by color alone.
 
 ## Cross-Story Dependencies
 
-- Stories 3.1, 3.2, 3.3 and 3.4 share one asset vocabulary in core, used by the check, the provisioning plan and the engine. Do not fork it.
-- Story 3.8 blocks the GPU backends (3.9, and CUDA/WebGPU provisioning in 3.2). It does not block CPU. When 3.8 lands, it should only swap URLs in the pinned source table.
-- Stories 3.10 and 3.11 depend on 3.5, 3.6 and 3.7. Stories 3.12, 3.13 and 3.14 add entries to the Backend tab.
-- Windows items depend on Epic 2's Windows tray and hotkey work and on Story 2.8 (Windows virtual mic control surface, still unresolved) before they can be verified by hand.
+- 3.1 → 3.2 → 3.3/3.4 form the dependency pipeline. 3.5 supplies the selection they derive from.
+- 3.10 moves the backend UI into its own tab. 3.7, 3.9, 3.11 and 3.12–3.17 build on that tab.
+- 3.6 creates the `SpeechProvider` abstraction that 3.7 and 3.14 extend. Edge TTS (3.17) reuses 3.14's stock-voice list and disclosure.
+- 3.8 gates the GPU backends and 3.9.
+- 3.12 sets the child-process pattern. 3.15 moves it into `voice-me-espeak`, which 3.17 reuses. 3.16 depends on 3.15.
+- Windows stories (3.13, 3.16) need a CI compile and passing unit tests. Manual checks wait until the Windows app can start (Epic 2, Story 2.8 and the tray).
+- Relies on Epic 2's `TtsPort`, the Virtual Microphone, notifications and the Prompt Overlay. Epic 4 adds the Turkish strings for the new copy.

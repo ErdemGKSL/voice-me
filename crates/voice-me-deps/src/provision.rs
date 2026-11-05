@@ -22,7 +22,7 @@ use reqwest::header::{CONTENT_RANGE, RANGE};
 use sha2::{Digest as _, Sha256};
 use voice_me_core::{AppEvent, AppEventSender, DependencyKind, VoiceMeError, format_bytes};
 
-use crate::sources::{Asset, PlannedDownload};
+use crate::sources::{Asset, Digest, LibraryEntry, PlannedDownload};
 
 /// The fastest a row's progress is reported: about ten times a second.
 /// Faster only floods the one channel every other event shares.
@@ -32,9 +32,18 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Sends `ProvisioningProgress` for one row, throttled.
+/// What a [`ProgressReporter`] reports on: a Dependencies row, or a voice
+/// being downloaded from the Piper voices tab (Story 3.15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgressTarget {
+    Row(DependencyKind),
+    PiperVoice(String),
+}
+
+/// Sends `ProvisioningProgress` (or `PiperVoiceProgress`) for one row,
+/// throttled.
 pub struct ProgressReporter {
-    kind: DependencyKind,
+    target: ProgressTarget,
     events: AppEventSender,
     done: u64,
     total: u64,
@@ -51,13 +60,22 @@ impl ProgressReporter {
         events: AppEventSender,
         plan: &[PlannedDownload],
     ) -> Self {
+        Self::for_target(ProgressTarget::Row(kind), events, plan)
+    }
+
+    /// [`Self::for_plan`], for any target.
+    pub fn for_target(
+        target: ProgressTarget,
+        events: AppEventSender,
+        plan: &[PlannedDownload],
+    ) -> Self {
         let total = plan.iter().map(|planned| planned.asset.size).sum();
         let done = plan
             .iter()
             .map(|planned| part_len(&planned.destination).min(planned.asset.size))
             .sum();
         let mut reporter = Self {
-            kind,
+            target,
             events,
             done,
             total,
@@ -94,11 +112,19 @@ impl ProgressReporter {
         self.last_sent = Some(Instant::now());
         // A closed receiver means the app is quitting; the download carries
         // on to its next safe point regardless.
-        let _ = self.events.unbounded_send(AppEvent::ProvisioningProgress {
-            kind: self.kind,
-            done_bytes: self.done,
-            total_bytes: self.total,
-        });
+        let event = match &self.target {
+            ProgressTarget::Row(kind) => AppEvent::ProvisioningProgress {
+                kind: *kind,
+                done_bytes: self.done,
+                total_bytes: self.total,
+            },
+            ProgressTarget::PiperVoice(key) => AppEvent::PiperVoiceProgress {
+                key: key.clone(),
+                done_bytes: self.done,
+                total_bytes: self.total,
+            },
+        };
+        let _ = self.events.unbounded_send(event);
     }
 }
 
@@ -280,17 +306,18 @@ fn content_range_start(response: &reqwest::Response) -> Option<u64> {
     range.split('-').next()?.trim().parse().ok()
 }
 
-/// Hash the finished `.part` and compare. A mismatch deletes it: those
-/// bytes are wrong, and resuming onto them would only be wrong again.
+/// Hash the finished `.part` with the asset's digest and compare. A
+/// mismatch deletes it: those bytes are wrong, and resuming onto them would
+/// only be wrong again.
 fn verify(asset: &Asset, part: &Path, dir: &Path) -> Result<(), VoiceMeError> {
     let name = asset.file_name();
-    let actual = sha256_file(part).map_err(|error| {
+    let actual = digest_file(&asset.digest, part).map_err(|error| {
         VoiceMeError::Other(format!(
             "Could not read {name} back from {} to check it: {error}",
             dir.display()
         ))
     })?;
-    if actual.eq_ignore_ascii_case(&asset.sha256) {
+    if actual.eq_ignore_ascii_case(asset.digest.expected()) {
         return Ok(());
     }
     remove_part(part, dir)?;
@@ -299,19 +326,43 @@ fn verify(asset: &Asset, part: &Path, dir: &Path) -> Result<(), VoiceMeError> {
     )))
 }
 
+/// Whether the file at `path` is exactly `asset`: its pinned size, then its
+/// digest (Story 3.16: a package already on disk is reused only then).
+pub fn is_verified(asset: &Asset, path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.len() == asset.size)
+        && digest_file(&asset.digest, path)
+            .is_ok_and(|actual| actual.eq_ignore_ascii_case(asset.digest.expected()))
+}
+
 /// Lowercase hex SHA-256 of a file, read in 1 MiB pieces.
 pub fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 1 << 20];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    digest_file(&Digest::Sha256(String::new()), path)
+}
+
+/// Lowercase hex of `path` under the kind of checksum `digest` is.
+pub fn digest_file(digest: &Digest, path: &Path) -> std::io::Result<String> {
+    fn hash<D: sha2::Digest>(mut hasher: D, file: &mut File) -> std::io::Result<String> {
+        let mut buffer = vec![0_u8; 1 << 20];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
         }
-        hasher.update(&buffer[..read]);
+        Ok(hex(&hasher.finalize()))
     }
-    Ok(hex(&hasher.finalize()))
+    let mut file = File::open(path)?;
+    match digest {
+        Digest::Sha256(_) => hash(Sha256::new(), &mut file),
+        Digest::Md5(_) => hash(md5::Md5::new(), &mut file),
+        Digest::GitBlobSha1(_) => {
+            let len = file.metadata()?.len();
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(format!("blob {len}\0").as_bytes());
+            hash(hasher, &mut file)
+        }
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -329,102 +380,278 @@ fn remove_part(part: &Path, dir: &Path) -> Result<(), VoiceMeError> {
     }
 }
 
-/// Pull the one real runtime library out of the verified archive and give
-/// it its final name — `.part` then rename, like every download.
+/// Pull the named shared libraries out of a verified archive into `dir`,
+/// each under its [`LibraryEntry::file_name`] — `.part` then rename, like
+/// every download (Story 3.8: the core runtime carries two, a cuDNN wheel
+/// eight).
 ///
 /// The format follows the archive's extension: `.zip` (the Windows
-/// release) is read as a zip, anything else as a `.tgz` (the Linux one).
-/// Only a regular-file entry counts: the Linux archive's
-/// `libonnxruntime.so` is a symlink chain, and extracting a symlink into
-/// the cache would leave the engine loading whatever it points at.
-pub fn extract_runtime_library(
+/// release, and NVIDIA's `.whl` wheels, which are zip files) is read as a
+/// zip, anything else as a `.tgz` (the Linux one). Only a regular-file
+/// entry counts: the Linux archive's `libonnxruntime.so` is a symlink
+/// chain, and extracting a symlink into the cache would leave the engine
+/// loading whatever it points at.
+///
+/// All or nothing: every library is written to its `.part` first, and
+/// only when the archive held all of them are they renamed into place. An
+/// archive missing one leaves no library behind, so the Dependency Check
+/// never sees half a runtime as installed.
+pub fn extract_libraries(
     archive: &Path,
-    entry_name: &str,
-    destination: &Path,
+    entries: &[LibraryEntry],
+    dir: &Path,
 ) -> Result<(), VoiceMeError> {
-    let library = destination
+    let archive_name = archive
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let library = |entry: &LibraryEntry| entry.file_name.clone();
+    let first = entries.first().map(library).unwrap_or_default();
+    let failed_for = |library: &str, reason: String| {
+        VoiceMeError::Other(format!(
+            "Extraction of {library} from {archive_name} failed: {reason}"
+        ))
+    };
+    let failed = |reason: String| failed_for(&first, reason);
+
+    std::fs::create_dir_all(dir)
+        .map_err(|error| failed(format!("could not create {}: {error}", dir.display())))?;
+
+    let file = File::open(archive).map_err(|error| failed(error.to_string()))?;
+    let is_zip = archive.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("zip") || extension.eq_ignore_ascii_case("whl")
+    });
+    let written = if is_zip {
+        extract_zip_entries(file, entries, dir, &failed)
+    } else {
+        extract_tar_entries(file, entries, dir, &failed)
+    };
+    let remove_parts = |found: &[bool]| {
+        for (entry, _) in entries.iter().zip(found).filter(|(_, found)| **found) {
+            let _ = std::fs::remove_file(part_path(&dir.join(&entry.file_name)));
+        }
+    };
+    let found = match written {
+        Ok(found) => found,
+        Err((found, error)) => {
+            remove_parts(&found);
+            return Err(error);
+        }
+    };
+    if let Some(missing) = entries.iter().zip(&found).find(|(_, found)| !**found) {
+        remove_parts(&found);
+        return Err(failed_for(
+            &missing.0.file_name,
+            format!("the archive has no {}", missing.0.entry),
+        ));
+    }
+    // Every existing library steps aside to `<name>.old` before its new
+    // copy takes the name. Any failure puts every one of them back, so the
+    // directory holds the old set or the new one, never a mix.
+    let mut placed: Vec<(PathBuf, Option<PathBuf>)> = Vec::with_capacity(entries.len());
+    let restore = |placed: &[(PathBuf, Option<PathBuf>)]| {
+        for (destination, backup) in placed.iter().rev() {
+            let _ = std::fs::remove_file(destination);
+            if let Some(backup) = backup {
+                let _ = std::fs::rename(backup, destination);
+            }
+        }
+    };
+    for entry in entries {
+        let destination = dir.join(&entry.file_name);
+        let backup = if destination.is_file() {
+            let backup = backup_path(&destination);
+            let _ = std::fs::remove_file(&backup);
+            if let Err(error) = std::fs::rename(&destination, &backup) {
+                restore(&placed);
+                remove_parts(&found);
+                return Err(failed_for(
+                    &entry.file_name,
+                    format!(
+                        "could not move the old one aside in {}: {error}",
+                        dir.display()
+                    ),
+                ));
+            }
+            Some(backup)
+        } else {
+            None
+        };
+        if let Err(error) = std::fs::rename(part_path(&destination), &destination) {
+            if let Some(backup) = &backup {
+                let _ = std::fs::rename(backup, &destination);
+            }
+            restore(&placed);
+            remove_parts(&found);
+            return Err(failed_for(
+                &entry.file_name,
+                format!("could not move it into place in {}: {error}", dir.display()),
+            ));
+        }
+        placed.push((destination, backup));
+    }
+    // Only now is the old set of no further use. A backup Windows still
+    // holds open (a loaded DLL) stays until a later run.
+    for (_, backup) in placed {
+        if let Some(backup) = backup {
+            let _ = std::fs::remove_file(backup);
+        }
+    }
+    Ok(())
+}
+
+/// `<destination>.old`: where an existing library waits while its new copy
+/// is moved in.
+fn backup_path(destination: &Path) -> PathBuf {
+    let mut name = destination
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    name.push(".old");
+    destination.with_file_name(name)
+}
+
+/// Which of `entries` an extractor wrote to its `.part` — or, on failure,
+/// that list so far with the error.
+type Extracted = Result<Vec<bool>, (Vec<bool>, VoiceMeError)>;
+
+/// The `.tgz` reader: one pass, taking every regular file whose path is one
+/// of `entries`.
+fn extract_tar_entries(
+    file: File,
+    entries: &[LibraryEntry],
+    dir: &Path,
+    failed: &dyn Fn(String) -> VoiceMeError,
+) -> Extracted {
+    let mut found = vec![false; entries.len()];
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
+    let members = match tar.entries() {
+        Ok(members) => members,
+        Err(error) => return Err((found, failed(error.to_string()))),
+    };
+    for member in members {
+        let mut member = match member {
+            Ok(member) => member,
+            Err(error) => return Err((found, failed(error.to_string()))),
+        };
+        if !member.header().entry_type().is_file() {
+            continue;
+        }
+        let Some(index) = member.path().ok().and_then(|path| {
+            entries
+                .iter()
+                .position(|entry| path == Path::new(&entry.entry))
+        }) else {
+            continue;
+        };
+        if found[index] {
+            continue;
+        }
+        let part = part_path(&dir.join(&entries[index].file_name));
+        if let Err(error) = write_part(&mut member, &part, dir, failed) {
+            return Err((found, error));
+        }
+        found[index] = true;
+    }
+    Ok(found)
+}
+
+/// The `.zip` reader: each entry is taken by its exact name and must be a
+/// regular file — not a directory, not a symlink.
+fn extract_zip_entries(
+    file: File,
+    entries: &[LibraryEntry],
+    dir: &Path,
+    failed: &dyn Fn(String) -> VoiceMeError,
+) -> Extracted {
+    let mut found = vec![false; entries.len()];
+    let mut zip = match zip::ZipArchive::new(std::io::BufReader::new(file)) {
+        Ok(zip) => zip,
+        Err(error) => return Err((found, failed(error.to_string()))),
+    };
+    for (index, entry) in entries.iter().enumerate() {
+        let mut member = match zip.by_name(&entry.entry) {
+            Ok(member) => member,
+            Err(zip::result::ZipError::FileNotFound) => continue,
+            Err(error) => return Err((found, failed(error.to_string()))),
+        };
+        if !member.is_file() || member.is_symlink() {
+            continue;
+        }
+        let part = part_path(&dir.join(&entry.file_name));
+        if let Err(error) = write_part(&mut member, &part, dir, failed) {
+            return Err((found, error));
+        }
+        found[index] = true;
+    }
+    Ok(found)
+}
+
+/// Unpack a whole verified `.zip` into `dir` (Story 2.8: the VB-CABLE
+/// driver pack, whose setup program needs the files beside it).
+///
+/// Every entry is placed only by its enclosed name — no absolute path, no
+/// `..` escaping `dir` — and the names are all checked before anything is
+/// written, so an archive with one unsafe entry writes nothing at all. A
+/// symlink entry is refused the same way. Each file arrives through its own
+/// `.part` and is renamed into place, like every download.
+pub fn extract_zip_into_dir(archive: &Path, dir: &Path) -> Result<(), VoiceMeError> {
     let archive_name = archive
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     let failed = |reason: String| {
-        VoiceMeError::Other(format!(
-            "Extraction of {library} from {archive_name} failed: {reason}"
-        ))
+        VoiceMeError::Other(format!("Extraction of {archive_name} failed: {reason}"))
     };
-
-    let dir = destination
-        .parent()
-        .ok_or_else(|| failed("no directory to extract into".to_string()))?;
-    std::fs::create_dir_all(dir)
-        .map_err(|error| failed(format!("could not create {}: {error}", dir.display())))?;
 
     let file = File::open(archive).map_err(|error| failed(error.to_string()))?;
-    let is_zip = archive
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"));
-    let found = if is_zip {
-        extract_zip_entry(file, entry_name, destination, dir, &failed)?
-    } else {
-        extract_tar_entry(file, entry_name, destination, dir, &failed)?
-    };
-    if found {
-        Ok(())
-    } else {
-        Err(failed(format!("the archive has no {entry_name}")))
-    }
-}
-
-/// The `.tgz` reader: `Ok(false)` when no regular file has that name.
-fn extract_tar_entry(
-    file: File,
-    entry_name: &str,
-    destination: &Path,
-    dir: &Path,
-    failed: &dyn Fn(String) -> VoiceMeError,
-) -> Result<bool, VoiceMeError> {
-    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
-    let entries = tar.entries().map_err(|error| failed(error.to_string()))?;
-    for entry in entries {
-        let mut entry = entry.map_err(|error| failed(error.to_string()))?;
-        let is_library = entry
-            .path()
-            .map(|path| path == Path::new(entry_name))
-            .unwrap_or(false);
-        if !is_library || !entry.header().entry_type().is_file() {
-            continue;
-        }
-        write_entry(&mut entry, destination, dir, failed)?;
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-/// The `.zip` reader: the entry is taken by its exact name and must be a
-/// regular file — not a directory, not a symlink. `Ok(false)` when there is
-/// no such file.
-fn extract_zip_entry(
-    file: File,
-    entry_name: &str,
-    destination: &Path,
-    dir: &Path,
-    failed: &dyn Fn(String) -> VoiceMeError,
-) -> Result<bool, VoiceMeError> {
     let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
         .map_err(|error| failed(error.to_string()))?;
-    let mut entry = match zip.by_name(entry_name) {
-        Ok(entry) => entry,
-        Err(zip::result::ZipError::FileNotFound) => return Ok(false),
-        Err(error) => return Err(failed(error.to_string())),
-    };
-    if !entry.is_file() || entry.is_symlink() {
-        return Ok(false);
+
+    // First pass: where every entry would go, refusing the archive outright
+    // on the first one that would land outside `dir`.
+    let mut placed = Vec::with_capacity(zip.len());
+    for index in 0..zip.len() {
+        let entry = zip
+            .by_index(index)
+            .map_err(|error| failed(error.to_string()))?;
+        let Some(relative) = entry.enclosed_name() else {
+            return Err(failed(format!(
+                "it holds an entry with an unsafe name ({})",
+                entry.name()
+            )));
+        };
+        if entry.is_symlink() {
+            return Err(failed(format!(
+                "it holds a symbolic link ({})",
+                entry.name()
+            )));
+        }
+        placed.push((relative, entry.is_dir()));
     }
-    write_entry(&mut entry, destination, dir, failed)?;
-    Ok(true)
+
+    std::fs::create_dir_all(dir)
+        .map_err(|error| failed(format!("could not create {}: {error}", dir.display())))?;
+    for (index, (relative, is_dir)) in placed.into_iter().enumerate() {
+        let destination = dir.join(&relative);
+        if is_dir {
+            std::fs::create_dir_all(&destination).map_err(|error| {
+                failed(format!(
+                    "could not create {}: {error}",
+                    destination.display()
+                ))
+            })?;
+            continue;
+        }
+        let parent = destination.parent().unwrap_or(dir).to_path_buf();
+        std::fs::create_dir_all(&parent)
+            .map_err(|error| failed(format!("could not create {}: {error}", parent.display())))?;
+        let mut entry = zip
+            .by_index(index)
+            .map_err(|error| failed(error.to_string()))?;
+        write_entry(&mut entry, &destination, &parent, &failed)?;
+    }
+    Ok(())
 }
 
 /// Write one archive entry to `destination` through its `.part` (made
@@ -436,20 +663,7 @@ fn write_entry(
     failed: &dyn Fn(String) -> VoiceMeError,
 ) -> Result<(), VoiceMeError> {
     let part = part_path(destination);
-    let mut out = File::create(&part)
-        .map_err(|error| failed(format!("could not write to {}: {error}", dir.display())))?;
-    std::io::copy(entry, &mut out)
-        .and_then(|_| out.sync_all())
-        .map_err(|error| {
-            let _ = std::fs::remove_file(&part);
-            failed(format!("could not write to {}: {error}", dir.display()))
-        })?;
-    drop(out);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755));
-    }
+    write_part(entry, &part, dir, failed)?;
     std::fs::rename(&part, destination).map_err(|error| {
         let _ = std::fs::remove_file(&part);
         failed(format!(
@@ -457,6 +671,31 @@ fn write_entry(
             dir.display()
         ))
     })
+}
+
+/// Write one archive entry to `part`, made executable on unix. A failed
+/// write leaves no `.part` behind.
+fn write_part(
+    entry: &mut dyn std::io::Read,
+    part: &Path,
+    dir: &Path,
+    failed: &dyn Fn(String) -> VoiceMeError,
+) -> Result<(), VoiceMeError> {
+    let mut out = File::create(part)
+        .map_err(|error| failed(format!("could not write to {}: {error}", dir.display())))?;
+    std::io::copy(entry, &mut out)
+        .and_then(|_| out.sync_all())
+        .map_err(|error| {
+            let _ = std::fs::remove_file(part);
+            failed(format!("could not write to {}: {error}", dir.display()))
+        })?;
+    drop(out);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(part, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok(())
 }
 
 fn kept_sentence(kept: u64, size: u64) -> String {
@@ -512,7 +751,7 @@ fn write_error(
 /// The innermost cause, which is where the words a person can act on live
 /// ("Connection reset by peer"), rather than reqwest's outer "error sending
 /// request for url (…)" wrapper.
-fn reason(error: &(dyn std::error::Error + 'static)) -> String {
+pub(crate) fn reason(error: &(dyn std::error::Error + 'static)) -> String {
     let mut innermost = error;
     while let Some(source) = innermost.source() {
         innermost = source;

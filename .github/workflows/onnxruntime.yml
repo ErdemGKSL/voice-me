@@ -1,0 +1,340 @@
+name: ONNX Runtime (all providers)
+
+# Story 3.8: build ONNX Runtime from source with the CPU, CUDA and WebGPU
+# execution providers in one shared library, and mirror it on this repo's
+# Releases as `onnxruntime-<version>-voiceme.<n>`, where `voice-me-deps`
+# provisions it like any other pinned asset (AD-7). Microsoft ships no
+# WebGPU build, so this is the only source of one.
+#
+# Per OS it publishes two archives:
+# - core: `onnxruntime` + `onnxruntime_providers_shared` (+ Dawn, for WebGPU).
+#   Every backend downloads it.
+# - cuda: `onnxruntime_providers_cuda`. Only a CUDA backend downloads it,
+#   together with NVIDIA's own wheels for cudart/cuBLAS/cuFFT/cuDNN.
+#
+# Runs by itself only when the runtime voice-me pins changes: a push to main
+# touching `crates/voice-me-deps/src/sources.rs` (or this file) builds
+# `VOICEME_RUNTIME_TAG` from there, and only if that release does not exist
+# yet. So bumping the ONNX Runtime version or the `.N` build number there
+# starts a build; pinning, or any other edit, does not. A build takes hours,
+# and a published asset is pinned by size and SHA-256 in `sources.rs`, so it
+# never changes under the same name: to rebuild with other settings (CUDA,
+# cuDNN, flags), bump the build number. Started by hand, it always builds.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - crates/voice-me-deps/src/sources.rs
+      - .github/workflows/onnxruntime.yml
+  workflow_dispatch:
+    inputs:
+      ort_version:
+        description: ONNX Runtime release tag to build (without the leading v)
+        default: "1.28.2"
+      build_number:
+        description: voice-me build number of this runtime (the .N in the tag)
+        default: "1"
+      targets:
+        description: Which builds to run (both, linux or windows)
+        default: both
+      reuse_run_id:
+        description: >-
+          Optional run id whose uploaded build artifacts the release reuses
+          (e.g. a finished Linux build when only Windows is re-run)
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: onnxruntime-${{ inputs.targets || 'both' }}
+  cancel-in-progress: false
+
+env:
+  # Decision 5: CUDA 12.8, compute capability 6.0 upwards. Real code for
+  # Pascal, Turing, Ampere (sm_80 code also runs on sm_86/sm_89) and consumer
+  # Blackwell; compute_60 PTX lets the driver JIT for everything else (Volta,
+  # Hopper). Nine real architectures did not finish inside the 6 h job limit.
+  CUDA_ARCHS: "60-real;75-real;80-real;120-real;60-virtual"
+  CUDNN_VERSION: "9.8.0"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      ort_version: ${{ steps.plan.outputs.ort_version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      targets: ${{ steps.plan.outputs.targets }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: crates/voice-me-deps/src/sources.rs
+          sparse-checkout-cone-mode: false
+
+      - name: Decide what to build
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          IN_VERSION: ${{ inputs.ort_version }}
+          IN_BUILD: ${{ inputs.build_number }}
+          IN_TARGETS: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = workflow_dispatch ]; then
+            version=$IN_VERSION build_number=$IN_BUILD targets=$IN_TARGETS
+          else
+            pinned=$(sed -n 's/^pub const VOICEME_RUNTIME_TAG: &str = "\(.*\)";$/\1/p' \
+              crates/voice-me-deps/src/sources.rs)
+            [[ $pinned =~ ^onnxruntime-([0-9][0-9.]*)-voiceme\.([0-9]+)$ ]] || {
+              echo "::error::VOICEME_RUNTIME_TAG '$pinned' is not onnxruntime-<version>-voiceme.<n>"
+              exit 1
+            }
+            version=${BASH_REMATCH[1]} build_number=${BASH_REMATCH[2]} targets=both
+          fi
+          tag="onnxruntime-$version-voiceme.$build_number"
+          build=true
+          if [ "$EVENT" != workflow_dispatch ] && gh release view "$tag" > /dev/null 2>&1; then
+            echo "$tag is already published; nothing to build."
+            build=false
+          fi
+          echo "$tag: build=$build targets=$targets"
+          { echo "build=$build"; echo "ort_version=$version"; echo "tag=$tag"; echo "targets=$targets"; } >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    needs: plan
+    if: needs.plan.outputs.build == 'true' && needs.plan.outputs.targets != 'windows'
+    # The same glibc floor as the app's Linux build (dev-release.yml).
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+    env:
+      ORT_VERSION: ${{ needs.plan.outputs.ort_version }}
+      TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the CUDA 12.8 toolkit and build tools
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cuda-toolkit-12-8 ninja-build \
+            libx11-dev libx11-xcb-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev
+          echo "/usr/local/cuda-12.8/bin" >> "$GITHUB_PATH"
+          df -h /
+
+      - name: Fetch cuDNN
+        run: |
+          python - <<'EOF'
+          import json, os, urllib.request, tarfile
+          base = "https://developer.download.nvidia.com/compute/cudnn/redist/"
+          meta = json.load(urllib.request.urlopen(f"{base}redistrib_{os.environ['CUDNN_VERSION']}.json"))
+          rel = meta["cudnn"]["linux-x86_64"]["cuda12"]["relative_path"]
+          urllib.request.urlretrieve(base + rel, "cudnn.tar.xz")
+          with tarfile.open("cudnn.tar.xz") as t:
+              t.extractall("cudnn-extract")
+          (d,) = os.listdir("cudnn-extract")
+          os.rename(os.path.join("cudnn-extract", d), "cudnn")
+          EOF
+          ls cudnn cudnn/lib | head -40
+
+      - name: Fetch ONNX Runtime ${{ env.ORT_VERSION }}
+        run: git clone --depth 1 --branch "v$ORT_VERSION" --recursive https://github.com/microsoft/onnxruntime.git ort
+
+      - name: Build
+        working-directory: ort
+        run: |
+          ./build.sh --config Release --build_shared_lib --parallel 4 --nvcc_threads 1 \
+            --use_cuda --cuda_home /usr/local/cuda-12.8 --cudnn_home "$GITHUB_WORKSPACE/cudnn" \
+            --use_webgpu --skip_tests --compile_no_warning_as_error --cmake_generator Ninja \
+            --cmake_extra_defines "CMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHS" onnxruntime_BUILD_UNIT_TESTS=OFF \
+              onnxruntime_USE_FLASH_ATTENTION=OFF \
+              onnxruntime_USE_FPA_INTB_GEMM=OFF onnxruntime_USE_FP8_KV_CACHE=OFF
+          df -h /
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          out="build/Linux/Release"
+          ls -la "ort/$out" | grep -E '\.so' || true
+          core="onnxruntime-voiceme-linux-x64-$ORT_VERSION"
+          cuda="onnxruntime-voiceme-linux-x64-cuda12-$ORT_VERSION"
+          mkdir -p "dist" "$core/lib" "$cuda/lib"
+          # Real files only (no symlinks): voice-me extracts named entries.
+          cp -L "ort/$out/libonnxruntime.so.$ORT_VERSION" "$core/lib/"
+          cp -L "ort/$out/libonnxruntime_providers_shared.so" "$core/lib/"
+          for f in ort/$out/libwebgpu_dawn*.so ort/$out/libdawn*.so; do
+            [ -e "$f" ] && cp -L "$f" "$core/lib/"
+          done
+          cp -L "ort/$out/libonnxruntime_providers_cuda.so" "$cuda/lib/"
+          cp ort/LICENSE ort/ThirdPartyNotices.txt "$core/"
+          cp ort/LICENSE ort/ThirdPartyNotices.txt "$cuda/"
+          tar czf "dist/$core.tgz" "$core"
+          tar czf "dist/$cuda.tgz" "$cuda"
+          # What each library needs, for pinning and for the story's notes.
+          for f in "$core"/lib/* "$cuda"/lib/*; do echo "== $f"; ldd "$f" || true; done > "dist/linux-x64-ldd.txt"
+          (cd dist && tar tzf "$core.tgz"; tar tzf "$cuda.tgz") > dist/linux-x64-contents.txt
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-linux-x64
+          path: dist/*
+
+  build-windows:
+    needs: plan
+    if: needs.plan.outputs.build == 'true' && needs.plan.outputs.targets != 'linux'
+    # CUDA 12.8's nvcc supports Visual Studio 2022 as its host compiler;
+    # windows-latest has moved past it.
+    runs-on: windows-2022
+    timeout-minutes: 355
+    env:
+      ORT_VERSION: ${{ needs.plan.outputs.ort_version }}
+      TAG: ${{ needs.plan.outputs.tag }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the CUDA 12.8 toolkit
+        uses: Jimver/cuda-toolkit@v0.2.23
+        with:
+          cuda: "12.8.0"
+          method: network
+
+      - name: Fetch cuDNN
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import json, os, urllib.request, zipfile
+          base = "https://developer.download.nvidia.com/compute/cudnn/redist/"
+          meta = json.load(urllib.request.urlopen(f"{base}redistrib_{os.environ['CUDNN_VERSION']}.json"))
+          rel = meta["cudnn"]["windows-x86_64"]["cuda12"]["relative_path"]
+          urllib.request.urlretrieve(base + rel, "cudnn.zip")
+          with zipfile.ZipFile("cudnn.zip") as z:
+              z.extractall("cudnn-extract")
+          (d,) = os.listdir("cudnn-extract")
+          os.rename(os.path.join("cudnn-extract", d), "cudnn")
+          EOF
+          ls cudnn cudnn/bin | head -40
+
+      # The workspace drive (D:) has ~14 GB free, too little for a CUDA
+      # build tree; C: has far more. A short path also keeps MSBuild clear of
+      # the 260-character limit.
+      - name: Fetch ONNX Runtime ${{ env.ORT_VERSION }}
+        shell: bash
+        run: |
+          git clone --depth 1 --branch "v$ORT_VERSION" --recursive https://github.com/microsoft/onnxruntime.git /c/ort
+          df -h /c /d || true
+
+      - name: Build
+        working-directory: C:\ort
+        shell: pwsh
+        run: |
+          # Three jobs and one nvcc thread each: the runner has 16 GB of memory,
+          # and an unbounded CUDA build runs it out. The LLM-only flash attention and
+          # mixed-precision GEMM kernels (the heaviest CUDA units) are left out.
+          .\build.bat --config Release --build_shared_lib --parallel 3 --nvcc_threads 1 --use_cuda `
+            --cuda_home "$env:CUDA_PATH" --cudnn_home "$env:GITHUB_WORKSPACE\cudnn" `
+            --use_webgpu --skip_tests --compile_no_warning_as_error `
+            --cmake_generator "Visual Studio 17 2022" `
+            --cmake_extra_defines "CMAKE_CUDA_ARCHITECTURES=$env:CUDA_ARCHS" onnxruntime_BUILD_UNIT_TESTS=OFF `
+              onnxruntime_USE_FLASH_ATTENTION=OFF `
+              onnxruntime_USE_FPA_INTB_GEMM=OFF onnxruntime_USE_FP8_KV_CACHE=OFF
+          $code = $LASTEXITCODE
+          Get-PSDrive C, D | Format-Table Name, Used, Free
+          if ($code -ne 0) { exit $code }
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="/c/ort/build/Windows/Release/Release"
+          ls -la "$out" | grep -iE '\.dll' || true
+          core="onnxruntime-voiceme-win-x64-$ORT_VERSION"
+          cuda="onnxruntime-voiceme-win-x64-cuda12-$ORT_VERSION"
+          mkdir -p dist "$core/lib" "$cuda/lib"
+          cp "$out/onnxruntime.dll" "$out/onnxruntime_providers_shared.dll" "$core/lib/"
+          # Dawn, and the DirectX shader compiler Dawn's D3D12 backend loads.
+          for f in "$out"/webgpu_dawn*.dll "$out"/dxil.dll "$out"/dxcompiler.dll; do
+            [ -e "$f" ] && cp "$f" "$core/lib/"
+          done
+          cp "$out/onnxruntime_providers_cuda.dll" "$cuda/lib/"
+          cp /c/ort/LICENSE /c/ort/ThirdPartyNotices.txt "$core/"
+          cp /c/ort/LICENSE /c/ort/ThirdPartyNotices.txt "$cuda/"
+          7z a -tzip "dist/$core.zip" "$core" > /dev/null
+          7z a -tzip "dist/$cuda.zip" "$cuda" > /dev/null
+          (cd dist && 7z l "$core.zip"; 7z l "$cuda.zip") > dist/win-x64-contents.txt
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: onnxruntime-win-x64
+          path: dist/*
+
+  release:
+    needs: [plan, build-linux, build-windows]
+    # Publishes whatever built; a later run with `targets` set to the missing
+    # OS (and `reuse_run_id` pointing here, if useful) adds the rest.
+    if: >-
+      !cancelled() &&
+      (needs.build-linux.result == 'success' || needs.build-windows.result == 'success')
+    runs-on: ubuntu-latest
+    env:
+      ORT_VERSION: ${{ needs.plan.outputs.ort_version }}
+      TAG: ${{ needs.plan.outputs.tag }}
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Reuse the builds of run ${{ inputs.reuse_run_id }}
+        if: inputs.reuse_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+          run-id: ${{ inputs.reuse_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Publish ${{ env.TAG }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -la
+          # One checksum and size list per OS, so publishing one OS later
+          # never overwrites the other's.
+          for os in linux win; do
+            files=$(ls onnxruntime-voiceme-$os-* 2>/dev/null || true)
+            [ -n "$files" ] || continue
+            sha256sum $files > "SHA256SUMS-$os.txt"
+            stat -c '%s %n' $files > "SIZES-$os.txt"
+            cat "SHA256SUMS-$os.txt" "SIZES-$os.txt"
+          done
+          notes="ONNX Runtime $ORT_VERSION built from source with the CPU, CUDA 12.8 and WebGPU execution providers (Story 3.8). Pinned by size and SHA-256 in voice-me-deps; never replaced under this tag."
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" * --clobber
+          else
+            gh release create "$TAG" * --title "$TAG" --notes "$notes" --latest=false
+          fi

@@ -176,3 +176,77 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-3-14-generate-through-azure-neural-tts.md`
   summary: Unverified: Azure's disclosure (an extra note and a long voice item) may not fit `OVERLAY_DISCLOSURE_HEIGHT` (medium if true).
   evidence: No test renders `confirm_disclosure` with Azure's text. The manual check in the spec (confirm the disclosure with a real key) settles it. If it clips, raise the height in `crates/voice-me-app/src/main.rs`.
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-15-speak-naturally-and-instantly-with-piper-on-linux.md`
+  summary: The real Piper engine path (`PiperTts::ensure_voice` rebuilding on a voice change, `run_graph`'s input names, shapes and `scales` order) only runs in `tests/real_engine.rs`, which skips itself in CI.
+  evidence: CI sets neither `ORT_DYLIB_PATH` nor `VOICE_ME_PIPER_TEST_VOICE`. Fix it either with a session-builder seam so a unit test can check the rebuild, or by having CI fetch the pinned runtime and fahrettin (about 72 MB) and set both variables.
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-15-speak-naturally-and-instantly-with-piper-on-linux.md`
+  summary: No test checks that Install on "No Piper voice installed" downloads the built-in default voice (fahrettin).
+  evidence: `piper::default_voice()` has its URLs fixed in code, so an adapter-level test cannot point it at a `TestServer`. Make the default voice's source injectable (e.g. through `PiperSources`) first.
+
+- source_spec: none
+  status: resolved by spec-3-8 (`provision_row` provisions the CPU runtime for a Piper selection; test `a_piper_runtime_install_uses_the_cpu_runtime_whatever_backend_is_saved`)
+  summary: Install on Piper's ONNX Runtime row fails when the saved Chatterbox backend is a GPU one, because `provision_runtime` checks `request.backend` instead of the CPU runtime Piper's row is built for.
+  evidence: `crates/voice-me-deps/src/lib.rs` `piper_rows` builds the row with `SpeechBackend::CPU` and `installable`, but `provision_row` passes `request.backend` to `provision_runtime`, which refuses any non-CPU target with `gpu_runtime_unavailable`. Found while investigating a Linux runtime auto-download request that turned out to be already served by the Install button.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-settings-window-title-bar.md`
+  summary: The Settings window has no title, so with the native title bar gone nothing names it in the taskbar, Alt-Tab or the window list.
+  evidence: `TitleBar::title_bar_options()` sets `title: None`, and the old `WindowOptions::default()` titlebar had no title either, so this predates the change. Setting `titlebar.title` in `SettingsView::window_options()` would fix it.
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-prompt-overlay-pill-bar.md`
+  summary: DESIGN.md says the overlay's focus emphasis is Primary Violet (#7C6AFF), but no code sets the theme's `primary` or `ring`, so the prompt bar's focused edge shows gpui-kit's default ring colour.
+  evidence: nothing in `crates/` applies a theme override for `primary`/`ring`; the gap predates the pill bar, which is only the first surface to use the ring as emphasis.
+- source_spec: `_bmad-output/implementation-artifacts/spec-prompt-overlay-pill-bar.md`
+  summary: `epics.md` UX-DR4 ("one `Input` and nothing else, popover-family elevation/shadow") and UX-DR22 ("fade/scale-in"), and EXPERIENCE.md, still describe the boxed overlay rather than the pill bar with its icon and Enter hint.
+  evidence: the user asked for the pill bar (DESIGN.md was updated with it); the planning documents were left for a correct-course pass rather than edited from a review.
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-16-speak-with-piper-on-windows.md`
+  summary: On Windows, `espeak-ng.exe` reads its argv (including `--path=<cache dir>`) through the ANSI code page, so a user profile path with characters outside that code page may leave eSpeak NG unable to find its data.
+  evidence: espeak-ng 1.52.0 uses `main(argc, argv)` and narrow `fopen`. Settle it by running Piper under a profile named outside the code page, and fix it with `GetShortPathNameW` or an ASCII-only cache location for eSpeak NG.
+
+- source_spec: none
+  summary: Story 3.13 — speak with Windows' own local speech engine (the user's choice for Windows instead of Edge TTS), next after the Windows virtual microphone.
+  evidence: split from "finish the remaining Windows implementations" (2026-09-24); the user put the virtual microphone first and asked for the Windows speech API rather than porting Edge TTS.
+- source_spec: none
+  summary: Story 3.16 — Piper on Windows.
+  evidence: split from "finish the remaining Windows implementations" (2026-09-24); not in the user's first two priorities.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-8-windows-virtual-microphone-via-vb-cable.md`
+  summary: The Windows playback drain/timeout state machine in `play_on` (`crates/voice-me-audio-windows/src/lib.rs`) has no automated test.
+  evidence: it is built directly on a cpal WASAPI stream, which CI has no device for; covering it means pulling the callback's position/signalled/drained state into a small pure type tested like `fill_frames`. Until then only the manual Windows check (Discord hears the whole line) verifies it.
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-8-windows-virtual-microphone-via-vb-cable.md`
+  summary: Check the Authenticode signature (VB-Audio) of the unpacked `VBCABLE_Setup_x64.exe` before asking Windows to run it elevated.
+  evidence: the pack is SHA-256-verified when downloaded, but the unpacked setup in the user-writable cache is run elevated without a signer check; UAC shows the publisher, so the user is the last line of defence today (medium, hardening).
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-8-windows-virtual-microphone-via-vb-cable.md`
+  summary: Update the PRD's FR-6, the PRD addendum's driver notes and the "single executable" distribution claim for VB-CABLE on Windows.
+  evidence: only PRD Open Question 2 and the architecture spine were updated in spec-2-8; the planning documents that name the old driver belong to a correct-course pass.
+- source_spec: `_bmad-output/implementation-artifacts/spec-fix-espeak-ng-install-without-msiexec.md`
+  summary: The eSpeak NG MSI unpacker's end-to-end test runs only when `VOICE_ME_ESPEAK_MSI` points at the real package, so CI never exercises the table join, cabinet read and write path.
+  evidence: `the_real_espeak_ng_package_unpacks_into_its_install_layout` returns early without the variable. Settle it with a test that builds a small MSI (`msi::Package::create`) holding an embedded cabinet (`cab::CabinetBuilder`), or by caching the pinned MSI in CI.
+- source_spec: `_bmad-output/implementation-artifacts/spec-native-gnome-kde-hotkey.md`
+  summary: voice-me's GNOME custom keybinding (`custom-keybindings/voice-me/`) and its KDE kglobalaccel component are never removed — not on uninstall, and not when a later run falls back to another backend.
+  evidence: No unbind exists in `HotkeyPort` (a spec 2.3 deferral). A stale GNOME grab keeps eating the combination while a fallback is bound.
+- source_spec: `_bmad-output/implementation-artifacts/spec-native-gnome-kde-hotkey.md`
+  summary: The GlobalShortcuts portal backend has no integration test (session creation, the bind response check, forwarding `Activated`, rebinding in the same session).
+  evidence: Only `to_portal_trigger` is tested. It needs a fake `org.freedesktop.portal.GlobalShortcuts` with Request/Response objects on a test bus.
+- source_spec: `_bmad-output/implementation-artifacts/spec-native-gnome-kde-hotkey.md`
+  summary: Unverified (medium): on KDE, Shift plus a digit or symbol key (e.g. Shift+1) may never fire, because `to_qt_key` sends SHIFT|Key_1 while Qt/KWin may match the shifted keysym.
+  evidence: Settle it on a real Plasma session by binding Shift+Digit1 and pressing it.
+- source_spec: `_bmad-output/implementation-artifacts/spec-native-gnome-kde-hotkey.md`
+  summary: Unverified (high): Plasma 6's kglobalacceld may no longer expose the KF5-era `setShortcut`/`shortcut` (`ai`) methods that `kde.rs` calls. KDE would then always fall back to the portal.
+  evidence: Settle it on Plasma 6 with `qdbus6 org.kde.kglobalaccel /kglobalaccel` or `busctl --user introspect org.kde.kglobalaccel /kglobalaccel`. The fix, if needed: `setShortcutKeys`/`shortcutKeys` with `a(ai)`.
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-13-speak-instantly-with-the-windows-speech-engine.md`
+  summary: `voice-me-tts-system-windows/src/wav.rs` is an extended copy of `voice-me-tts-system-linux/src/wav.rs`, so fixes and formats can diverge between the two System voices.
+  evidence: The Windows copy reads 24/32-bit PCM, float and extensible headers; the Linux one reads 16-bit PCM only. A small shared audio-decode crate (not an adapter, so AD-2 allows it) would hold one decoder.
+- source_spec: `_bmad-output/implementation-artifacts/spec-overlay-vertical-position.md`
+  summary: After a disclosure is confirmed, the overlay shrinks from 196 px to the 56 px prompt bar but keeps its top edge, so the bar ends up above the chosen vertical position (about 140 px high at 100%).
+  evidence: `PromptOverlayView::confirm` (`voice-me-ui/src/prompt_overlay.rs`) calls `window.resize` only. Fixing it needs the position in the view, plus a way to move the window.
+- source_spec: `_bmad-output/implementation-artifacts/spec-overlay-vertical-position.md`
+  summary: On Linux/X11, gpui-pre 0.3.5's `visible_bounds()` is the full display, so at 0% or 100% the overlay can sit under a top or bottom panel.
+  evidence: gpui overrides `visible_bounds` only on Windows. Settle it on an X11 desktop with a panel; fix it upstream or read `_NET_WORKAREA`.
+- source_spec: `_bmad-output/implementation-artifacts/spec-overlay-vertical-position.md`
+  summary: No test checks that the overlay-open closure in `main()` uses the persisted `overlay_position` on each summon, or that `SettingsView` hands the value through to the Hotkey tab.
+  evidence: Only the pure helpers are tested. Extract the size-and-position choice into a pure helper next to `overlay_bounds_in` and test it.
+- source_spec: `_bmad-output/implementation-artifacts/spec-backend-engine-and-device-selects.md`
+  summary: The warm-up guard `for_current_selection` compares only `report.backend`, so a late report for one engine can start a warm-up for another engine on the same device.
+  evidence: `main.rs` compares `report.backend` with `resolve_backend(current selection)`. Chatterbox CPU → Piper CPU already matched before this spec; Piper now matches on GPU devices too. Fix by carrying the selection in `DependencyReport`.
+- source_spec: `_bmad-output/implementation-artifacts/spec-backend-engine-and-device-selects.md`
+  summary: Piper never sends `AppEvent::SpeechSessionBuilt`, so the Backend tab's "actually acquired" line (AD-9) never shows Piper's device or a failed GPU build.
+  evidence: Only `TtsAdapter::with_events` sends it. `build_piper` has no event sender. This dates from Story 3.15 and matters now that Piper can run on CUDA/WebGPU.

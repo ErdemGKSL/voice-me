@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Test-only: a minimal hand-written copy of gnome-settings-daemon's two
+  media-keys schemas, holding only the keys voice-me reads and writes. CI
+  compiles it with glib-compile-schemas and points GSETTINGS_SCHEMA_DIR at
+  the result, so `gnome::tests::save_and_rebind_through_real_gsettings` runs
+  against a real gsettings with a throwaway keyfile backend.
+-->
+<schemalist>
+  <schema id="org.gnome.settings-daemon.plugins.media-keys" path="/org/gnome/settings-daemon/plugins/media-keys/">
+    <key name="custom-keybindings" type="as"><default>[]</default></key>
+  </schema>
+  <schema id="org.gnome.settings-daemon.plugins.media-keys.custom-keybinding">
+    <key name="name" type="s"><default>''</default></key>
+    <key name="binding" type="s"><default>''</default></key>
+    <key name="command" type="s"><default>''</default></key>
+  </schema>
+</schemalist>

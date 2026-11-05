@@ -15,6 +15,10 @@ Pressing the global hotkey summons the prompt overlay: a borderless window
 with a single focused field. Type a line and press `Enter` to send it;
 `Escape`, or clicking away, closes it and discards what you typed. Dismissing
 the overlay never quits the app — it stays in the tray either way.
+Settings → Hotkey → "Overlay position" sets how high it opens (0% top,
+100% bottom, default 50% centred in the free area; saved as
+`overlay_position` in `settings.toml`) — on GNOME/Wayland the compositor
+may ignore it.
 
 A confirmed line is now actually generated (Story 2.6), in the speech
 language from `settings.toml` (`speech_language`, default `tr`), in the voice
@@ -63,9 +67,17 @@ played — deliberately, since PulseAudio answers an unresolvable device by
 falling back to your speakers — and a desktop notification says which of
 those it was.
 
-On **Windows** the virtual microphone is not implemented yet (Story 2.8): the
-app runs and generates, and a Speak Action notifies that it has nowhere to
-play the result.
+On **Windows** the Virtual Microphone is VB-Audio's **VB-CABLE**
+(donationware, www.vb-cable.com). voice-me plays each line to its
+"CABLE Input" playback device; in your voice-chat app, select
+**CABLE Output** as the microphone. If it is missing, open
+**Settings → Dependencies** and press **Install** on the Virtual Microphone
+row: voice-me downloads VB-Audio's official driver pack (pinned and
+checksum-verified), then runs VB's own setup, which Windows asks you to
+allow. If Windows wants a restart afterwards, restart and press
+**Check again**. voice-me never installs the driver silently or at startup,
+and never plays to your speakers instead: with no cable, or more than one,
+a Speak Action notifies rather than playing.
 
 ## Speech generation (spec-2-5 spike)
 
@@ -81,17 +93,92 @@ open **Settings → Dependencies** and press **Install** on each missing row.
   1.56 GB, with progress shown on the row. An interrupted download resumes
   from the bytes already on disk the next time Install is pressed, and every
   file is checked against a pinned SHA-256 before it is used.
-- **ONNX Runtime** (Linux x64, Windows x64) — the core library from
-  Microsoft's `onnxruntime-linux-x64-1.28.2.tgz` release, extracted to
-  `<cache>/runtime/libonnxruntime.so`, or on Windows from
-  `onnxruntime-win-x64-1.28.2.zip`, extracted to
-  `<cache>/runtime/onnxruntime.dll`. No execution-provider libraries are
-  fetched for the CPU backend. On other systems, or when `ORT_DYLIB_PATH`
-  points somewhere that does not exist, the row shows short manual steps
-  instead of an Install button.
+- **ONNX Runtime** (Linux x64, Windows x64) — the core archive of
+  voice-me's own all-provider build (below), extracted to
+  `<cache>/runtime/libonnxruntime.so`, or on Windows to
+  `<cache>/runtime/onnxruntime.dll` (with `dxil.dll` and `dxcompiler.dll`,
+  which WebGPU needs on Direct3D 12). On other systems, or when
+  `ORT_DYLIB_PATH` points somewhere that does not exist, the row shows short
+  manual steps instead of an Install button.
+- **voice-me's all-provider runtime** (Story 3.8) — ONNX Runtime 1.28.2
+  built from source in CI (`.github/workflows/onnxruntime.yml`, which runs
+  when `VOICEME_RUNTIME_TAG` in `sources.rs` names a release that does not
+  exist yet, or by hand) with the CPU, WebGPU and CUDA 12.8 execution providers in one
+  library, mirrored on this repo's Releases as `onnxruntime-1.28.2-voiceme.1`.
+  Per OS there is a **core** archive (`onnxruntime` and
+  `onnxruntime_providers_shared`, WebGPU built in), which every backend
+  uses, and a **CUDA provider** archive (`onnxruntime_providers_cuda`),
+  fetched only for a CUDA backend. Because one library carries every
+  provider, switching between CPU, WebGPU and CUDA rebuilds the speech
+  session instead of restarting voice-me. The release is pinned by size and
+  SHA-256 in `crates/voice-me-deps/src/sources.rs` and replaces Microsoft's
+  CPU archive; a CPU-only runtime already in the cache keeps serving the CPU
+  backend, and Install replaces it when a GPU backend is selected. CUDA code
+  is built for compute capability 6.0, 7.5, 8.0 and 12.0 (8.0 code also runs
+  on 8.6/8.9), with PTX that the driver compiles for the others.
+- **NVIDIA libraries for CUDA** — the CUDA runtime, cuBLAS/cuBLASLt, cuFFT
+  and cuDNN 9, from NVIDIA's own wheels on PyPI (`nvidia-cuda-runtime-cu12`,
+  `nvidia-cublas-cu12`, `nvidia-cufft-cu12`, `nvidia-cudnn-cu12`), each pinned
+  by URL, size and SHA-256. Only their shared libraries are extracted, into
+  `<cache>/runtime/cuda/`, and voice-me loads them from there before it
+  registers the CUDA provider — your `PATH` and `LD_LIBRARY_PATH` are never
+  changed. With a CUDA backend selected, the runtime, CUDA provider and
+  NVIDIA library rows each show what is missing, and one Install fetches all
+  of it (about 1.5 GB of wheels). You only need the NVIDIA driver. A runtime
+  you added under Local runtimes, or `ORT_DYLIB_PATH`, is used exactly as
+  before and still wins over the bundled one.
 
 When a row finishes, the check runs again by itself; the row turns "ready"
 and the Prompt Overlay accepts input without a restart.
+
+### Piper and eSpeak NG
+
+Piper (natural, instant stock voices) is the first-run backend on Linux and
+Windows, with the Turkish voice `tr_TR-fahrettin-medium`. It reads text
+through the `espeak-ng` program, run as a separate process; nothing of
+eSpeak NG is linked.
+
+Settings → Backend picks the engine first, then its device. Under **Local**
+the backend `Select` lists the engines — Piper, Chatterbox and System voice —
+and picking Piper or Chatterbox shows a **Device** `Select` under it: CPU,
+CUDA or WebGPU on the bundled runtime (CUDA and WebGPU once voice-me's
+all-provider runtime is the pinned one), plus, for Chatterbox, each added
+runtime's targets ("CUDA — libonnxruntime.so"). Piper runs on the bundled
+runtime only. Switching engine keeps the device when the new engine offers
+it, otherwise CPU. Piper on CUDA gets the same runtime, CUDA provider and
+NVIDIA library rows and one-click Install as Chatterbox, but never the
+Chatterbox model files. The System voice and the remote backends have no
+device.
+
+- **Linux** — install `espeak-ng` with your package manager; the eSpeak NG
+  row shows the command.
+- **Windows** — voice-me looks for `espeak-ng.exe` in its cache, then under
+  `C:\Program Files\eSpeak NG\`, then on `PATH`. When none is found, the
+  eSpeak NG row's **Install** downloads the official eSpeak NG 1.52.0
+  `espeak-ng.msi` (12.8 MB, pinned SHA-256), unpacks it into
+  `<cache>\espeak-ng\` by reading the package itself (no `msiexec`, no
+  admin prompt, no registry or `PATH` change), and deletes the `.msi`. Delete that directory to remove it.
+
+### System voice
+
+Local → **System voice** speaks instantly through the operating system's
+own engine: nothing to download and no Reference Voice Sample.
+
+- **Linux** — eSpeak NG (`espeak-ng`, the same package Piper uses).
+- **Windows** — the Windows speech engine
+  (`Windows.Media.SpeechSynthesis`), with the voices Windows has installed,
+  for example Microsoft Tolga for Turkish. Speech is rendered into memory
+  and played through voice-me's own audio path (the Virtual Microphone),
+  never to the speakers directly. The speech language list is the
+  installed voices' languages; the default `tr` matches `tr-TR`.
+
+  To add a voice for a language: open Windows **Settings → Time & language
+  → Speech**, under **Manage voices** choose **Add voices**, install the
+  language's voice, then press **Check again** in Settings → Dependencies.
+  When the selected speech language has no installed voice, Settings →
+  Backend says so beside the speech language; when Windows speech lists no
+  voices at all, the Dependencies tab shows a blocking row with the same
+  steps.
 
 For reference, the weights come from
 `onnx-community/chatterbox-multilingual-ONNX` (MIT), pinned to revision
@@ -158,12 +245,10 @@ follows describes *this hardware*, not voice-me's direction:
   not the problem; the hardware is. The Quadro additionally loses its Vulkan
   device mid-run (`VK_ERROR_DEVICE_LOST` out of NVK) on anything longer than
   a word.
-- Reaching WebGPU at all needs `--no-default-features --features
-  webgpu-probe`, which swaps `load-dynamic` for ort's `download-binaries`
-  (pyke's Dawn-bundling distribution): a build-time download and a static
-  link, i.e. the opposite of what AD-8 mandates, never built in CI. Its
-  `libwebgpu_dawn.so` is not installed anywhere, so the built example needs
-  `LD_LIBRARY_PATH` pointing into `~/.cache/ort.pyke.io/dfbin/...`.
+- These measurements were taken with a since-removed spike build that
+  linked a prebuilt WebGPU runtime at build time. WebGPU now comes from
+  voice-me's own ONNX Runtime build (Story 3.8), provisioned like any other
+  asset.
 - `ort::ep::WebGPU::with_device_id` had **no effect** here — Dawn picked the
   discrete adapter regardless. The only thing that selected a device was
   restricting the Vulkan loader: `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/intel_icd.json`.
@@ -177,30 +262,82 @@ backend does:
 | Session | Overlay window | Above a fullscreen window? |
 |---------|----------------|----------------------------|
 | X11 | always-on-top, taskbar-less popup | expected — **not yet verified on real hardware** |
-| Wayland | ordinary focused window | no — and the compositor, not voice-me, decides where it appears |
+| Wayland with layer shell (Hyprland, Sway, KDE, …) | a layer-shell surface on the overlay layer, never tiled, at the chosen position | yes, above normal windows — **not yet verified on real hardware** |
+| Wayland without layer shell (GNOME) | ordinary focused window | no — and the compositor, not voice-me, decides where it appears |
 
-This is a platform limitation, not a bug. The GPUI version this app is built
-on has no always-on-top window type that works under Wayland, and the one
-mechanism that could provide it — `zwlr_layer_shell_v1` — is not implemented
-by GNOME/Mutter, so it is deliberately not used. Under Wayland the overlay
-still opens, focuses, and accepts typing normally; it may simply sit behind a
-fullscreen game instead of over it.
+On Wayland the overlay first asks for a `zwlr_layer_shell_v1` surface, so
+tiling compositors such as Hyprland never tile it and it opens at the chosen
+height. GNOME/Mutter does not implement layer shell; there it falls back to
+an ordinary window that still opens, focuses, and accepts typing normally,
+but may sit behind a fullscreen game instead of over it.
 
 ## Linux: global hotkey setup
 
-The global hotkey uses one of two backends, chosen at runtime from the
-session:
+The saved hotkey (always stored in `settings.toml` as e.g. `Ctrl+Alt+KeyV`)
+is bound through the first of these backends that works, chosen at runtime:
 
-| Session | Backend | Setup needed |
-|---------|---------|--------------|
-| X11 | `global-hotkey` (`XGrabKey`) | none |
-| Wayland | raw `evdev` read of `/dev/input/event*` | `input`-group membership |
+| Order | When | Backend | Setup needed |
+|-------|------|---------|--------------|
+| 1 | GNOME (an entry of `XDG_CURRENT_DESKTOP` is `GNOME`), any session | a custom keybinding named **voice-me** | none |
+| 1 | KDE Plasma (an entry of `XDG_CURRENT_DESKTOP` is `KDE`), any session | a `kglobalaccel` component named **voice-me** | none |
+| 2 | other Wayland compositors | xdg-desktop-portal `GlobalShortcuts` | a portal that implements it (e.g. Hyprland's) |
+| 3 | other X11 sessions | `global-hotkey` (`XGrabKey`) | none |
+| 4 | last resort, everywhere | raw `evdev` read of `/dev/input/event*` | `input`-group membership |
 
-`global-hotkey` is X11-only, and GNOME does not implement the desktop
-portal's GlobalShortcuts interface, so on Wayland the hotkey is matched by
-reading the keyboard devices directly. That needs read access to the input
-devices, which is granted by joining the `input` group — a **one-time**
-setup step:
+`XDG_CURRENT_DESKTOP` is a colon-separated list (`ubuntu:GNOME`), and a
+whole entry must match, in any case: `GNOME-Flashback` is not `GNOME`.
+
+A backend that is missing (no `gsettings`, no kglobalaccel on the session
+bus, no GlobalShortcuts portal) or fails is skipped, and the reason is
+printed on stderr. A combination that is already in use is the exception:
+it is reported on the Hotkey tab and no later backend is tried, since that
+would bind the same combination twice.
+
+**GNOME and KDE.** Save on the Hotkey tab writes the desktop's own shortcut,
+so the desktop grabs the combination exclusively (it does not reach the
+focused window) and you can see or change it in the desktop's settings:
+Settings → Keyboard → Keyboard Shortcuts → Custom Shortcuts on GNOME, System
+Settings → Shortcuts on KDE. The Hotkey tab's **Open keyboard settings**
+button opens that page. **Change the combination from voice-me's Hotkey
+tab, not there:** voice-me writes its saved combination to the desktop at
+every start and every Save, so a change made in the desktop's settings is
+replaced the next time either happens. On GNOME the entry lives at
+`/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/voice-me/`;
+voice-me updates only that entry and only appends its path to the list,
+never touching your other custom shortcuts. Its command is not a path to the
+voice-me binary but a D-Bus call to the running app, so moving the binary
+never breaks the shortcut:
+
+```bash
+gdbus call --session --dest dev.voice_me.VoiceMe --object-path /dev/voice_me/VoiceMe --method dev.voice_me.VoiceMe.Summon
+```
+
+If voice-me is not running, the call fails and nothing happens. KDE needs no
+command: kglobalaccel signals voice-me directly. On KDE a combination another
+application already holds is refused and the previous one stays; GNOME does
+not report such conflicts.
+
+**Other desktops (Sway, Hyprland, …).** The same D-Bus service runs as soon
+as voice-me starts, so you can also bind the command above in your
+compositor's own config — the Hotkey tab shows it under **Show steps**. Use
+a **different** combination from the one saved on the Hotkey tab: voice-me
+already listens for that one (through the portal or evdev), so binding it
+again in the compositor would summon twice. For example, in Sway:
+
+```text
+bindsym Ctrl+Alt+Shift+v exec gdbus call --session --dest dev.voice_me.VoiceMe --object-path /dev/voice_me/VoiceMe --method dev.voice_me.VoiceMe.Summon
+```
+
+On Wayland, a compositor with a GlobalShortcuts portal gets a shortcut
+called `summon` with your combination as its *preferred* trigger; the
+compositor has the final say (some ask you, some expect you to assign it in
+their config).
+
+### The evdev fallback
+
+When nothing above works, the hotkey is matched by reading the keyboard
+devices directly. That needs read access to the input devices, which is
+granted by joining the `input` group — a **one-time** setup step:
 
 ```bash
 sudo usermod -aG input $USER
@@ -209,16 +346,16 @@ sudo usermod -aG input $USER
 **Understand what this grants before running it.** `input`-group membership
 lets *any* process running as your user read every keystroke you type,
 system-wide — including passwords typed into other applications, on any
-desktop or login screen. It is not scoped to voice-me. The Wayland backend
+desktop or login screen. It is not scoped to voice-me. The evdev backend
 does exactly that: it reads the raw keyboard stream and matches your
-combination against it. On X11 nothing of the sort is needed, and voice-me
-does not ask for it.
+combination against it. On GNOME, KDE, a GlobalShortcuts portal or X11
+nothing of the sort is needed, and voice-me does not ask for it.
 
 Log out and back in (a new shell is not enough — group membership is
 established at login). Until then the Hotkey tab reports the missing access
 instead of binding anything; the rest of the app runs normally.
 
-Two properties of the Wayland backend are consequences of the platform, not
+Two properties of the evdev backend are consequences of the platform, not
 bugs:
 
 - The combination **also reaches the focused application** — it is a passive
@@ -226,7 +363,7 @@ bugs:
   keyboard input from every other application.)
 - **Conflicts cannot be detected.** Nothing is registered with any server, so
   there is no way to learn that another application already uses the
-  combination. Inline conflict reporting exists only on X11.
+  combination. Inline conflict reporting exists only on X11 and KDE.
 
 To verify the backend on its own, without the app:
 

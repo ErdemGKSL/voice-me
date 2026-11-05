@@ -18,6 +18,15 @@ tokio = { version = "1.53", default-features = false, features = ["rt"] }
 # Every downloaded file is checked against a SHA-256 pinned in `sources.rs`
 # before it takes its final name.
 sha2 = "0.10"
+# Story 3.15: a user-chosen Piper voice is checked with the digest its
+# catalog publishes — MD5 for `rhasspy/piper-voices`, the Git blob SHA-1
+# Hugging Face reports for a non-LFS `config.json`. Same `digest` 0.10 trait
+# as `sha2`.
+md-5 = "0.10"
+sha1 = "0.10"
+# Story 3.15: the three Piper catalogs are JSON.
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 # The Linux ONNX Runtime ships as a `.tgz`; only its real shared library is
 # extracted. (Windows ships a `.zip`, below.)
 flate2 = "1.1"
@@ -26,6 +35,14 @@ tar = { version = "0.4", default-features = false }
 # extraction. Unconditional, so the zip path is tested on every OS; only
 # deflate, the method Microsoft's archive uses.
 zip = { version = "8.6", default-features = false, features = ["deflate"] }
+# eSpeak NG's `espeak-ng.msi` is unpacked by reading the package itself:
+# `msiexec`, even `/a`, needs an administrator for this per-machine
+# package. `msi` reads its tables and streams, `cab` its embedded cabinet:
+# the `cab-superewald` fork of `cab` 0.6, whose `all_files` reads a folder
+# in one pass (upstream decompresses the folder anew for every file).
+# Unconditional, so the unpacking is tested on every OS.
+msi = "0.10"
+cab = { package = "cab-superewald", version = "0.6.1" }
 # Story 3.3: the CUDA capability probe opens the NVIDIA driver library
 # (`libcuda.so.1` / `nvcuda.dll`) at run time — a missing driver is a
 # "not found" answer, never a link error. The version `ash` already uses.
@@ -42,7 +59,20 @@ ash = { version = "0.38", default-features = false, features = ["loaded", "std"]
 voice-me-audio-linux = { path = "../voice-me-audio-linux" }
 # Story 3.12: whether `espeak-ng` is on PATH, and the distribution's install
 # command, are *asked of* the crate that runs it — the same rule as above.
-voice-me-tts-system-linux = { path = "../voice-me-tts-system-linux" }
+# Story 3.15: that crate is now `voice-me-espeak`, shared by the System
+# voice and Piper.
+voice-me-espeak = { path = "../voice-me-espeak" }
+# Story 3.17: where `edge-tts` is, and the pipx steps, asked of the crate
+# that runs it.
+voice-me-tts-edge = { path = "../voice-me-tts-edge" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Story 3.16: where `espeak-ng.exe` is, asked of the crate that runs it.
+voice-me-espeak = { path = "../voice-me-espeak" }
+# Story 2.8: whether VB-CABLE's "CABLE Input" is present, and the elevated
+# launch of VB's own setup, are *asked of* the crate that plays to it —
+# the same rule as the Linux audio crate above.
+voice-me-audio-windows = { path = "../voice-me-audio-windows" }
 
 [dev-dependencies]
 tempfile = "3.14"

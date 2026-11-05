@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "voices": [
+    {
+      "key": "tr_TR-erdem",
+      "name": "erdem",
+      "locale": "tr_TR",
+      "language": "Turkish (Turkey)",
+      "quality": "medium",
+      "model": {
+        "url": "https://raw.githubusercontent.com/ErdemGKSL/voice-me/main/piper-voices/custom/tr_TR-erdem/model.onnx",
+        "size": 63516050,
+        "sha256": "4174e3048a03911fc3ed3d07b6f9e7d0441686d43552d3bd5f530b3e2f6de167"
+      },
+      "config": {
+        "url": "https://raw.githubusercontent.com/ErdemGKSL/voice-me/main/piper-voices/custom/tr_TR-erdem/config.json",
+        "size": 4877,
+        "sha256": "9f648ed2ffd995c0ec97e92045f640a1f1185d518cfe7329eabf142dd7560629"
+      }
+    },
+    {
+      "key": "tr_TR-fahrettin-medium",
+      "name": "fahrettin",
+      "locale": "tr_TR",
+      "language": "Turkish (Turkey)",
+      "quality": "medium",
+      "licence": "CC0-1.0",
+      "model": {
+        "url": "https://huggingface.co/speaches-ai/piper-tr_TR-fahrettin-medium/resolve/aab8f92429ede58091e17de506484a2c84384792/model.onnx",
+        "size": 63201294,
+        "sha256": "39081c47270180e8a0dfac69b07bf329fb6d039fcc1279dbe26c2daf2848b190"
+      },
+      "config": {
+        "url": "https://huggingface.co/speaches-ai/piper-tr_TR-fahrettin-medium/resolve/aab8f92429ede58091e17de506484a2c84384792/config.json",
+        "size": 5022,
+        "sha256": "93741b234acc5f123430a0e343f619e01cfda6b1dc0970ee80bce7da22b1a09b"
+      }
+    }
+  ]
+}

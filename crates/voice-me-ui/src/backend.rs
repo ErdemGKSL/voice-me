@@ -1,4 +1,4 @@
-//! Settings → Backend (Story 3.10): which backend speaks for the user, and
+//! Settings → Speech (Story 3.10): which backend speaks for the user, and
 //! that backend's own options.
 //!
 //! The tab is two-step. The user first chooses **Local** or **Remote**, then
@@ -47,9 +47,9 @@ use gpui_kit::{
     px,
 };
 use voice_me_core::{
-    ActiveBackend, ApiKeys, BackendSelection, CheckRequest, LanguageBackend, LocalRuntime,
-    RemoteProvider, RemoteSample, SpeechLanguages, SpeechVoices, StockVoice, backend_choices,
-    parse_azure_region, stock_voices_of,
+    ActiveBackend, ApiKeys, BackendSelection, CheckRequest, LanguageBackend, LocalEngine,
+    LocalRuntime, RemoteProvider, RemoteSample, SpeechLanguages, SpeechVoices, StockVoice,
+    device_choices, engine_choices, parse_azure_region, stock_voices_of, switch_engine,
 };
 
 /// Something the user asked of the backend. The views only *ask*; the
@@ -149,6 +149,10 @@ pub enum BackendArea {
 pub struct BackendPanel {
     pub selection: BackendSelection,
     pub runtimes: Vec<LocalRuntime>,
+    /// Whether the bundled runtime has every execution provider (Story
+    /// 3.8), so its CUDA and WebGPU devices are listed
+    /// (spec-backend-engine-and-device-selects).
+    pub bundled_all_providers: bool,
     pub api_keys: ApiKeys,
     /// What the engine actually acquired — only ever from its own report.
     pub active: ActiveBackend,
@@ -176,15 +180,24 @@ pub struct BackendPanel {
     /// Azure's voice list as the root last fetched it (Story 3.14). Not
     /// persisted; cached by the root for the session.
     pub azure_voices: Vec<StockVoice>,
+    /// The voices `edge-tts --list-voices` listed at the last check with
+    /// Edge TTS selected (Story 3.17). Not persisted; held by the root.
+    pub edge_tts_voices: Vec<StockVoice>,
+    /// The Piper voices installed in the cache (Story 3.15): Piper's
+    /// language and voice pickers list only these.
+    pub piper_voices: Vec<StockVoice>,
 }
 
 impl BackendPanel {
     /// The run-time voice list `backend`'s languages and voices come from:
-    /// the System voice's engine list, Azure's voice list, or nothing.
+    /// the System voice's engine list, Azure's voice list, Edge TTS's
+    /// voice list, or nothing.
     fn stock_voices(&self, backend: LanguageBackend) -> &[StockVoice] {
         match backend {
             LanguageBackend::SystemVoice => &self.system_voices,
             LanguageBackend::Remote(RemoteProvider::Azure) => &self.azure_voices,
+            LanguageBackend::Remote(RemoteProvider::EdgeTts) => &self.edge_tts_voices,
+            LanguageBackend::Piper => &self.piper_voices,
             _ => &[],
         }
     }
@@ -195,6 +208,7 @@ impl Default for BackendPanel {
         Self {
             selection: BackendSelection::BUNDLED_CPU,
             runtimes: Vec::new(),
+            bundled_all_providers: false,
             api_keys: ApiKeys::default(),
             active: ActiveBackend::NotStarted,
             restart_pending: false,
@@ -208,13 +222,27 @@ impl Default for BackendPanel {
             system_voices: Vec::new(),
             azure_region: None,
             azure_voices: Vec::new(),
+            edge_tts_voices: Vec::new(),
+            piper_voices: Vec::new(),
         }
     }
 }
 
+/// Emitted by "Manage voices" (Story 3.15); the Settings shell switches to
+/// the Piper voices tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenPiperVoicesTab;
+
+/// What the Backend tab says while no Piper voice is installed.
+pub const PIPER_NO_VOICE_NOTE: &str = "No Piper voice installed — Manage voices";
+
 /// The line under Azure's options (Story 3.14): a stock voice, not the
 /// user's.
 pub const AZURE_STOCK_VOICE_NOTE: &str = "Speech will be in this Microsoft voice, not yours.";
+
+/// The line under Edge TTS's options (Story 3.17): a stock voice, not the
+/// user's.
+pub const EDGE_TTS_STOCK_VOICE_NOTE: &str = "Speech will be in this Microsoft voice, not yours.";
 
 /// What the Backend tab says while Azure has no voice saved (D4).
 pub const AZURE_PICK_A_VOICE: &str = "Pick a voice for Azure";
@@ -239,7 +267,9 @@ impl BackendKind {
 
     fn of(selection: &BackendSelection) -> Self {
         match selection {
-            BackendSelection::Local { .. } | BackendSelection::SystemVoice => BackendKind::Local,
+            BackendSelection::Local { .. }
+            | BackendSelection::SystemVoice
+            | BackendSelection::Piper { .. } => BackendKind::Local,
             BackendSelection::Remote(_) => BackendKind::Remote,
         }
     }
@@ -254,13 +284,13 @@ impl BackendKind {
     fn label(self) -> &'static str {
         match self {
             BackendKind::Local => "Local — on this computer",
-            BackendKind::Remote => "Remote — with your own API key",
+            BackendKind::Remote => "Remote — online providers",
         }
     }
 
     fn placeholder(self) -> &'static str {
         match self {
-            BackendKind::Local => "Choose a local backend",
+            BackendKind::Local => "Choose a local engine",
             BackendKind::Remote => "Choose a remote backend",
         }
     }
@@ -276,14 +306,61 @@ impl BackendKind {
     }
 }
 
+/// What the backend `Select` lists: a local engine, whose device is a
+/// second `Select` (spec-backend-engine-and-device-selects), or a remote
+/// provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendEntry {
+    Engine(LocalEngine),
+    Remote(RemoteProvider),
+}
+
+impl BackendEntry {
+    /// The entry `selection` is listed under.
+    fn of(selection: &BackendSelection) -> Self {
+        match selection {
+            BackendSelection::Remote(provider) => BackendEntry::Remote(*provider),
+            BackendSelection::Local { .. } => BackendEntry::Engine(LocalEngine::Chatterbox),
+            BackendSelection::Piper { .. } => BackendEntry::Engine(LocalEngine::Piper),
+            BackendSelection::SystemVoice => BackendEntry::Engine(LocalEngine::SystemVoice),
+        }
+    }
+
+    fn label(self) -> String {
+        match self {
+            BackendEntry::Engine(engine) => engine.label().to_string(),
+            BackendEntry::Remote(provider) => BackendSelection::Remote(provider).label(),
+        }
+    }
+}
+
 /// One entry of the backend `Select`.
 #[derive(Clone)]
 struct BackendChoice {
-    selection: BackendSelection,
+    entry: BackendEntry,
     label: SharedString,
 }
 
 impl gpui_kit::component::searchable_list::SearchableListItem for BackendChoice {
+    type Value = BackendEntry;
+
+    fn title(&self) -> SharedString {
+        self.label.clone()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.entry
+    }
+}
+
+/// One entry of the device `Select`: the engine on one device.
+#[derive(Clone)]
+struct DeviceChoice {
+    selection: BackendSelection,
+    label: SharedString,
+}
+
+impl gpui_kit::component::searchable_list::SearchableListItem for DeviceChoice {
     type Value = BackendSelection;
 
     fn title(&self) -> SharedString {
@@ -293,6 +370,21 @@ impl gpui_kit::component::searchable_list::SearchableListItem for BackendChoice 
     fn value(&self) -> &Self::Value {
         &self.selection
     }
+}
+
+/// The devices the saved selection's engine can run on — empty for the
+/// System voice and a remote provider, which have none.
+fn device_items(panel: &BackendPanel) -> Vec<DeviceChoice> {
+    let Some(engine) = panel.selection.engine() else {
+        return Vec::new();
+    };
+    device_choices(engine, &panel.runtimes, panel.bundled_all_providers)
+        .into_iter()
+        .map(|selection| DeviceChoice {
+            label: selection.device_label().unwrap_or_default().into(),
+            selection,
+        })
+        .collect()
 }
 
 /// One entry of the speech-language `Select`: the code the model gets, and
@@ -397,15 +489,24 @@ fn voice_pick(panel: &BackendPanel) -> Option<VoicePick> {
     })
 }
 
-/// The existing backends of one kind: the bundled CPU entry and each added
-/// runtime's entries, or every remote provider.
-fn choices(kind: BackendKind, runtimes: &[LocalRuntime]) -> Vec<BackendChoice> {
-    backend_choices(runtimes)
+/// The entries of one kind: the local engines (without a device), or
+/// every remote provider.
+fn choices(kind: BackendKind) -> Vec<BackendChoice> {
+    let entries: Vec<BackendEntry> = match kind {
+        BackendKind::Local => engine_choices()
+            .into_iter()
+            .map(BackendEntry::Engine)
+            .collect(),
+        BackendKind::Remote => RemoteProvider::ALL
+            .into_iter()
+            .map(BackendEntry::Remote)
+            .collect(),
+    };
+    entries
         .into_iter()
-        .filter(|selection| BackendKind::of(selection) == kind)
-        .map(|selection| BackendChoice {
-            label: selection.label().into(),
-            selection,
+        .map(|entry| BackendChoice {
+            label: entry.label().into(),
+            entry,
         })
         .collect()
 }
@@ -418,6 +519,9 @@ pub struct BackendView {
     /// flipped it and has not picked an entry yet (Decision 1).
     kind: BackendKind,
     backend_select: Entity<SelectState<Vec<BackendChoice>>>,
+    /// The saved engine's device (spec-backend-engine-and-device-selects),
+    /// shown under Piper and Chatterbox.
+    device_select: Entity<SelectState<Vec<DeviceChoice>>>,
     /// The saved backend's speech language (Story 3.11).
     language_select: Entity<SelectState<Vec<LanguageChoice>>>,
     /// Whose languages `language_select` currently lists.
@@ -455,17 +559,50 @@ impl BackendView {
         cx: &mut Context<Self>,
     ) -> Self {
         let kind = BackendKind::of(&panel.selection);
-        let items = choices(kind, &panel.runtimes);
+        let items = choices(kind);
+        let saved_entry = BackendEntry::of(&panel.selection);
         let selected = items
             .iter()
-            .position(|choice| choice.selection == panel.selection)
+            .position(|choice| choice.entry == saved_entry)
             .map(IndexPath::new);
         let backend_select = cx.new(|cx| SelectState::new(items, selected, window, cx));
         let subscription = cx.subscribe(&backend_select, |this, _select, event, cx| {
+            let SelectEvent::Confirm(Some(entry)) = event else {
+                return;
+            };
+            // Re-confirming the saved engine or provider is not a change.
+            if *entry == BackendEntry::of(&this.panel.selection) {
+                return;
+            }
+            let selection = match *entry {
+                // Decision 4: the device is kept when the new engine offers
+                // it, otherwise CPU.
+                BackendEntry::Engine(engine) => switch_engine(
+                    &this.panel.selection,
+                    engine,
+                    &this.panel.runtimes,
+                    this.panel.bundled_all_providers,
+                ),
+                BackendEntry::Remote(provider) => BackendSelection::Remote(provider),
+            };
+            this.act(BackendAction::Select(selection), cx);
+        });
+
+        let device_items = device_items(&panel);
+        let device_selected = device_items
+            .iter()
+            .position(|choice| choice.selection == panel.selection)
+            .map(IndexPath::new);
+        let device_select =
+            cx.new(|cx| SelectState::new(device_items, device_selected, window, cx));
+        let device_subscription = cx.subscribe(&device_select, |this, _select, event, cx| {
             let SelectEvent::Confirm(Some(selection)) = event else {
                 return;
             };
-            if *selection != this.panel.selection {
+            // Only a device of the saved engine is ever saved from here.
+            if *selection != this.panel.selection
+                && selection.engine() == this.panel.selection.engine()
+            {
                 this.act(BackendAction::Select(selection.clone()), cx);
             }
         });
@@ -528,8 +665,10 @@ impl BackendView {
             }
         });
 
+        // Story 3.17: a keyless provider (Edge TTS) gets no key field.
         let key_inputs = RemoteProvider::ALL
             .into_iter()
+            .filter(|provider| provider.needs_api_key())
             .map(|provider| {
                 let saved = panel.api_keys.get(provider).unwrap_or_default().to_string();
                 let input = cx.new(|cx| {
@@ -553,6 +692,7 @@ impl BackendView {
             actions,
             kind,
             backend_select,
+            device_select,
             language_select,
             language_backend,
             voice_select,
@@ -565,7 +705,12 @@ impl BackendView {
             language_stale: false,
             language_items_stale: false,
             voice_stale: false,
-            _subscriptions: vec![subscription, language_subscription, voice_subscription],
+            _subscriptions: vec![
+                subscription,
+                device_subscription,
+                language_subscription,
+                voice_subscription,
+            ],
         }
     }
 
@@ -576,7 +721,8 @@ impl BackendView {
         // save, a removal) — never merely because some other part of the
         // panel did, which would wipe whatever the user is typing.
         let keys_changed = panel.api_keys != self.panel.api_keys;
-        let runtimes_changed = panel.runtimes != self.panel.runtimes;
+        let runtimes_changed = panel.runtimes != self.panel.runtimes
+            || panel.bundled_all_providers != self.panel.bundled_all_providers;
         let selection_changed = panel.selection != self.panel.selection;
         // A failed save leaves the selection unchanged, but the `Select`
         // still shows the entry the user picked: resync it to what is saved.
@@ -584,7 +730,9 @@ impl BackendView {
         // The same for the language `Select`: a failed save leaves the
         // picked language showing until it is resynced to the saved one.
         let voices_changed = panel.system_voices != self.panel.system_voices
-            || panel.azure_voices != self.panel.azure_voices;
+            || panel.azure_voices != self.panel.azure_voices
+            || panel.edge_tts_voices != self.panel.edge_tts_voices
+            || panel.piper_voices != self.panel.piper_voices;
         let region_changed = panel.azure_region != self.panel.azure_region;
         self.language_items_stale |= voices_changed;
         self.language_stale |= panel.speech_languages != self.panel.speech_languages
@@ -717,14 +865,19 @@ impl BackendView {
         self.panel_stale = false;
 
         let selection = self.panel.selection.clone();
-        let items =
-            std::mem::take(&mut self.items_stale).then(|| choices(self.kind, &self.panel.runtimes));
+        let items = std::mem::take(&mut self.items_stale).then(|| choices(self.kind));
         self.backend_select.update(cx, |select, cx| {
             if let Some(items) = items {
                 select.set_items(items, window, cx);
             }
             // The saved entry is absent from the other kind's list, which
             // leaves the `Select` empty, on its placeholder.
+            select.set_selected_value(&BackendEntry::of(&selection), window, cx);
+        });
+        // The saved engine's devices, with the saved one chosen.
+        let devices = device_items(&self.panel);
+        self.device_select.update(cx, |select, cx| {
+            select.set_items(devices, window, cx);
             select.set_selected_value(&selection, window, cx);
         });
 
@@ -813,9 +966,30 @@ impl BackendView {
         }
     }
 
-    /// Step one and two: the kind, then a backend of that kind.
+    /// Whether the device `Select` is shown: the Local kind with Piper or
+    /// Chatterbox saved (spec-backend-engine-and-device-selects). Never for
+    /// the System voice or a remote backend.
+    fn shows_device_select(&self) -> bool {
+        self.kind == BackendKind::Local
+            && self
+                .panel
+                .selection
+                .engine()
+                .is_some_and(LocalEngine::has_device)
+    }
+
+    /// Step one and two: the kind, then a backend of that kind — and, for
+    /// an ONNX engine, the device it runs on.
     fn choice_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let kind = self.kind;
+        let shows_device = self.shows_device_select();
+        // A failed save is shown under the last `Select` of the two.
+        let error = self.panel.errors.get(&BackendArea::Selection).cloned();
+        let error_line_for_selection = |cx: &mut Context<Self>| {
+            error
+                .clone()
+                .map(|error| error_line("backend-error-selection", error, cx))
+        };
         v_flex()
             .gap_4()
             .child(
@@ -859,11 +1033,28 @@ impl BackendView {
                             .menu_width(px(360.))
                             .w(px(360.)),
                     )
-                    .when_some(
-                        self.panel.errors.get(&BackendArea::Selection).cloned(),
-                        |el, error| el.child(error_line("backend-error-selection", error, cx)),
-                    ),
+                    .when(!shows_device, |el| {
+                        el.children(error_line_for_selection(cx))
+                    }),
             )
+            .when(shows_device, |el| {
+                el.child(
+                    v_flex()
+                        .id("backend-device")
+                        .test_support()
+                        .gap_1()
+                        .child(div().font_weight(FontWeight::MEDIUM).child("Device"))
+                        .child(
+                            Select::new(&self.device_select)
+                                .id("backend-device-select")
+                                .accessibility_label("Device")
+                                .placeholder("Choose a device")
+                                .menu_width(px(360.))
+                                .w(px(360.)),
+                        )
+                        .children(error_line_for_selection(cx)),
+                )
+            })
             .into_any_element()
     }
 
@@ -882,12 +1073,27 @@ impl BackendView {
         let voice = self
             .shows_voice_picker()
             .then(|| self.speech_voice_section(cx));
+        // Story 3.15: Piper's voices are managed on their own tab.
+        let manage_voices = (self.kind == BackendKind::Local && self.panel.selection.is_piper())
+            .then(|| {
+                h_flex()
+                    .child(
+                        Button::new("backend-manage-piper-voices")
+                            .ghost()
+                            .label("Manage voices")
+                            .on_click(
+                                cx.listener(|_this, _, _window, cx| cx.emit(OpenPiperVoicesTab)),
+                            ),
+                    )
+                    .into_any_element()
+            });
         match self.kind {
             BackendKind::Local => Some(
                 v_flex()
                     .gap_6()
                     .children(language)
                     .children(voice)
+                    .children(manage_voices)
                     .child(self.runtimes_section(cx))
                     .into_any_element(),
             ),
@@ -912,6 +1118,34 @@ impl BackendView {
                             .children(language)
                             .children(voice)
                             .child(self.azure_voice_status(cx))
+                            .when(!others.is_empty(), |el| {
+                                el.child(
+                                    v_flex()
+                                        .id("backend-other-providers")
+                                        .test_support()
+                                        .gap_2()
+                                        .children(others),
+                                )
+                            })
+                            .into_any_element(),
+                    );
+                }
+                // Story 3.17: Edge TTS has no key and holds no sample — its
+                // locale and voice, and what it speaks in.
+                if saved == Some(RemoteProvider::EdgeTts) {
+                    return Some(
+                        v_flex()
+                            .gap_6()
+                            .children(language)
+                            .children(voice)
+                            .child(
+                                div()
+                                    .id("backend-edge-tts-stock-note")
+                                    .test_support()
+                                    .text_size(px(12.))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(EDGE_TTS_STOCK_VOICE_NOTE),
+                            )
                             .when(!others.is_empty(), |el| {
                                 el.child(
                                     v_flex()
@@ -1485,12 +1719,24 @@ impl BackendView {
 fn speech_language_note(panel: &BackendPanel, backend: LanguageBackend) -> String {
     // Nothing listed is not the same as a wrong value.
     if backend == LanguageBackend::SystemVoice && panel.system_voices.is_empty() {
-        return "The System voice has not listed its voices yet. See Settings → Backend."
+        return "The System voice has not listed its voices yet. See Settings → Speech."
             .to_string();
+    }
+    if backend == LanguageBackend::Piper && panel.piper_voices.is_empty() {
+        return PIPER_NO_VOICE_NOTE.to_string();
     }
     if backend == LanguageBackend::Remote(RemoteProvider::Azure) && panel.azure_voices.is_empty() {
         return "Azure's voices have not been listed yet. They are fetched once its key and \
                 region are saved."
+            .to_string();
+    }
+    // Story 3.17: a missing program is the Dependencies row's to say; a
+    // failed listing is the error beside this language.
+    if backend == LanguageBackend::Remote(RemoteProvider::EdgeTts)
+        && panel.edge_tts_voices.is_empty()
+    {
+        return "Edge TTS's voices are not listed yet. They are listed by the edge-tts program \
+             at the next check."
             .to_string();
     }
     let saved = panel.speech_languages.get(backend).unwrap_or_default();
@@ -1499,6 +1745,8 @@ fn speech_language_note(panel: &BackendPanel, backend: LanguageBackend) -> Strin
         backend.label()
     )
 }
+
+impl gpui_kit::EventEmitter<OpenPiperVoicesTab> for BackendView {}
 
 impl Render for BackendView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1537,6 +1785,7 @@ fn provider_slug(provider: RemoteProvider) -> &'static str {
         RemoteProvider::DeepInfra => "deepinfra",
         RemoteProvider::FalAi => "fal-ai",
         RemoteProvider::Azure => "azure",
+        RemoteProvider::EdgeTts => "edge-tts",
     }
 }
 
@@ -1611,6 +1860,11 @@ mod tests {
             assert_eq!(view.read(cx).kind, BackendKind::Local);
             assert_eq!(
                 view.read(cx).backend_select.read(cx).selected_value(),
+                Some(&BackendEntry::Engine(LocalEngine::Chatterbox))
+            );
+            assert!(window.try_find("backend-device-select").is_some());
+            assert_eq!(
+                view.read(cx).device_select.read(cx).selected_value(),
                 Some(&BackendSelection::BUNDLED_CPU)
             );
             assert!(window.try_find("backend-runtimes").is_some());
@@ -1644,6 +1898,10 @@ mod tests {
             assert!(window.try_find("backend-runtimes").is_none());
             assert!(window.try_find("backend-add-runtime").is_none());
             assert!(window.try_find("backend-cpu-mode").is_none());
+            assert!(
+                window.try_find("backend-device-select").is_none(),
+                "a remote backend has no device"
+            );
         })
         .unwrap();
 
@@ -1678,6 +1936,7 @@ mod tests {
                 "none of the remote backends is chosen"
             );
             assert!(window.try_find("backend-runtimes").is_none());
+            assert!(window.try_find("backend-device-select").is_none());
             assert!(window.try_find("backend-api-keys").is_none());
             assert!(window.try_find("api-key-save-deepinfra").is_none());
             assert!(window.try_find("remote-sample-state-deepinfra").is_none());
@@ -1697,8 +1956,9 @@ mod tests {
             assert_eq!(view.read(cx).kind, BackendKind::Local);
             assert_eq!(
                 view.read(cx).backend_select.read(cx).selected_value(),
-                Some(&BackendSelection::BUNDLED_CPU)
+                Some(&BackendEntry::Engine(LocalEngine::Chatterbox))
             );
+            assert!(window.try_find("backend-device-select").is_some());
             assert!(window.try_find("backend-runtimes").is_some());
         })
         .unwrap();
@@ -1721,7 +1981,7 @@ mod tests {
             assert_eq!(view.read(cx).kind, BackendKind::Remote);
             assert_eq!(
                 view.read(cx).backend_select.read(cx).selected_value(),
-                Some(&BackendSelection::Remote(RemoteProvider::DeepInfra))
+                Some(&BackendEntry::Remote(RemoteProvider::DeepInfra))
             );
             assert!(window.try_find("api-key-save-deepinfra").is_some());
         })
@@ -1925,19 +2185,32 @@ mod tests {
         .unwrap();
     }
 
-    /// Choosing another entry in the `Select` asks the root to select it,
-    /// once; re-confirming the current entry sends nothing.
+    /// Choosing another engine asks the root to select it, once, on the
+    /// device the engine offers; re-confirming the current engine sends
+    /// nothing. A remote provider is selected as itself.
     #[gpui_kit::test]
-    fn choosing_a_backend_asks_the_root(cx: &mut TestAppContext) {
+    fn choosing_an_engine_asks_the_root(cx: &mut TestAppContext) {
         let (window, view, recorded) = open_backend_tab(cx, cuda_panel());
 
         cx.update_window(window.into(), |_, window, cx| {
             window.render_frame(cx);
             let select = view.read(cx).backend_select.clone();
             select.update(cx, |_, cx| {
-                // Re-confirming the current selection is not a change.
-                cx.emit(SelectEvent::Confirm(Some(cuda_panel().selection)));
-                cx.emit(SelectEvent::Confirm(Some(BackendSelection::BUNDLED_CPU)));
+                // Re-confirming the current engine is not a change.
+                cx.emit(SelectEvent::Confirm(Some(BackendEntry::Engine(
+                    LocalEngine::Chatterbox,
+                ))));
+                // The added runtime's CUDA is Chatterbox's only, and the
+                // bundled runtime here offers CPU only: Piper on CPU.
+                cx.emit(SelectEvent::Confirm(Some(BackendEntry::Engine(
+                    LocalEngine::Piper,
+                ))));
+                cx.emit(SelectEvent::Confirm(Some(BackendEntry::Engine(
+                    LocalEngine::SystemVoice,
+                ))));
+                cx.emit(SelectEvent::Confirm(Some(BackendEntry::Remote(
+                    RemoteProvider::Azure,
+                ))));
             });
         })
         .unwrap();
@@ -1945,30 +2218,184 @@ mod tests {
 
         assert_eq!(
             *recorded.borrow(),
-            vec![BackendAction::Select(BackendSelection::BUNDLED_CPU)]
+            vec![
+                BackendAction::Select(BackendSelection::PIPER_CPU),
+                BackendAction::Select(BackendSelection::SystemVoice),
+                BackendAction::Select(BackendSelection::Remote(RemoteProvider::Azure)),
+            ]
         );
     }
 
-    /// The `Select` lists only existing backends of the kind shown.
+    /// The Engine switch row: Chatterbox on WebGPU → Piper keeps WebGPU
+    /// when the bundled runtime has every provider.
+    #[gpui_kit::test]
+    fn switching_engine_keeps_the_device(cx: &mut TestAppContext) {
+        let panel = BackendPanel {
+            selection: BackendSelection::Local {
+                runtime: None,
+                target: voice_me_core::SpeechExecutionTarget::WebGpu,
+            },
+            bundled_all_providers: true,
+            ..BackendPanel::default()
+        };
+        let (window, view, recorded) = open_backend_tab(cx, panel);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let select = view.read(cx).backend_select.clone();
+            select.update(cx, |_, cx| {
+                cx.emit(SelectEvent::Confirm(Some(BackendEntry::Engine(
+                    LocalEngine::Piper,
+                ))));
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            *recorded.borrow(),
+            vec![BackendAction::Select(BackendSelection::Piper {
+                target: voice_me_core::SpeechExecutionTarget::WebGpu
+            })]
+        );
+    }
+
+    /// The device `Select` lists the saved engine's devices; confirming
+    /// another saves the engine on it, once.
+    #[gpui_kit::test]
+    fn the_device_select_lists_and_saves_the_engines_devices(cx: &mut TestAppContext) {
+        let panel = BackendPanel {
+            bundled_all_providers: true,
+            ..cuda_panel()
+        };
+        let (window, view, recorded) = open_backend_tab(cx, panel);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("backend-device-select").is_some());
+            let devices: Vec<String> = device_items(&view.read(cx).panel)
+                .into_iter()
+                .map(|choice| choice.label.to_string())
+                .collect();
+            assert_eq!(
+                devices,
+                vec!["CPU", "CUDA", "WebGPU", "CUDA — libonnxruntime.so"]
+            );
+            let select = view.read(cx).device_select.clone();
+            assert_eq!(
+                select.read(cx).selected_value(),
+                Some(&cuda_panel().selection)
+            );
+            select.update(cx, |_, cx| {
+                // The saved device is not a change.
+                cx.emit(SelectEvent::Confirm(Some(cuda_panel().selection)));
+                cx.emit(SelectEvent::Confirm(Some(BackendSelection::Local {
+                    runtime: None,
+                    target: voice_me_core::SpeechExecutionTarget::WebGpu,
+                })));
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            *recorded.borrow(),
+            vec![BackendAction::Select(BackendSelection::Local {
+                runtime: None,
+                target: voice_me_core::SpeechExecutionTarget::WebGpu,
+            })]
+        );
+    }
+
+    /// Piper's devices: CPU only until the bundled runtime has every
+    /// provider, then CPU, CUDA and WebGPU — never an added runtime's. The
+    /// System voice has no device `Select`.
+    #[gpui_kit::test]
+    fn the_device_select_follows_the_engine(cx: &mut TestAppContext) {
+        let mut panel = piper_panel(&[], None);
+        panel.runtimes = cuda_panel().runtimes;
+        let (window, view, _recorded) = open_backend_tab(cx, panel.clone());
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(
+                view.read(cx).backend_select.read(cx).selected_value(),
+                Some(&BackendEntry::Engine(LocalEngine::Piper))
+            );
+            assert!(window.try_find("backend-device-select").is_some());
+            let labels = |view: &Entity<BackendView>, cx: &App| -> Vec<String> {
+                device_items(&view.read(cx).panel)
+                    .into_iter()
+                    .map(|choice| choice.label.to_string())
+                    .collect()
+            };
+            assert_eq!(labels(&view, cx), vec!["CPU"]);
+
+            view.update(cx, |view, cx| {
+                view.set_backend_panel(
+                    BackendPanel {
+                        bundled_all_providers: true,
+                        ..panel.clone()
+                    },
+                    cx,
+                )
+            });
+            window.render_frame(cx);
+            assert_eq!(labels(&view, cx), vec!["CPU", "CUDA", "WebGPU"]);
+            assert_eq!(
+                view.read(cx).device_select.read(cx).selected_value(),
+                Some(&BackendSelection::PIPER_CPU)
+            );
+
+            view.update(cx, |view, cx| {
+                view.set_backend_panel(
+                    BackendPanel {
+                        selection: BackendSelection::SystemVoice,
+                        ..BackendPanel::default()
+                    },
+                    cx,
+                )
+            });
+            window.render_frame(cx);
+            assert!(window.try_find("backend-device-select").is_none());
+        })
+        .unwrap();
+    }
+
+    /// The Engine list row: the Local `Select` lists the engines without a
+    /// device; Remote lists every provider.
     #[test]
     fn each_kind_lists_only_its_own_backends() {
-        let runtimes = cuda_panel().runtimes;
-        let local: Vec<_> = choices(BackendKind::Local, &runtimes)
+        let local: Vec<_> = choices(BackendKind::Local)
             .into_iter()
-            .map(|choice| choice.selection)
+            .map(|choice| (choice.entry, choice.label.to_string()))
             .collect();
-        assert_eq!(local[0], BackendSelection::BUNDLED_CPU);
-        assert_eq!(local[1..local.len() - 1], runtimes[0].entries()[..]);
-        assert_eq!(local.last(), Some(&BackendSelection::SystemVoice));
-        let remote: Vec<_> = choices(BackendKind::Remote, &runtimes)
+        assert_eq!(
+            local,
+            vec![
+                (
+                    BackendEntry::Engine(LocalEngine::Piper),
+                    "Piper — natural, instant (stock voice)".to_string()
+                ),
+                (
+                    BackendEntry::Engine(LocalEngine::Chatterbox),
+                    "Chatterbox — your voice".to_string()
+                ),
+                (
+                    BackendEntry::Engine(LocalEngine::SystemVoice),
+                    "System voice — instant (stock voice)".to_string()
+                ),
+            ]
+        );
+        let remote: Vec<_> = choices(BackendKind::Remote)
             .into_iter()
-            .map(|choice| choice.selection)
+            .map(|choice| choice.entry)
             .collect();
         assert_eq!(
             remote,
             RemoteProvider::ALL
                 .into_iter()
-                .map(BackendSelection::Remote)
+                .map(BackendEntry::Remote)
                 .collect::<Vec<_>>()
         );
     }
@@ -1981,7 +2408,7 @@ mod tests {
 
         cx.update_window(window.into(), |_, window, cx| {
             window.render_frame(cx);
-            let select = view.read(cx).backend_select.clone();
+            let select = view.read(cx).device_select.clone();
             select.update(cx, |select, cx| {
                 select.set_selected_value(&BackendSelection::BUNDLED_CPU, window, cx)
             });
@@ -2059,7 +2486,7 @@ mod tests {
         assert!(recorded.borrow().is_empty());
     }
 
-    /// A runtime added while the Local kind is shown rebuilds the Local
+    /// A runtime added while the Local kind is shown rebuilds the device
     /// `Select`, so its entries can be chosen.
     #[gpui_kit::test]
     fn an_added_runtime_appears_in_the_local_select(cx: &mut TestAppContext) {
@@ -2082,7 +2509,7 @@ mod tests {
             window.render_frame(cx);
             assert!(window.try_find("backend-runtime-0").is_some());
 
-            let select = view.read(cx).backend_select.clone();
+            let select = view.read(cx).device_select.clone();
             select.update(cx, |select, cx| {
                 select.set_selected_value(&cuda_entry, window, cx)
             });
@@ -2559,8 +2986,9 @@ mod tests {
             assert_eq!(view.read(cx).kind, BackendKind::Local);
             assert_eq!(
                 view.read(cx).backend_select.read(cx).selected_value(),
-                Some(&BackendSelection::SystemVoice)
+                Some(&BackendEntry::Engine(LocalEngine::SystemVoice))
             );
+            assert!(window.try_find("backend-device-select").is_none());
             assert!(window.try_find("backend-stock-voice").is_some());
             assert!(window.try_find("backend-cpu-mode").is_none());
             assert!(window.try_find("backend-speech-language").is_some());
@@ -2749,7 +3177,7 @@ mod tests {
             window.render_frame(cx);
             assert!(window.try_find("backend-speech-language-note").is_some());
             let note = speech_language_note(&view.read(cx).panel, LanguageBackend::SystemVoice);
-            assert!(note.contains("Settings → Backend"), "{note}");
+            assert!(note.contains("Settings → Speech"), "{note}");
             assert!(!note.contains("eSpeak"), "{note}");
             view.update(cx, |view, cx| {
                 view.set_backend_panel(system_voice_panel("tr", None), cx)
@@ -2983,5 +3411,229 @@ mod tests {
             assert!(note.contains("Azure"), "{note}");
         })
         .unwrap();
+    }
+
+    fn edge_voice(id: &str, locale: &str, name: &str, priority: u32) -> StockVoice {
+        StockVoice {
+            id: id.to_string(),
+            language: locale.to_string(),
+            language_label: locale.to_string(),
+            name: name.to_string(),
+            priority,
+        }
+    }
+
+    /// Edge TTS saved, speaking `locale` with `voice` stored, against a
+    /// small list as `edge-tts --list-voices` gives it.
+    fn edge_tts_panel(locale: &str, voice: Option<&str>) -> BackendPanel {
+        BackendPanel {
+            selection: BackendSelection::Remote(RemoteProvider::EdgeTts),
+            speech_languages: SpeechLanguages {
+                edge_tts: locale.to_string(),
+                ..SpeechLanguages::default()
+            },
+            speech_voices: SpeechVoices {
+                edge_tts: voice.map(str::to_string),
+                ..SpeechVoices::default()
+            },
+            edge_tts_voices: vec![
+                edge_voice("en-US-AvaMultilingualNeural", "en-US", "Ava (Female)", 0),
+                edge_voice("tr-TR-AhmetNeural", "tr-TR", "Ahmet (Male)", 1),
+                edge_voice(EMEL, "tr-TR", "Emel (Female)", 2),
+            ],
+            ..BackendPanel::default()
+        }
+    }
+
+    /// Story 3.17: Edge TTS has no key field and no sample line; its
+    /// locale and voice come from its list, with the first listed voice in
+    /// effect, and it says it speaks in a Microsoft voice.
+    #[gpui_kit::test]
+    fn edge_tts_shows_its_locale_and_voice_and_no_key(cx: &mut TestAppContext) {
+        let (window, view, recorded) = open_backend_tab(cx, edge_tts_panel("tr-TR", None));
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).kind, BackendKind::Remote);
+            assert!(
+                !view
+                    .read(cx)
+                    .key_inputs
+                    .iter()
+                    .any(|(provider, _)| *provider == RemoteProvider::EdgeTts)
+            );
+            assert!(window.try_find("api-key-save-edge-tts").is_none());
+            assert!(window.try_find("backend-api-keys").is_none());
+            assert!(window.try_find("api-key-plaintext-notice").is_none());
+            assert!(window.try_find("backend-remote-samples").is_none());
+            assert!(window.try_find("backend-speech-language").is_some());
+            assert_eq!(
+                view.read(cx).language_select.read(cx).selected_value(),
+                Some(&"tr-TR".to_string())
+            );
+            assert!(window.try_find("backend-speech-voice").is_some());
+            assert_eq!(
+                view.read(cx).voice_select.read(cx).selected_value(),
+                Some(&"tr-TR-AhmetNeural".to_string()),
+                "the language's first listed voice"
+            );
+            assert!(window.try_find("backend-edge-tts-stock-note").is_some());
+            assert!(window.try_find("backend-stock-voice").is_some());
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(recorded.borrow().is_empty());
+    }
+
+    /// Picking Emel asks the root once, under Edge TTS.
+    #[gpui_kit::test]
+    fn picking_an_edge_tts_voice_asks_the_root(cx: &mut TestAppContext) {
+        let (window, view, recorded) = open_backend_tab(cx, edge_tts_panel("tr-TR", None));
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let select = view.read(cx).voice_select.clone();
+            select.update(cx, |_, cx| {
+                // The voice in effect is not a change.
+                cx.emit(SelectEvent::Confirm(Some("tr-TR-AhmetNeural".to_string())));
+                cx.emit(SelectEvent::Confirm(Some(EMEL.to_string())));
+            });
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            *recorded.borrow(),
+            vec![BackendAction::SetSpeechVoice(
+                LanguageBackend::Remote(RemoteProvider::EdgeTts),
+                Some(EMEL.to_string())
+            )]
+        );
+    }
+
+    /// Edge TTS is listed after Azure, under the Remote kind, which no
+    /// longer promises a key.
+    #[test]
+    fn edge_tts_is_the_last_remote_entry() {
+        let remote = choices(BackendKind::Remote);
+        let last = remote.last().unwrap();
+        assert_eq!(last.entry, BackendEntry::Remote(RemoteProvider::EdgeTts));
+        assert_eq!(last.label.as_ref(), "Edge TTS — free, online (stock voice)");
+        assert_eq!(
+            remote[remote.len() - 2].entry,
+            BackendEntry::Remote(RemoteProvider::Azure)
+        );
+        assert_eq!(BackendKind::Remote.label(), "Remote — online providers");
+        assert_eq!(provider_slug(RemoteProvider::EdgeTts), "edge-tts");
+    }
+
+    /// Nothing listed yet: the note says so, and never that the program is
+    /// missing — the Dependencies row says that.
+    #[test]
+    fn edge_tts_with_no_list_yet_says_so() {
+        let panel = BackendPanel {
+            edge_tts_voices: Vec::new(),
+            ..edge_tts_panel("tr-TR", None)
+        };
+        let note = speech_language_note(&panel, LanguageBackend::Remote(RemoteProvider::EdgeTts));
+        assert!(note.contains("Edge TTS"), "{note}");
+        assert!(note.contains("not listed yet"), "{note}");
+        assert!(!note.contains("  "), "no stray spaces: {note}");
+    }
+
+    fn piper_panel(installed: &[(&str, &str)], voice: Option<&str>) -> BackendPanel {
+        BackendPanel {
+            selection: BackendSelection::PIPER_CPU,
+            speech_voices: SpeechVoices {
+                piper: voice.map(str::to_string),
+                ..SpeechVoices::default()
+            },
+            piper_voices: installed
+                .iter()
+                .map(|(id, locale)| StockVoice {
+                    id: id.to_string(),
+                    language: locale.to_string(),
+                    language_label: if locale.starts_with("tr") {
+                        "Turkish (Turkey)".to_string()
+                    } else {
+                        "English (United States)".to_string()
+                    },
+                    name: id.to_string(),
+                    priority: 0,
+                })
+                .collect(),
+            ..BackendPanel::default()
+        }
+    }
+
+    /// Story 3.15: Piper's pickers list only installed voices, and it is a
+    /// Local stock voice with "Manage voices".
+    #[gpui_kit::test]
+    fn piper_pickers_list_installed_voices_only(cx: &mut TestAppContext) {
+        let panel = piper_panel(
+            &[
+                ("tr_TR-dfki-medium", "tr_TR"),
+                ("tr_TR-fahrettin-medium", "tr_TR"),
+                ("en_US-lessac-medium", "en_US"),
+            ],
+            Some("tr_TR-fahrettin-medium"),
+        );
+        let (window, view, _recorded) = open_backend_tab(cx, panel);
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_eq!(view.read(cx).kind, BackendKind::Local);
+            assert!(window.try_find("backend-stock-voice").is_some());
+            assert!(window.try_find("backend-manage-piper-voices").is_some());
+            assert_eq!(
+                view.read(cx).language_select.read(cx).selected_value(),
+                Some(&"tr_TR".to_string())
+            );
+            let voice = view.read(cx).voice_select.clone();
+            assert_eq!(
+                voice.read(cx).selected_value(),
+                Some(&"tr_TR-fahrettin-medium".to_string())
+            );
+            // An English voice is not among Turkish's.
+            voice.update(cx, |select, cx| {
+                select.set_selected_value(&"en_US-lessac-medium".to_string(), window, cx);
+            });
+            assert_eq!(voice.read(cx).selected_value(), None);
+            voice.update(cx, |select, cx| {
+                select.set_selected_value(&"tr_TR-dfki-medium".to_string(), window, cx);
+            });
+            assert_eq!(
+                voice.read(cx).selected_value(),
+                Some(&"tr_TR-dfki-medium".to_string())
+            );
+        })
+        .unwrap();
+    }
+
+    /// With no Piper voice installed the language note says so and points
+    /// at "Manage voices", which asks the shell for the Piper voices tab.
+    #[gpui_kit::test]
+    fn no_piper_voice_says_so_and_manage_voices_opens_the_tab(cx: &mut TestAppContext) {
+        let (window, view, _recorded) =
+            open_backend_tab(cx, piper_panel(&[], Some("tr_TR-fahrettin-medium")));
+        let opened = Rc::new(std::cell::Cell::new(false));
+        let _subscription = cx.update({
+            let opened = opened.clone();
+            let view = view.clone();
+            move |cx| cx.subscribe(&view, move |_, _: &OpenPiperVoicesTab, _| opened.set(true))
+        });
+
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("backend-speech-language-note").is_some());
+            assert_eq!(
+                speech_language_note(&view.read(cx).panel, LanguageBackend::Piper),
+                PIPER_NO_VOICE_NOTE
+            );
+            window.click("backend-manage-piper-voices", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(opened.get());
     }
 }

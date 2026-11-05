@@ -13,8 +13,10 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::VoiceMeError;
-use crate::state::SpeechWeights;
+use crate::state::{SpeechWeights, StockVoice};
 
 /// Overrides the cache root entirely, for a machine that keeps the engine's
 /// assets somewhere else (and for every test that must not touch the user's
@@ -149,6 +151,108 @@ pub fn bundled_runtime_dylib(root: &Path) -> PathBuf {
     root.join(RUNTIME_DIR).join(runtime_dylib_file_name())
 }
 
+/// Story 3.8: where NVIDIA's CUDA libraries (cudart, cuBLAS, cuFFT, cuDNN)
+/// sit, inside [`RUNTIME_DIR`]. The engine loads them from here before it
+/// registers the CUDA provider, so the user's `PATH` and `LD_LIBRARY_PATH`
+/// are never involved.
+pub const CUDA_LIBRARIES_DIR: &str = "cuda";
+
+/// Records which archive the runtime in [`RUNTIME_DIR`] came from (its file
+/// name), so an older or CPU-only runtime can be told apart from the
+/// build that has the GPU providers. A runtime without one predates
+/// Story 3.8.
+pub const RUNTIME_SOURCE_FILE: &str = "installed-from.txt";
+
+/// `<root>/runtime`.
+pub fn runtime_dir(root: &Path) -> PathBuf {
+    root.join(RUNTIME_DIR)
+}
+
+/// `<root>/runtime/cuda`.
+pub fn cuda_libraries_dir(root: &Path) -> PathBuf {
+    runtime_dir(root).join(CUDA_LIBRARIES_DIR)
+}
+
+/// `<root>/runtime/installed-from.txt`.
+pub fn runtime_source_file(root: &Path) -> PathBuf {
+    runtime_dir(root).join(RUNTIME_SOURCE_FILE)
+}
+
+/// Story 3.8 (Windows): where a runtime update is put when the runtime in
+/// [`RUNTIME_DIR`] is loaded in this process and cannot be replaced. It is
+/// moved into place when voice-me next starts, before anything loads it.
+pub const STAGED_RUNTIME_DIR: &str = "staged";
+
+/// `<root>/runtime/staged`.
+pub fn staged_runtime_dir(root: &Path) -> PathBuf {
+    runtime_dir(root).join(STAGED_RUNTIME_DIR)
+}
+
+/// `<root>/runtime/cuda/installed-from.txt`: one line per NVIDIA wheel
+/// installed — its pinned identity, then the libraries taken from it
+/// ([`cuda_marker_line`]).
+pub fn cuda_libraries_source_file(root: &Path) -> PathBuf {
+    cuda_libraries_dir(root).join(RUNTIME_SOURCE_FILE)
+}
+
+/// One line of [`cuda_libraries_source_file`]: `stamp`, then each library's
+/// file name, tab-separated.
+pub fn cuda_marker_line(stamp: &str, libraries: &[&str]) -> String {
+    let mut line = stamp.to_string();
+    for library in libraries {
+        line.push('\t');
+        line.push_str(library);
+    }
+    line.push('\n');
+    line
+}
+
+/// The lines of [`cuda_libraries_source_file`], as `(stamp, libraries)`.
+/// Missing or unreadable reads as nothing installed.
+pub fn installed_cuda_wheels(root: &Path) -> Vec<(String, Vec<String>)> {
+    std::fs::read_to_string(cuda_libraries_source_file(root))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut fields = line.split('\t');
+            let stamp = fields.next().unwrap_or_default().to_string();
+            (stamp, fields.map(str::to_string).collect())
+        })
+        .collect()
+}
+
+/// Every NVIDIA library the installed wheels named — the only files in
+/// `runtime/cuda/` the engine loads.
+pub fn installed_cuda_libraries(root: &Path) -> Vec<String> {
+    installed_cuda_wheels(root)
+        .into_iter()
+        .flat_map(|(_, libraries)| libraries)
+        .collect()
+}
+
+/// The platform's file name for ONNX Runtime's CUDA execution provider,
+/// which ONNX Runtime loads from beside its own library.
+pub fn cuda_provider_file_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "onnxruntime_providers_cuda.dll"
+    } else {
+        "libonnxruntime_providers_cuda.so"
+    }
+}
+
+/// Where the bundled runtime's CUDA provider sits: beside the bundled
+/// library.
+pub fn bundled_cuda_provider(root: &Path) -> PathBuf {
+    runtime_dir(root).join(cuda_provider_file_name())
+}
+
+/// Whether `dylib` is the bundled runtime of `root` — the one voice-me
+/// installs, rather than a library the user added or configured.
+pub fn is_bundled_runtime(root: &Path, dylib: &Path) -> bool {
+    dylib == bundled_runtime_dylib(root)
+}
+
 /// How the ONNX Runtime library was located — which is half of what the
 /// Dependency Check has to report, since "not at the path you configured"
 /// and "not where we would have put it" are different problems with
@@ -192,9 +296,261 @@ pub fn resolve_runtime_dylib(root: &Path, added: Option<&Path>) -> RuntimeDylib 
     }
 }
 
+/// Where Piper voices live inside the cache root (Story 3.15), one
+/// directory per voice key.
+pub const PIPER_DIR: &str = "piper";
+
+/// A Piper voice's graph, inside its directory.
+pub const PIPER_MODEL_FILE: &str = "model.onnx";
+
+/// A Piper voice's `config.json`, inside its directory.
+pub const PIPER_CONFIG_FILE: &str = "config.json";
+
+/// What `voice-me-deps` records about a Piper voice it installed, inside its
+/// directory. Written last, so a voice with one is a complete install.
+pub const PIPER_MANIFEST_FILE: &str = "voice.toml";
+
+/// The Piper voice a Linux or Windows profile starts with (Stories 3.15,
+/// 3.16): its key and its locale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PiperDefaultVoice {
+    pub key: &'static str,
+    pub locale: &'static str,
+}
+
+/// `tr_TR-fahrettin-medium`: CC0, 63 MB, Turkish.
+pub const PIPER_DEFAULT_VOICE: PiperDefaultVoice = PiperDefaultVoice {
+    key: "tr_TR-fahrettin-medium",
+    locale: "tr_TR",
+};
+
+/// `<root>/piper`.
+pub fn piper_dir(root: &Path) -> PathBuf {
+    root.join(PIPER_DIR)
+}
+
+/// Where an eSpeak NG unpacked by `voice-me-deps` lives inside the cache
+/// root on Windows (Story 3.16): the MSI's files as it would install them, so
+/// the program sits at `<root>/espeak-ng/eSpeak NG/espeak-ng.exe`.
+pub const ESPEAK_DIR: &str = "espeak-ng";
+
+/// `<root>/espeak-ng`.
+pub fn espeak_dir(root: &Path) -> PathBuf {
+    root.join(ESPEAK_DIR)
+}
+
+/// Where the Turkish G2P model lives inside the cache root: DizgeBERT
+/// (`iatagun/dizge-g2p`), exported to ONNX. Piper voices whose
+/// `config.json` says `"phoneme_type": "dizge"` are phonemized through it
+/// instead of eSpeak NG.
+pub const TURKISH_G2P_DIR: &str = "g2p-tr-dizge";
+
+/// The Turkish G2P model's graph, inside its directory.
+pub const TURKISH_G2P_MODEL_FILE: &str = "model.onnx";
+
+/// The Turkish G2P model's input characters and output labels, inside its
+/// directory.
+pub const TURKISH_G2P_VOCAB_FILE: &str = "vocab.json";
+
+/// The files of the Turkish G2P model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurkishG2pFiles {
+    /// `<root>/g2p-tr-dizge`.
+    pub dir: PathBuf,
+    pub model: PathBuf,
+    pub vocab: PathBuf,
+}
+
+impl TurkishG2pFiles {
+    /// Whether both files are on disk.
+    pub fn is_complete(&self) -> bool {
+        self.model.is_file() && self.vocab.is_file()
+    }
+}
+
+/// Where the Turkish G2P model's files live under `root`.
+pub fn turkish_g2p_files(root: &Path) -> TurkishG2pFiles {
+    let dir = root.join(TURKISH_G2P_DIR);
+    TurkishG2pFiles {
+        model: dir.join(TURKISH_G2P_MODEL_FILE),
+        vocab: dir.join(TURKISH_G2P_VOCAB_FILE),
+        dir,
+    }
+}
+
+/// The directory eSpeak NG's MSI installs into, under Program Files — and,
+/// unpacked by voice-me, under [`ESPEAK_DIR`].
+pub const ESPEAK_WINDOWS_INSTALL_DIR: &str = "eSpeak NG";
+
+/// The program's file name on Windows.
+pub const ESPEAK_WINDOWS_PROGRAM: &str = "espeak-ng.exe";
+
+/// Where the program sits in an eSpeak NG unpacked into `espeak_dir`: `<espeak_dir>/eSpeak NG/espeak-ng.exe`.
+pub fn espeak_program(espeak_dir: &Path) -> PathBuf {
+    espeak_dir
+        .join(ESPEAK_WINDOWS_INSTALL_DIR)
+        .join(ESPEAK_WINDOWS_PROGRAM)
+}
+
+/// Whether `key` can name a voice directory: letters, digits, `_`, `-` and
+/// `.`, not starting with a dot. Anything else — a `/`, a `..` — could
+/// reach outside `<root>/piper`, so it is never a voice.
+pub fn is_valid_piper_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 128
+        && !key.starts_with('.')
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// The files of one Piper voice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PiperVoiceFiles {
+    /// `<root>/piper/<key>`.
+    pub dir: PathBuf,
+    pub model: PathBuf,
+    pub config: PathBuf,
+    pub manifest: PathBuf,
+}
+
+/// Where voice `key`'s files live under `root`; `None` for a key that is
+/// not a voice name ([`is_valid_piper_key`]).
+pub fn piper_voice_files(root: &Path, key: &str) -> Option<PiperVoiceFiles> {
+    if !is_valid_piper_key(key) {
+        return None;
+    }
+    let dir = piper_dir(root).join(key);
+    Some(PiperVoiceFiles {
+        model: dir.join(PIPER_MODEL_FILE),
+        config: dir.join(PIPER_CONFIG_FILE),
+        manifest: dir.join(PIPER_MANIFEST_FILE),
+        dir,
+    })
+}
+
+/// What `voice.toml` records about an installed voice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PiperVoiceManifest {
+    /// The voice's own name (`fahrettin`).
+    pub name: String,
+    /// Its locale (`tr_TR`) — Piper's speech language.
+    pub locale: String,
+    /// How its language is named to the user (`Turkish (Turkey)`).
+    pub label: String,
+    /// `x_low`, `low`, `medium`, `high`.
+    pub quality: String,
+    /// Which catalog it came from, as the user reads it.
+    pub source: String,
+    /// Its licence, when the source declares one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub licence: Option<String>,
+    /// The SHA-256 of the `model.onnx` installed, when its source publishes
+    /// one: what an update compares with the catalog. Absent in a
+    /// `voice.toml` written before updates existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_sha256: Option<String>,
+    /// The SHA-256 of the `config.json` installed, likewise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_sha256: Option<String>,
+}
+
+impl PiperVoiceManifest {
+    /// The TOML `voice.toml` holds.
+    pub fn to_toml(&self) -> Result<String, VoiceMeError> {
+        toml::to_string_pretty(self)
+            .map_err(|error| VoiceMeError::Other(format!("could not write voice.toml: {error}")))
+    }
+
+    /// Read `voice.toml`'s text; `None` when it is not one.
+    pub fn from_toml(text: &str) -> Option<Self> {
+        toml::from_str(text).ok()
+    }
+}
+
+/// One Piper voice installed under the cache root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledPiperVoice {
+    pub key: String,
+    pub manifest: PiperVoiceManifest,
+    /// The graph and config together, in bytes.
+    pub size_bytes: u64,
+}
+
+impl InstalledPiperVoice {
+    /// The voice as the stock-voice vocabulary names it: its key is the id,
+    /// its locale the language, labelled with the language's name.
+    pub fn to_stock_voice(&self) -> StockVoice {
+        StockVoice {
+            id: self.key.clone(),
+            language: self.manifest.locale.clone(),
+            language_label: self.manifest.label.clone(),
+            name: format!("{} ({})", self.manifest.name, self.manifest.quality),
+            priority: 0,
+        }
+    }
+}
+
+/// Every complete Piper voice under `root`, sorted by key: a directory with
+/// a valid key holding the graph, the config and a readable `voice.toml`.
+/// Read from disk every time — the installed list is a fact about the
+/// cache, never a setting.
+pub fn installed_piper_voices(root: &Path) -> Vec<InstalledPiperVoice> {
+    let Ok(entries) = std::fs::read_dir(piper_dir(root)) else {
+        return Vec::new();
+    };
+    let mut voices: Vec<InstalledPiperVoice> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let key = entry.file_name().to_str()?.to_string();
+            let files = piper_voice_files(root, &key)?;
+            let size = |path: &Path| std::fs::metadata(path).ok().map(|meta| meta.len());
+            let size_bytes = size(&files.model)? + size(&files.config)?;
+            let manifest =
+                PiperVoiceManifest::from_toml(&std::fs::read_to_string(&files.manifest).ok()?)?;
+            Some(InstalledPiperVoice {
+                key,
+                manifest,
+                size_bytes,
+            })
+        })
+        .collect();
+    voices.sort_by(|a, b| a.key.cmp(&b.key));
+    voices
+}
+
+/// The installed voices as stock voices: Piper's languages and voices.
+pub fn installed_piper_stock_voices(root: &Path) -> Vec<StockVoice> {
+    installed_piper_voices(root)
+        .iter()
+        .map(InstalledPiperVoice::to_stock_voice)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_turkish_g2p_model_sits_in_its_own_directory() {
+        let files = turkish_g2p_files(Path::new("/cache"));
+        assert_eq!(files.dir, PathBuf::from("/cache/g2p-tr-dizge"));
+        assert_eq!(files.model, PathBuf::from("/cache/g2p-tr-dizge/model.onnx"));
+        assert_eq!(files.vocab, PathBuf::from("/cache/g2p-tr-dizge/vocab.json"));
+        assert!(!files.is_complete());
+    }
+
+    #[test]
+    fn espeak_ng_is_unpacked_next_to_the_piper_voices() {
+        assert_eq!(
+            espeak_dir(Path::new("/cache")),
+            PathBuf::from("/cache/espeak-ng")
+        );
+        assert_eq!(
+            espeak_program(Path::new("/cache/espeak-ng")),
+            PathBuf::from("/cache/espeak-ng/eSpeak NG/espeak-ng.exe")
+        );
+    }
 
     #[test]
     fn the_tokenizer_sits_at_the_cache_root_not_under_onnx() {
@@ -265,6 +621,70 @@ mod tests {
         );
     }
 
+    /// Story 3.8: the bundled runtime, its CUDA provider beside it, and
+    /// NVIDIA's libraries one level down — all inside `runtime/`.
+    #[test]
+    fn the_cuda_pieces_sit_inside_the_runtime_directory() {
+        let root = Path::new("/cache");
+        assert_eq!(runtime_dir(root), PathBuf::from("/cache/runtime"));
+        assert_eq!(
+            cuda_libraries_dir(root),
+            PathBuf::from("/cache/runtime/cuda")
+        );
+        assert_eq!(
+            bundled_cuda_provider(root).parent(),
+            bundled_runtime_dylib(root).parent()
+        );
+        assert!(
+            cuda_provider_file_name().contains("onnxruntime_providers_cuda"),
+            "{}",
+            cuda_provider_file_name()
+        );
+        assert_eq!(
+            runtime_source_file(root),
+            PathBuf::from("/cache/runtime/installed-from.txt")
+        );
+        assert!(is_bundled_runtime(root, &bundled_runtime_dylib(root)));
+        assert_eq!(
+            staged_runtime_dir(root),
+            PathBuf::from("/cache/runtime/staged")
+        );
+        assert!(!is_bundled_runtime(
+            root,
+            Path::new("/opt/ort/libonnxruntime.so")
+        ));
+    }
+
+    /// The NVIDIA marker names each wheel's identity and its libraries,
+    /// which are the only files the engine loads from `runtime/cuda/`.
+    #[test]
+    fn the_cuda_marker_round_trips_and_lists_only_named_libraries() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cuda_libraries_dir(root.path())).unwrap();
+        let text = cuda_marker_line("https://x/a.whl sha256:aa", &["liba.so.1"])
+            + &cuda_marker_line("https://x/b.whl sha256:bb", &["libb.so.1", "libc.so.1"]);
+        std::fs::write(cuda_libraries_source_file(root.path()), text).unwrap();
+
+        assert_eq!(
+            installed_cuda_wheels(root.path()),
+            vec![
+                (
+                    "https://x/a.whl sha256:aa".to_string(),
+                    vec!["liba.so.1".to_string()]
+                ),
+                (
+                    "https://x/b.whl sha256:bb".to_string(),
+                    vec!["libb.so.1".to_string(), "libc.so.1".to_string()]
+                ),
+            ]
+        );
+        assert_eq!(
+            installed_cuda_libraries(root.path()),
+            ["liba.so.1", "libb.so.1", "libc.so.1"]
+        );
+        assert!(installed_cuda_libraries(Path::new("/nonexistent-voice-me")).is_empty());
+    }
+
     #[test]
     fn a_selected_added_library_wins_over_everything_else() {
         let resolved = resolve_runtime_dylib(
@@ -275,5 +695,69 @@ mod tests {
         assert_eq!(resolved.path, PathBuf::from("/opt/ort/libonnxruntime.so"));
         assert!(resolved.added);
         assert!(!resolved.configured);
+    }
+
+    fn install_fake_voice(root: &Path, key: &str, manifest: Option<&str>) {
+        let files = piper_voice_files(root, key).unwrap();
+        std::fs::create_dir_all(&files.dir).unwrap();
+        std::fs::write(&files.model, b"graph").unwrap();
+        std::fs::write(&files.config, b"{}").unwrap();
+        if let Some(manifest) = manifest {
+            std::fs::write(&files.manifest, manifest).unwrap();
+        }
+    }
+
+    const MANIFEST: &str = "name = \"fahrettin\"\nlocale = \"tr_TR\"\nlabel = \"Turkish\"\n\
+                            quality = \"medium\"\nsource = \"voice-me\"\nlicence = \"CC0-1.0\"\n";
+
+    #[test]
+    fn a_piper_voice_lives_in_its_own_directory_under_piper() {
+        let files = piper_voice_files(Path::new("/cache"), "tr_TR-fahrettin-medium").unwrap();
+        assert_eq!(
+            files.model,
+            PathBuf::from("/cache/piper/tr_TR-fahrettin-medium/model.onnx")
+        );
+        assert_eq!(
+            files.manifest,
+            PathBuf::from("/cache/piper/tr_TR-fahrettin-medium/voice.toml")
+        );
+        for bad in ["", "..", "../etc", "a/b", ".hidden", "a b"] {
+            assert!(
+                piper_voice_files(Path::new("/cache"), bad).is_none(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_complete_voices_are_installed_and_they_become_stock_voices() {
+        let root = tempfile::tempdir().unwrap();
+        install_fake_voice(root.path(), "tr_TR-fahrettin-medium", Some(MANIFEST));
+        // No voice.toml yet: an install still in progress.
+        install_fake_voice(root.path(), "tr_TR-dfki-medium", None);
+        // A voice.toml that is not one.
+        install_fake_voice(root.path(), "en_US-lessac-medium", Some("not = [toml"));
+
+        let installed = installed_piper_voices(root.path());
+
+        assert_eq!(installed.len(), 1, "{installed:?}");
+        assert_eq!(installed[0].key, "tr_TR-fahrettin-medium");
+        assert_eq!(installed[0].size_bytes, 7);
+        assert_eq!(installed[0].manifest.licence.as_deref(), Some("CC0-1.0"));
+        let stock = installed[0].to_stock_voice();
+        assert_eq!(stock.id, "tr_TR-fahrettin-medium");
+        assert_eq!(stock.language, "tr_TR");
+        assert_eq!(stock.language_label, "Turkish");
+        assert_eq!(stock.name, "fahrettin (medium)");
+        assert!(installed_piper_voices(Path::new("/nonexistent-voice-me")).is_empty());
+    }
+
+    #[test]
+    fn a_manifest_round_trips_through_toml() {
+        let manifest = PiperVoiceManifest::from_toml(MANIFEST).unwrap();
+        assert_eq!(
+            PiperVoiceManifest::from_toml(&manifest.to_toml().unwrap()),
+            Some(manifest)
+        );
     }
 }

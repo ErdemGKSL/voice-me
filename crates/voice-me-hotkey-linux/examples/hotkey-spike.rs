@@ -33,7 +33,7 @@ use futures::channel::mpsc;
 #[cfg(target_os = "linux")]
 use voice_me_core::{AppEvent, HotkeyPort as _};
 #[cfg(target_os = "linux")]
-use voice_me_hotkey_linux::{LinuxHotkeyAdapter, SessionKind, session_kind};
+use voice_me_hotkey_linux::{LinuxHotkeyAdapter, SessionKind, desktop, session_kind};
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -44,11 +44,14 @@ fn main() {
     let (events, mut receiver) = mpsc::unbounded::<AppEvent>();
     let adapter = LinuxHotkeyAdapter::new(events.clone());
 
-    let backend = match session_kind() {
-        SessionKind::X11 => "X11 (global-hotkey / XGrabKey)",
-        SessionKind::Wayland => "Wayland (evdev)",
+    let session = match session_kind() {
+        SessionKind::X11 => "X11",
+        SessionKind::Wayland => "Wayland",
     };
-    println!("session backend: {backend}");
+    // The backend actually used is the first that binds, in this order:
+    // GNOME/KDE native → portal (Wayland) → X11 grab (X11) → evdev. A
+    // skipped one says why on stderr.
+    println!("desktop: {:?}, session: {session}", desktop());
 
     if let Err(error) = adapter.start_listening(&hotkey, events) {
         eprintln!("failed to bind {hotkey}: {error}");

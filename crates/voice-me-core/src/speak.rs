@@ -78,7 +78,26 @@ pub fn speak(
     virtual_mic: &dyn VirtualMicPort,
     notifications: &dyn NotificationPort,
 ) -> Result<AudioBuffer, VoiceMeError> {
-    match speak_inner(text, state, tts, virtual_mic, notifications) {
+    speak_with_phase(text, state, tts, virtual_mic, notifications, |_| {})
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeechPhase {
+    Generating,
+    Playing,
+}
+
+/// Run a Speak Action while reporting each actual work phase. `Playing` is
+/// reported only after this line acquires the global playback lock.
+pub fn speak_with_phase(
+    text: &str,
+    state: &AppState,
+    tts: &dyn TtsPort,
+    virtual_mic: &dyn VirtualMicPort,
+    notifications: &dyn NotificationPort,
+    on_phase: impl Fn(SpeechPhase),
+) -> Result<AudioBuffer, VoiceMeError> {
+    match speak_inner(text, state, tts, virtual_mic, notifications, &on_phase) {
         Ok(audio) => Ok(audio),
         Err(error) => {
             // A missing device and a failed generation have different fixes,
@@ -105,6 +124,7 @@ fn speak_inner(
     tts: &dyn TtsPort,
     virtual_mic: &dyn VirtualMicPort,
     notifications: &dyn NotificationPort,
+    on_phase: &dyn Fn(SpeechPhase),
 ) -> Result<AudioBuffer, VoiceMeError> {
     // The overlay already drops a whitespace-only line, so this is a
     // backstop rather than the primary guard — but it is checked here, ahead
@@ -123,7 +143,7 @@ fn speak_inner(
     let backend = state.backend_selection.language_backend();
     let Some(stored) = state.speech_language() else {
         return Err(VoiceMeError::Other(format!(
-            "{} has no speech language yet — choose another backend in Settings → Backend",
+            "{} has no speech language yet — choose another backend in Settings → Speech",
             backend.label()
         )));
     };
@@ -131,17 +151,45 @@ fn speak_inner(
     // Story 3.12: a stock voice. The language and the stored voice are
     // checked against the voices the engine listed — refused by name,
     // never substituted — and there is no sample to check and nothing to
-    // disclose: the engine runs on this machine.
-    if backend == LanguageBackend::SystemVoice {
+    // disclose: the engine runs on this machine. Story 3.15: Piper the
+    // same way, against the voices installed in the cache.
+    if matches!(
+        backend,
+        LanguageBackend::SystemVoice | LanguageBackend::Piper
+    ) {
         let voice = resolve_stock_voice(
             backend,
-            &state.system_voices,
+            state.stock_voices(backend),
             stored,
             state.speech_voices.get(backend),
         )
         .map_err(|refusal| VoiceMeError::Other(refusal.to_string()))?;
+        on_phase(SpeechPhase::Generating);
         let audio = tts.generate(text, None, &voice.language, Some(&voice.id))?;
-        return play(virtual_mic, audio);
+        return play(virtual_mic, audio, on_phase);
+    }
+
+    // Story 3.17: Edge TTS speaks in a stock Microsoft voice through the
+    // `edge-tts` program, with no key and no sample. The language and the
+    // stored voice are checked against the voices the program listed —
+    // refused by name, never substituted; an unset voice is the language's
+    // first. Then the disclosure, before any process is spawned.
+    if backend == LanguageBackend::Remote(RemoteProvider::EdgeTts) {
+        let voice = resolve_stock_voice(
+            backend,
+            &state.edge_tts_voices,
+            stored,
+            state.speech_voices.get(backend),
+        )
+        .map_err(|refusal| VoiceMeError::Other(refusal.to_string()))?;
+        if !state.disclosure_confirmed(RemoteProvider::EdgeTts) {
+            return Err(VoiceMeError::DisclosureNotConfirmed(
+                RemoteProvider::EdgeTts.label().to_string(),
+            ));
+        }
+        on_phase(SpeechPhase::Generating);
+        let audio = tts.generate(text, None, &voice.language, Some(&voice.id))?;
+        return play(virtual_mic, audio, on_phase);
     }
 
     // Story 3.14: Azure speaks in a stock Microsoft voice. A voice has to
@@ -166,13 +214,14 @@ fn speak_inner(
                 RemoteProvider::Azure.label().to_string(),
             ));
         }
+        on_phase(SpeechPhase::Generating);
         let audio = tts.generate(text, None, &locale, Some(&voice))?;
-        return play(virtual_mic, audio);
+        return play(virtual_mic, audio, on_phase);
     }
 
     let Some(language) = backend.speech_language(stored) else {
         return Err(VoiceMeError::Other(format!(
-            "{} can't speak the speech language {stored:?} — choose one in Settings → Backend",
+            "{} can't speak the speech language {stored:?} — choose one in Settings → Speech",
             backend.label()
         )));
     };
@@ -202,11 +251,16 @@ fn speak_inner(
         eprintln!("could not show the still-working notification: {delivery}");
     }
 
+    on_phase(SpeechPhase::Generating);
     let audio = tts.generate(text, Some(reference_clip), language.code, None)?;
-    play(virtual_mic, audio)
+    play(virtual_mic, audio, on_phase)
 }
 
-fn play(virtual_mic: &dyn VirtualMicPort, audio: AudioBuffer) -> Result<AudioBuffer, VoiceMeError> {
+fn play(
+    virtual_mic: &dyn VirtualMicPort,
+    audio: AudioBuffer,
+    on_phase: &dyn Fn(SpeechPhase),
+) -> Result<AudioBuffer, VoiceMeError> {
     // The AD-11 buffer crosses straight from one port to the other,
     // unconverted: 24 kHz mono f32 is what the decoder emits and what the
     // adapter declares to the audio server. `play` blocks until the server
@@ -215,6 +269,7 @@ fn play(virtual_mic: &dyn VirtualMicPort, audio: AudioBuffer) -> Result<AudioBuf
     // describes. A poisoned lock means a previous `play` panicked; the next
     // utterance is still better off spoken than refused.
     let _playing = PLAYBACK.lock().unwrap_or_else(|poison| poison.into_inner());
+    on_phase(SpeechPhase::Playing);
     virtual_mic.play(&audio)?;
 
     Ok(audio)
@@ -389,9 +444,12 @@ mod tests {
         }
     }
 
+    /// Local Chatterbox with a sample. Explicitly the bundled CPU: since
+    /// Story 3.15 an unsaved selection is Piper on Linux.
     fn state_with_a_sample() -> AppState {
         AppState {
             reference_voice_sample: Some(PathBuf::from("/data/reference_voice_sample.wav")),
+            backend_selection: BackendSelection::BUNDLED_CPU,
             ..AppState::default()
         }
     }
@@ -421,11 +479,43 @@ mod tests {
     }
 
     #[test]
+    fn phases_report_generation_then_playing_under_the_queue_lock() {
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+        let phases = Mutex::new(Vec::new());
+        speak_with_phase(
+            "Merhaba",
+            &state_with_a_sample(),
+            &tts,
+            &mic,
+            &notifier,
+            |phase| {
+                if phase == SpeechPhase::Playing {
+                    assert!(
+                        PLAYBACK.try_lock().is_err(),
+                        "playing starts after the queue lock"
+                    );
+                }
+                phases.lock().unwrap().push(phase);
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *phases.lock().unwrap(),
+            [SpeechPhase::Generating, SpeechPhase::Playing]
+        );
+    }
+
+    #[test]
     fn no_reference_voice_sample_notifies_and_never_touches_the_engine() {
         let tts = FakeTts::default();
         let notifier = FakeNotifier::default();
         let mic = FakeMic::default();
-        let state = AppState::default();
+        let state = AppState {
+            backend_selection: BackendSelection::BUNDLED_CPU,
+            ..AppState::default()
+        };
 
         let error = speak("Merhaba", &state, &tts, &mic, &notifier).unwrap_err();
 
@@ -540,7 +630,7 @@ mod tests {
             assert!(
                 message.contains(bad)
                     && message.contains("local Chatterbox")
-                    && message.contains("Settings → Backend"),
+                    && message.contains("Settings → Speech"),
                 "the message names the value, the backend and the fix: {message}"
             );
             assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
@@ -982,7 +1072,7 @@ mod tests {
                     system_voices: Vec::new(),
                     ..system_voice_state("tr", None)
                 },
-                "Settings → Backend",
+                "Settings → Speech",
             ),
         ] {
             let tts = FakeTts::default();
@@ -1207,5 +1297,250 @@ mod tests {
             .map(|call| call.2.clone())
             .collect();
         assert_eq!(locales, vec!["tr-TR", "tr-TR"]);
+    }
+
+    fn edge_voice(id: &str, locale: &str, priority: u32) -> crate::state::StockVoice {
+        crate::state::StockVoice {
+            id: id.to_string(),
+            language: locale.to_string(),
+            language_label: locale.to_string(),
+            name: id.to_string(),
+            priority,
+        }
+    }
+
+    /// Edge TTS selected, its voices listed, disclosure confirmed — no key
+    /// and no sample.
+    fn edge_state(locale: &str, voice: Option<&str>) -> AppState {
+        AppState {
+            backend_selection: BackendSelection::Remote(RemoteProvider::EdgeTts),
+            confirmed_disclosures: vec![RemoteProvider::EdgeTts],
+            speech_languages: SpeechLanguages {
+                edge_tts: locale.to_string(),
+                ..SpeechLanguages::default()
+            },
+            speech_voices: crate::state::SpeechVoices {
+                edge_tts: voice.map(str::to_string),
+                ..Default::default()
+            },
+            edge_tts_voices: vec![
+                edge_voice("en-US-JennyNeural", "en-US", 0),
+                edge_voice("tr-TR-AhmetNeural", "tr-TR", 1),
+                edge_voice("tr-TR-EmelNeural", "tr-TR", 2),
+            ],
+            ..AppState::default()
+        }
+    }
+
+    /// The matrix's Speak row: `tr-TR` with no voice set speaks the
+    /// language's first listed voice, with no clip, and plays the buffer.
+    #[test]
+    fn edge_tts_speaks_the_languages_first_voice_with_no_sample_or_key() {
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+
+        speak("Merhaba", &edge_state("tr-TR", None), &tts, &mic, &notifier).unwrap();
+        speak(
+            "Merhaba",
+            &edge_state("tr-tr", Some("tr-TR-EmelNeural")),
+            &tts,
+            &mic,
+            &notifier,
+        )
+        .unwrap();
+
+        assert_eq!(tts.calls.lock().unwrap()[0].2, "tr-TR");
+        assert_eq!(
+            *tts.voices.lock().unwrap(),
+            vec![
+                (None, Some("tr-TR-AhmetNeural".to_string())),
+                (None, Some("tr-TR-EmelNeural".to_string())),
+            ]
+        );
+        assert_eq!(mic.played().len(), 2);
+        assert!(notifier.summaries().is_empty());
+    }
+
+    /// The No disclosure row: refused before anything is spawned, with one
+    /// notification.
+    #[test]
+    fn edge_tts_is_refused_before_generate_until_its_disclosure_is_confirmed() {
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+        let state = AppState {
+            confirmed_disclosures: vec![RemoteProvider::Azure],
+            ..edge_state("tr-TR", None)
+        };
+
+        let error = speak("Merhaba", &state, &tts, &mic, &notifier).unwrap_err();
+
+        assert!(
+            matches!(error, VoiceMeError::DisclosureNotConfirmed(ref name) if name == "Edge TTS")
+        );
+        assert!(tts.calls.lock().unwrap().is_empty());
+        assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
+    }
+
+    /// An unlisted language or voice is refused by name, never
+    /// substituted; so is speaking before any voice was listed.
+    #[test]
+    fn an_unlisted_edge_tts_language_or_voice_is_refused_by_name() {
+        for (state, needle) in [
+            (edge_state("xx-XX", None), "\"xx-XX\""),
+            (
+                edge_state("tr-TR", Some("tr-TR-GoneNeural")),
+                "\"tr-TR-GoneNeural\"",
+            ),
+            (
+                edge_state("en-US", Some("tr-TR-EmelNeural")),
+                "\"tr-TR-EmelNeural\"",
+            ),
+            (
+                AppState {
+                    edge_tts_voices: Vec::new(),
+                    ..edge_state("tr-TR", None)
+                },
+                "no voices listed",
+            ),
+        ] {
+            let tts = FakeTts::default();
+            let notifier = FakeNotifier::default();
+            let mic = FakeMic::default();
+
+            let error = speak("Merhaba", &state, &tts, &mic, &notifier).unwrap_err();
+
+            assert!(tts.calls.lock().unwrap().is_empty());
+            let message = error.to_string();
+            assert!(
+                message.contains("Edge TTS") && message.contains(needle),
+                "{message}"
+            );
+            assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
+        }
+    }
+
+    fn piper_voice(id: &str, locale: &str) -> crate::state::StockVoice {
+        crate::state::StockVoice {
+            id: id.to_string(),
+            language: locale.to_string(),
+            language_label: "Turkish".to_string(),
+            name: id.to_string(),
+            priority: 0,
+        }
+    }
+
+    /// Piper with the default language and voice, fahrettin (and dfki)
+    /// installed — and no Reference Voice Sample.
+    fn piper_state(voice: Option<&str>) -> AppState {
+        AppState {
+            backend_selection: BackendSelection::PIPER_CPU,
+            speech_voices: crate::state::SpeechVoices {
+                piper: voice.map(str::to_string),
+                ..Default::default()
+            },
+            piper_voices: vec![
+                piper_voice("tr_TR-dfki-medium", "tr_TR"),
+                piper_voice("tr_TR-fahrettin-medium", "tr_TR"),
+            ],
+            ..AppState::default()
+        }
+    }
+
+    /// The matrix's Speak row at core level: no sample, no disclosure, the
+    /// installed voice and no clip reach the engine, and the buffer plays.
+    #[test]
+    fn piper_speaks_the_stored_voice_with_no_sample() {
+        let tts = FakeTts::cold();
+        let notifier = FakeNotifier::default();
+        let mic = FakeMic::default();
+
+        speak(
+            "Merhaba Erdem, bu yerel ve anında.",
+            &piper_state(Some("tr_TR-fahrettin-medium")),
+            &tts,
+            &mic,
+            &notifier,
+        )
+        .unwrap();
+
+        assert_eq!(tts.calls.lock().unwrap()[0].2, "tr_TR");
+        assert_eq!(
+            tts.voices.lock().unwrap()[0],
+            (None, Some("tr_TR-fahrettin-medium".to_string()))
+        );
+        assert_eq!(mic.played().len(), 1);
+        assert!(
+            notifier.summaries().is_empty(),
+            "a Piper voice loads in about a second: no still-working notice"
+        );
+    }
+
+    /// "Use" on another voice: the next line speaks in it. A voice that is
+    /// not installed (deleted) is refused by name, before the engine.
+    #[test]
+    fn piper_uses_the_chosen_voice_and_refuses_one_not_installed() {
+        let tts = FakeTts::default();
+        speak(
+            "Bir",
+            &piper_state(Some("tr_TR-dfki-medium")),
+            &tts,
+            &FakeMic::default(),
+            &FakeNotifier::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            tts.voices.lock().unwrap()[0].1.as_deref(),
+            Some("tr_TR-dfki-medium")
+        );
+
+        let tts = FakeTts::default();
+        let notifier = FakeNotifier::default();
+        let state = AppState {
+            piper_voices: vec![piper_voice("tr_TR-dfki-medium", "tr_TR")],
+            ..piper_state(Some("tr_TR-fahrettin-medium"))
+        };
+        let error = speak("Bir", &state, &tts, &FakeMic::default(), &notifier).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("Piper") && message.contains("tr_TR-fahrettin-medium"),
+            "{message}"
+        );
+        assert!(tts.calls.lock().unwrap().is_empty());
+        assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
+
+        // Nothing installed at all.
+        let error = speak(
+            "Bir",
+            &AppState {
+                piper_voices: Vec::new(),
+                ..piper_state(None)
+            },
+            &FakeTts::default(),
+            &FakeMic::default(),
+            &FakeNotifier::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Piper"), "{error}");
+    }
+
+    /// A Piper failure is one notification naming Piper and the reason.
+    #[test]
+    fn a_piper_failure_is_one_notification_naming_piper() {
+        let tts = FakeTts::failing(VoiceMeError::SpeechEngine(
+            "Piper could not phonemize the text: espeak-ng could not be started".to_string(),
+        ));
+        let notifier = FakeNotifier::default();
+        speak(
+            "Merhaba",
+            &piper_state(None),
+            &tts,
+            &FakeMic::default(),
+            &notifier,
+        )
+        .unwrap_err();
+        assert_eq!(notifier.summaries(), vec![GENERATION_FAILED_SUMMARY]);
+        assert!(notifier.bodies()[0].contains("Piper"));
     }
 }

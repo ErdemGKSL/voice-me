@@ -16,6 +16,7 @@ use crate::error::VoiceMeError;
 use crate::ports::SettingsStore;
 use crate::state::{
     ActiveBackend, ApiKeys, AppState, BackendSelection, DEFAULT_AZURE_LOCALE,
+    DEFAULT_EDGE_TTS_LOCALE, DEFAULT_OVERLAY_POSITION, DEFAULT_PIPER_LOCALE,
     DEFAULT_SPEECH_LANGUAGE, DependencyOutcome, LanguageBackend, LocalRuntime, RemoteProvider,
     RemoteSample, SpeechBackend, SpeechExecutionTarget, SpeechLanguages, SpeechVoices,
     parse_azure_region,
@@ -97,6 +98,16 @@ struct SettingsFile {
         skip_serializing_if = "Vec::is_empty"
     )]
     remote_samples: Vec<RemoteSample>,
+    /// Where the Prompt Overlay opens vertically, in percent. Lenient: an
+    /// unreadable value is the default (centred in the free area), and one
+    /// outside 0–100 is clamped on load. Read as `i64` so `250` or `-3`
+    /// clamps rather than failing to fit; clamped, it is held as a `u8`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_percent",
+        skip_serializing_if = "Option::is_none"
+    )]
+    overlay_position: Option<u8>,
 }
 
 /// How [`SpeechLanguages`] is written to TOML, keyed by backend slug:
@@ -138,6 +149,20 @@ struct SpeechLanguagesFile {
         skip_serializing_if = "Option::is_none"
     )]
     azure: Option<String>,
+    /// Story 3.17: an Edge TTS locale. Never seeded by the legacy key.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    edge_tts: Option<String>,
+    /// Story 3.15: a Piper locale. Never seeded by the legacy key.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    piper: Option<String>,
 }
 
 impl SpeechLanguagesFile {
@@ -147,7 +172,9 @@ impl SpeechLanguagesFile {
             LanguageBackend::Remote(RemoteProvider::DeepInfra) => Some(&mut self.deepinfra),
             LanguageBackend::Remote(RemoteProvider::FalAi) => None,
             LanguageBackend::Remote(RemoteProvider::Azure) => Some(&mut self.azure),
+            LanguageBackend::Remote(RemoteProvider::EdgeTts) => Some(&mut self.edge_tts),
             LanguageBackend::SystemVoice => Some(&mut self.system_voice),
+            LanguageBackend::Piper => Some(&mut self.piper),
         }
     }
 
@@ -162,6 +189,14 @@ impl SpeechLanguagesFile {
                 .azure
                 .clone()
                 .unwrap_or_else(|| DEFAULT_AZURE_LOCALE.to_string()),
+            edge_tts: self
+                .edge_tts
+                .clone()
+                .unwrap_or_else(|| DEFAULT_EDGE_TTS_LOCALE.to_string()),
+            piper: self
+                .piper
+                .clone()
+                .unwrap_or_else(|| DEFAULT_PIPER_LOCALE.to_string()),
         }
     }
 }
@@ -172,6 +207,7 @@ impl SpeechLanguagesFile {
 /// [speech_voices]
 /// system_voice = "sit/yue-Latn-jyutping"
 /// azure = "tr-TR-EmelNeural"
+/// edge_tts = "tr-TR-EmelNeural"
 /// ```
 ///
 /// An absent key is the language's top-priority voice — for Azure, no
@@ -191,6 +227,22 @@ struct SpeechVoicesFile {
         skip_serializing_if = "Option::is_none"
     )]
     azure: Option<String>,
+    /// Story 3.17.
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    edge_tts: Option<String>,
+    /// Story 3.15: a Piper voice key. Absent is the language's
+    /// top-priority installed voice; a profile that never saved a Piper
+    /// language starts at the default voice (see `read_settings_file`).
+    #[serde(
+        default,
+        deserialize_with = "lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    piper: Option<String>,
 }
 
 impl SpeechVoicesFile {
@@ -198,6 +250,8 @@ impl SpeechVoicesFile {
         match backend {
             LanguageBackend::SystemVoice => Some(&mut self.system_voice),
             LanguageBackend::Remote(RemoteProvider::Azure) => Some(&mut self.azure),
+            LanguageBackend::Remote(RemoteProvider::EdgeTts) => Some(&mut self.edge_tts),
+            LanguageBackend::Piper => Some(&mut self.piper),
             _ => None,
         }
     }
@@ -206,6 +260,8 @@ impl SpeechVoicesFile {
         SpeechVoices {
             system_voice: self.system_voice.clone(),
             azure: self.azure.clone(),
+            edge_tts: self.edge_tts.clone(),
+            piper: self.piper.clone(),
         }
     }
 }
@@ -234,6 +290,12 @@ enum SelectionFile {
     },
     /// Story 3.12.
     SystemVoice,
+    /// Story 3.15. A file from before the device `Select` has no target:
+    /// Piper on CPU.
+    Piper {
+        #[serde(default)]
+        target: SpeechExecutionTarget,
+    },
 }
 
 impl From<&BackendSelection> for SelectionFile {
@@ -247,6 +309,7 @@ impl From<&BackendSelection> for SelectionFile {
                 provider: *provider,
             },
             BackendSelection::SystemVoice => SelectionFile::SystemVoice,
+            BackendSelection::Piper { target } => SelectionFile::Piper { target: *target },
         }
     }
 }
@@ -257,6 +320,7 @@ impl From<SelectionFile> for BackendSelection {
             SelectionFile::Local { runtime, target } => BackendSelection::Local { runtime, target },
             SelectionFile::Remote { provider } => BackendSelection::Remote(provider),
             SelectionFile::SystemVoice => BackendSelection::SystemVoice,
+            SelectionFile::Piper { target } => BackendSelection::Piper { target },
         }
     }
 }
@@ -273,6 +337,15 @@ where
 {
     let value = toml::Value::deserialize(deserializer)?;
     Ok(T::deserialize(value).ok())
+}
+
+/// The same leniency for a percentage, clamped to 0–100 as it loads — the
+/// one clamp on the way in.
+fn lenient_percent<'de, D>(deserializer: D) -> Result<Option<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(lenient::<_, i64>(deserializer)?.map(|percent| percent.clamp(0, 100) as u8))
 }
 
 /// The same leniency for the API keys: an unreadable table reads as no keys.
@@ -330,8 +403,13 @@ impl Default for SettingsFile {
                 deepinfra: Some(DEFAULT_SPEECH_LANGUAGE.to_string()),
                 system_voice: Some(DEFAULT_SPEECH_LANGUAGE.to_string()),
                 azure: Some(DEFAULT_AZURE_LOCALE.to_string()),
+                edge_tts: Some(DEFAULT_EDGE_TTS_LOCALE.to_string()),
+                piper: Some(DEFAULT_PIPER_LOCALE.to_string()),
             },
-            speech_voices: SpeechVoicesFile::default(),
+            speech_voices: SpeechVoicesFile {
+                piper: Some(crate::assets::PIPER_DEFAULT_VOICE.key.to_string()),
+                ..SpeechVoicesFile::default()
+            },
             selected_mic_device: None,
             backend_selection: None,
             local_runtimes: Vec::new(),
@@ -339,6 +417,7 @@ impl Default for SettingsFile {
             azure_region: None,
             confirmed_disclosures: Vec::new(),
             remote_samples: Vec::new(),
+            overlay_position: None,
         }
     }
 }
@@ -419,6 +498,22 @@ impl FileSettingsStore {
             .speech_languages
             .azure
             .get_or_insert_with(|| DEFAULT_AZURE_LOCALE.to_string());
+        // Story 3.17: so does Edge TTS.
+        settings
+            .speech_languages
+            .edge_tts
+            .get_or_insert_with(|| DEFAULT_EDGE_TTS_LOCALE.to_string());
+        // Story 3.15: a profile that never saved a Piper language starts at
+        // the default voice and its locale. Once a language is saved, an
+        // absent voice is that language's top-priority one — so a new
+        // language (which clears the voice) is never pulled back here.
+        if settings.speech_languages.piper.is_none() {
+            settings.speech_languages.piper = Some(DEFAULT_PIPER_LOCALE.to_string());
+            settings
+                .speech_voices
+                .piper
+                .get_or_insert_with(|| crate::assets::PIPER_DEFAULT_VOICE.key.to_string());
+        }
         // A hand-edited region that is not `[a-z0-9]+` is no region: it
         // must never reach the host name.
         settings.azure_region = settings
@@ -478,6 +573,14 @@ impl FileSettingsStore {
             // Fetched from Azure and cached by the composition root for
             // the session, never a file.
             azure_voices: Vec::new(),
+            // Listed by the `edge-tts` program at a check, never a file.
+            edge_tts_voices: Vec::new(),
+            // Read from the cache by the composition root, never a file.
+            piper_voices: Vec::new(),
+            // Clamped to 0–100 as it loads.
+            overlay_position: settings
+                .overlay_position
+                .unwrap_or(DEFAULT_OVERLAY_POSITION),
         }
     }
 }
@@ -615,6 +718,13 @@ impl SettingsStore for FileSettingsStore {
         };
         let mut settings = self.read_settings_file()?;
         settings.azure_region = region;
+        self.write_settings_file(&settings)?;
+        Ok(self.build_state(settings))
+    }
+
+    fn save_overlay_position(&self, percent: u8) -> Result<AppState, VoiceMeError> {
+        let mut settings = self.read_settings_file()?;
+        settings.overlay_position = Some(percent.min(100));
         self.write_settings_file(&settings)?;
         Ok(self.build_state(settings))
     }
@@ -789,7 +899,13 @@ mod tests {
         // No settings file at all yet (first run).
         let state = store.load().unwrap();
         assert_eq!(state.speech_languages, SpeechLanguages::default());
-        assert_eq!(state.speech_language(), Some("tr"));
+        assert_eq!(state.speech_languages.local, "tr");
+        // Story 3.15: the unsaved selection (Piper on Linux, and on Windows
+        // since Story 3.16) reads its own.
+        assert_eq!(
+            state.speech_language(),
+            SpeechLanguages::default().get(BackendSelection::default().language_backend())
+        );
 
         // Any save writes the whole file, so the defaults become explicit.
         store.save_hotkey(Some("Ctrl+Alt+KeyV")).unwrap();
@@ -1001,8 +1117,11 @@ mod tests {
         FileSettingsStore::with_dirs(config_dir.to_path_buf(), data_dir.to_path_buf())
     }
 
+    /// Story 3.15: a file with no saved selection loads as the default —
+    /// Piper on Linux and Windows (Story 3.16), the bundled CPU runtime
+    /// elsewhere.
     #[test]
-    fn a_file_from_before_story_3_5_loads_as_the_bundled_cpu_backend() {
+    fn a_file_from_before_story_3_5_loads_as_the_default_backend() {
         let config_dir = tempfile::tempdir().unwrap();
         let data_dir = tempfile::tempdir().unwrap();
         fs::write(
@@ -1013,7 +1132,12 @@ mod tests {
 
         let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
 
-        assert_eq!(state.backend_selection, BackendSelection::BUNDLED_CPU);
+        assert_eq!(state.backend_selection, BackendSelection::default());
+        if cfg!(any(target_os = "linux", target_os = "windows")) {
+            assert_eq!(state.backend_selection, BackendSelection::PIPER_CPU);
+        } else {
+            assert_eq!(state.backend_selection, BackendSelection::BUNDLED_CPU);
+        }
         assert!(state.local_runtimes.is_empty());
         assert_eq!(state.api_keys, ApiKeys::default());
         assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
@@ -1113,7 +1237,9 @@ mod tests {
 
         let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
 
-        assert_eq!(state.backend_selection, BackendSelection::BUNDLED_CPU);
+        // The default — Piper on Linux since Story 3.15, and on Windows
+        // since Story 3.16.
+        assert_eq!(state.backend_selection, BackendSelection::default());
         assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
     }
 
@@ -1259,6 +1385,51 @@ mod tests {
         assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
     }
 
+    #[test]
+    fn overlay_position_defaults_to_centred_and_round_trips() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = store_in(config_dir.path(), data_dir.path());
+        store.save_hotkey(Some("Ctrl+Alt+KeyV")).unwrap();
+        let written = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
+        assert!(!written.contains("overlay_position"), "{written}");
+        assert_eq!(store.load().unwrap().overlay_position, 50);
+
+        let state = store.save_overlay_position(30).unwrap();
+        assert_eq!(state.overlay_position, 30);
+        assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
+        let written = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
+        assert!(written.contains("overlay_position = 30"), "{written}");
+
+        let reloaded = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+        assert_eq!(reloaded.overlay_position, 30);
+        assert_eq!(reloaded.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
+
+        assert_eq!(store.save_overlay_position(0).unwrap().overlay_position, 0);
+        assert_eq!(
+            store.save_overlay_position(200).unwrap().overlay_position,
+            100
+        );
+    }
+
+    #[test]
+    fn a_bad_overlay_position_loads_as_the_default_or_clamped() {
+        for (value, expected) in [("\"x\"", 50), ("250", 100), ("-3", 0), ("12.5", 50)] {
+            let config_dir = tempfile::tempdir().unwrap();
+            let data_dir = tempfile::tempdir().unwrap();
+            fs::write(
+                config_dir.path().join(SETTINGS_FILE_NAME),
+                format!("hotkey = \"Ctrl+Alt+KeyV\"\noverlay_position = {value}\n"),
+            )
+            .unwrap();
+
+            let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+
+            assert_eq!(state.overlay_position, expected, "{value}");
+            assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"), "{value}");
+        }
+    }
+
     /// Story 3.14: the region, locale and voice round trip; a new locale
     /// clears the voice; a bad region is refused and nothing is saved.
     #[test]
@@ -1313,6 +1484,50 @@ mod tests {
         assert_eq!(store.save_azure_region(None).unwrap().azure_region, None);
     }
 
+    /// Story 3.17: Edge TTS's locale and voice round trip under
+    /// `edge_tts`, a new locale clears the voice, and it has no key.
+    #[test]
+    fn edge_tts_locale_and_voice_round_trip() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = store_in(config_dir.path(), data_dir.path());
+        let edge = LanguageBackend::Remote(RemoteProvider::EdgeTts);
+        let state = store.load().unwrap();
+        assert_eq!(state.speech_languages.edge_tts, "tr-TR");
+        assert_eq!(state.speech_voices.edge_tts, None);
+
+        store
+            .save_backend_selection(&BackendSelection::Remote(RemoteProvider::EdgeTts))
+            .unwrap();
+        store.save_speech_language(edge, "en-US").unwrap();
+        store
+            .save_speech_voice(edge, Some("en-US-AvaMultilingualNeural"))
+            .unwrap();
+        let state = store
+            .save_api_key(RemoteProvider::EdgeTts, Some("ignored"))
+            .unwrap();
+        assert_eq!(state.api_keys.get(RemoteProvider::EdgeTts), None);
+
+        let reloaded = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+        assert_eq!(
+            reloaded.backend_selection,
+            BackendSelection::Remote(RemoteProvider::EdgeTts)
+        );
+        assert_eq!(reloaded.speech_languages.edge_tts, "en-US");
+        assert_eq!(
+            reloaded.speech_voices.edge_tts.as_deref(),
+            Some("en-US-AvaMultilingualNeural")
+        );
+        assert_eq!(reloaded.speech_languages.azure, "tr-TR", "untouched");
+        let written = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
+        assert!(written.contains("provider = \"edge_tts\""), "{written}");
+        assert!(written.contains("edge_tts = \"en-US\""), "{written}");
+        assert!(!written.contains("ignored"), "{written}");
+
+        let state = store.save_speech_language(edge, "tr-TR").unwrap();
+        assert_eq!(state.speech_voices.edge_tts, None);
+    }
+
     #[test]
     fn a_hand_edited_bad_region_loads_as_no_region() {
         let config_dir = tempfile::tempdir().unwrap();
@@ -1331,5 +1546,99 @@ mod tests {
             state.speech_languages.azure, "tr-TR",
             "the legacy key never seeds Azure"
         );
+    }
+
+    /// Story 3.15: Piper's selection, language and voice round-trip; an
+    /// explicit selection is never rewritten; a new language clears the
+    /// voice and it stays cleared.
+    #[test]
+    fn piper_selection_language_and_voice_round_trip() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = store_in(config_dir.path(), data_dir.path());
+
+        let fresh = store.load().unwrap();
+        assert_eq!(fresh.speech_languages.piper, "tr_TR");
+        assert_eq!(
+            fresh.speech_voices.piper.as_deref(),
+            Some("tr_TR-fahrettin-medium")
+        );
+
+        store
+            .save_backend_selection(&BackendSelection::PIPER_CPU)
+            .unwrap();
+        store
+            .save_speech_voice(LanguageBackend::Piper, Some("tr_TR-dfki-medium"))
+            .unwrap();
+        let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+        assert_eq!(state.backend_selection, BackendSelection::PIPER_CPU);
+        assert_eq!(
+            state.speech_voices.piper.as_deref(),
+            Some("tr_TR-dfki-medium")
+        );
+
+        store
+            .save_speech_language(LanguageBackend::Piper, "en_US")
+            .unwrap();
+        let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+        assert_eq!(state.speech_languages.piper, "en_US");
+        assert_eq!(
+            state.speech_voices.piper, None,
+            "a new language clears the voice"
+        );
+        assert_eq!(
+            state.speech_languages.system_voice, "tr",
+            "every other backend's language is untouched"
+        );
+
+        // An explicit selection is never rewritten by the default.
+        store
+            .save_backend_selection(&BackendSelection::BUNDLED_CPU)
+            .unwrap();
+        assert_eq!(
+            store.load().unwrap().backend_selection,
+            BackendSelection::BUNDLED_CPU
+        );
+        let text = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
+        assert!(text.contains("kind = \"local\""), "{text}");
+    }
+
+    /// spec-backend-engine-and-device-selects: Piper's device is saved and
+    /// read back.
+    #[test]
+    fn a_piper_device_round_trips() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = store_in(config_dir.path(), data_dir.path());
+
+        for target in [
+            SpeechExecutionTarget::Cuda,
+            SpeechExecutionTarget::WebGpu,
+            SpeechExecutionTarget::Cpu,
+        ] {
+            let selection = BackendSelection::Piper { target };
+            store.save_backend_selection(&selection).unwrap();
+            let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+            assert_eq!(state.backend_selection, selection);
+        }
+        let text = fs::read_to_string(config_dir.path().join(SETTINGS_FILE_NAME)).unwrap();
+        assert!(text.contains("kind = \"piper\""), "{text}");
+    }
+
+    /// The Old file row: `kind = "piper"` with no target is Piper on CPU.
+    #[test]
+    fn an_old_piper_selection_without_a_target_is_piper_on_cpu() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_dir.path().join(SETTINGS_FILE_NAME),
+            "hotkey = \"Ctrl+Alt+KeyV\"\n\n[backend_selection]\nkind = \"piper\"\n",
+        )
+        .unwrap();
+
+        let state = store_in(config_dir.path(), data_dir.path()).load().unwrap();
+
+        assert_eq!(state.backend_selection, BackendSelection::PIPER_CPU);
+        assert_eq!(state.hotkey.as_deref(), Some("Ctrl+Alt+KeyV"));
     }
 }

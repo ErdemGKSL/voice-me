@@ -615,7 +615,7 @@ impl Render for VoiceSetupView {
                 div()
                     .text_color(cx.theme().muted_foreground)
                     .child(if is_first_run {
-                        "Record a short clip of your voice (5-60 seconds) to use as your Reference Voice Sample — you'll need one before you can use voice-me."
+                        "Record a short clip of your voice (5-60 seconds) as a Reference Voice Sample. Cloning speech engines use it to speak in your voice."
                     } else {
                         "Record a short clip of your voice (5-60 seconds) to use as your Reference Voice Sample."
                     }),
@@ -992,6 +992,10 @@ mod tests {
         }
 
         fn save_azure_region(&self, _region: Option<&str>) -> Result<AppState, VoiceMeError> {
+            unimplemented!("not exercised by these tests")
+        }
+
+        fn save_overlay_position(&self, _percent: u8) -> Result<AppState, VoiceMeError> {
             unimplemented!("not exercised by these tests")
         }
 

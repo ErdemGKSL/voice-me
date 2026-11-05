@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Voice Me
+Comment=Speak typed text through a virtual microphone
+Exec=voice-me
+Icon=voice-me
+StartupWMClass=voice-me
+Terminal=false
+Categories=AudioVideo;Audio;

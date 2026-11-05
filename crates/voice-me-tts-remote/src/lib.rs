@@ -212,7 +212,7 @@ pub fn delete_held_sample(
             "{} does not hold voice samples in this voice-me release.",
             provider.label()
         ))),
-        RemoteProvider::Azure => Err(VoiceMeError::Other(format!(
+        RemoteProvider::Azure | RemoteProvider::EdgeTts => Err(VoiceMeError::Other(format!(
             "{} holds no voice samples — it speaks in a stock Microsoft voice.",
             provider.label()
         ))),
@@ -264,13 +264,13 @@ impl TtsPort for AzureTtsAdapter {
         };
         let Some(voice) = voice.filter(|voice| !voice.trim().is_empty()) else {
             return Err(refuse(
-                "Azure has no voice selected — pick one in Settings → Backend.",
+                "Azure has no voice selected — pick one in Settings → Speech.",
             ));
         };
         let key = api_key(self.store.as_ref(), provider)?;
         let Some(region) = self.store.load()?.azure_region else {
             return Err(refuse(
-                "Azure has no region — add one in Settings → Backend.",
+                "Azure has no region — add one in Settings → Speech.",
             ));
         };
 
@@ -341,7 +341,7 @@ fn api_key(store: &dyn SettingsStore, provider: RemoteProvider) -> Result<String
         .ok_or_else(|| VoiceMeError::Provider {
             provider: provider.label().to_string(),
             reason: format!(
-                "{} has no API key — add one under Settings → Dependencies.",
+                "{} has no API key — add one under Settings → Speech.",
                 provider.label()
             ),
         })

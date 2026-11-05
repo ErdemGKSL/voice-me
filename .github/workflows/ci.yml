@@ -1,9 +1,9 @@
 name: CI
 
+# Only pushes to main build; other branches and pull requests do not.
 on:
   push:
     branches: [main]
-  pull_request:
 
 jobs:
   build-ubuntu:
@@ -29,11 +29,39 @@ jobs:
             libxrandr-dev \
             libssl-dev \
             espeak-ng
+      # Story 3.17: a pinned `edge-tts`, so `find_program` and the
+      # Dependencies row see a real program. Every test that reaches
+      # Microsoft's service stays off (VOICE_ME_EDGE_TTS_ONLINE unset).
+      - name: Install edge-tts
+        run: pipx install edge-tts==7.2.8
       - run: cargo build --workspace
       # The tests are written to pass with no audio server; the ones that
       # need one are `#[ignore]`d. Without this step nothing automated ever
       # executes them.
       - run: cargo test --workspace
+      # spec-native-gnome-kde-hotkey: the hotkey crate's live tests — the
+      # D-Bus summon service reached by the real `gdbus call`, the
+      # kglobalaccel exchange against a fake, and the GNOME keybinding
+      # written through a real `gsettings` — on a private session bus with
+      # a throwaway keyfile backend and a minimal test copy of the
+      # media-keys schemas. Opt-in only, so they never touch a developer's
+      # real bus or dconf.
+      - name: Install D-Bus and gsettings for the hotkey tests
+        run: |
+          sudo apt-get install -y \
+            dbus \
+            libglib2.0-bin
+      - name: Test the hotkey backends on a private session bus
+        run: |
+          schemas="$(mktemp -d)"
+          cp crates/voice-me-hotkey-linux/tests/schemas/*.gschema.xml "$schemas"
+          glib-compile-schemas "$schemas"
+          VOICE_ME_TEST_DBUS=1 \
+          VOICE_ME_TEST_GSETTINGS=1 \
+          GSETTINGS_BACKEND=keyfile \
+          XDG_CONFIG_HOME="$(mktemp -d)" \
+          GSETTINGS_SCHEMA_DIR="$schemas" \
+            dbus-run-session -- cargo test -p voice-me-hotkey-linux
 
   build-windows:
     runs-on: windows-latest

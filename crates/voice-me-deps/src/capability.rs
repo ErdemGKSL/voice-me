@@ -26,9 +26,10 @@ use voice_me_core::{
     SpeechExecutionTarget,
 };
 
-/// Decision 5: CUDA's floor is compute capability 6.0 (spec-2-5 Decision 1
-/// — ONNX Runtime's prebuilt CUDA kernels start at sm_60 and ship no PTX
-/// to JIT an older GPU from). One constant; Story 3.8 may revisit it.
+/// Decision 5: CUDA's floor is compute capability 6.0 (spec-2-5 Decision 1).
+/// Story 3.8 decision 5 keeps it: voice-me's own ONNX Runtime build is
+/// compiled for `60;70;75;80;86;89;90;120` plus PTX for newer GPUs, and
+/// nothing older than sm_60.
 pub const CUDA_MIN_COMPUTE_CAPABILITY: (i32, i32) = (6, 0);
 
 /// How long one hardware probe may take before the check gives up on it.
@@ -306,11 +307,12 @@ pub fn capability_row(request: &CheckRequest, probe: &dyn GpuProbe) -> Option<De
             SpeechExecutionTarget::WebGpu => Some(webgpu_row(selection, probe.vulkan())),
         },
         BackendSelection::Remote(provider) => {
-            if !request.has_api_key {
+            // Story 3.17: Edge TTS has no key to be missing.
+            if provider.needs_api_key() && !request.has_api_key {
                 return Some(cannot_run(
                     selection,
                     &format!(
-                        "{} has no API key — add one in Settings → Backend.",
+                        "{} has no API key — add one in Settings → Speech.",
                         provider.label()
                     ),
                 ));
@@ -333,20 +335,32 @@ pub fn capability_row(request: &CheckRequest, probe: &dyn GpuProbe) -> Option<De
                 // by the check.
                 RemoteProvider::Azure if !request.has_region => Some(cannot_run(
                     selection,
-                    "Azure has no region — add one in Settings → Backend.",
+                    "Azure has no region — add one in Settings → Speech.",
                 )),
                 RemoteProvider::Azure if !request.has_voice => Some(cannot_run(
                     selection,
-                    "Azure has no voice selected — pick one in Settings → Backend.",
+                    "Azure has no voice selected — pick one in Settings → Speech.",
                 )),
                 RemoteProvider::Azure => None,
+                // Story 3.17: on Linux Edge TTS's readiness is the
+                // `edge-tts` program row ([`edge_tts_program_row`]), not a
+                // capability row. Elsewhere no engine is built (E1).
+                RemoteProvider::EdgeTts => {
+                    if cfg!(target_os = "linux") {
+                        None
+                    } else {
+                        Some(cannot_run(selection, EDGE_TTS_OTHER_OS))
+                    }
+                }
             }
         }
         // Story 3.12: on Linux the System voice's readiness is the eSpeak
-        // NG row ([`system_voice_engine_row`]), not a capability row.
-        // Elsewhere it has no engine yet (Windows is Story 3.13).
+        // NG row ([`system_voice_engine_row`]), not a capability row; on
+        // Windows (Story 3.13) it is Windows speech's row
+        // ([`windows_system_voice_row`]), reported with the engine rows.
+        // Elsewhere it has no engine yet.
         BackendSelection::SystemVoice => {
-            if cfg!(target_os = "linux") {
+            if cfg!(any(target_os = "linux", target_os = "windows")) {
                 None
             } else {
                 Some(cannot_run(
@@ -355,6 +369,27 @@ pub fn capability_row(request: &CheckRequest, probe: &dyn GpuProbe) -> Option<De
                 ))
             }
         }
+        // Story 3.15: on Linux Piper's readiness is its runtime, voice and
+        // eSpeak NG rows — and on Windows too since Story 3.16. Elsewhere
+        // it has no engine yet. On CUDA or WebGPU its device is probed like
+        // Chatterbox's (spec-backend-engine-and-device-selects).
+        BackendSelection::Piper { .. }
+            if !cfg!(any(target_os = "linux", target_os = "windows")) =>
+        {
+            Some(cannot_run(
+                selection,
+                "Piper on this system arrives in a later voice-me release.",
+            ))
+        }
+        BackendSelection::Piper { target } => match target {
+            SpeechExecutionTarget::Cpu => None,
+            SpeechExecutionTarget::Cuda => Some(cuda_row(
+                selection,
+                request.backend.device.unwrap_or(0),
+                probe.cuda(),
+            )),
+            SpeechExecutionTarget::WebGpu => Some(webgpu_row(selection, probe.vulkan())),
+        },
     }
 }
 
@@ -364,8 +399,13 @@ pub const SYSTEM_VOICE_ENGINE_LABEL: &str = "eSpeak NG";
 /// The System voice's engine row (Story 3.12): ready, naming where
 /// `espeak-ng` was found, or missing and speech-blocking with manual steps
 /// only — it is a system package, which voice-me never installs.
-/// `install_step` is the distribution's command, in words.
-pub fn system_voice_engine_row(found: Option<&Path>, install_step: &str) -> Dependency {
+/// `install_step` is the distribution's command, in words; `used_by` ends
+/// the missing sentence with who needs it (Story 3.15: Piper, too).
+pub fn system_voice_engine_row(
+    found: Option<&Path>,
+    install_step: &str,
+    used_by: &str,
+) -> Dependency {
     match found {
         Some(path) => Dependency::ready(
             DependencyKind::SystemVoiceEngine,
@@ -375,9 +415,134 @@ pub fn system_voice_engine_row(found: Option<&Path>, install_step: &str) -> Depe
         None => Dependency::missing(
             DependencyKind::SystemVoiceEngine,
             SYSTEM_VOICE_ENGINE_LABEL,
-            "The espeak-ng program is not on PATH. The System voice speaks through it.".to_string(),
+            format!("The espeak-ng program is not on PATH. {used_by}"),
         )
         .manual([install_step.to_string(), "Press Check again.".to_string()]),
+    }
+}
+
+/// What the Windows eSpeak NG row says when the program is not found
+/// (Story 3.16).
+pub const ESPEAK_NOT_INSTALLED_WINDOWS: &str = "eSpeak NG is not installed. Piper reads text \
+     through it. Install downloads eSpeak NG 1.52.0 (12.8 MB) from its official release.";
+
+/// Piper's eSpeak NG row on Windows (Story 3.16): ready in
+/// [`system_voice_engine_row`]'s form, naming where `espeak-ng.exe` was
+/// found, or missing and speech-blocking. Missing, it offers Install — the
+/// official MSI, unpacked into voice-me's cache — where `installable` (a
+/// pinned download exists for this target), and manual steps otherwise.
+pub fn windows_espeak_row(found: Option<&Path>, installable: bool) -> Dependency {
+    if found.is_some() {
+        return system_voice_engine_row(found, "", "");
+    }
+    let row = Dependency::missing(
+        DependencyKind::SystemVoiceEngine,
+        SYSTEM_VOICE_ENGINE_LABEL,
+        ESPEAK_NOT_INSTALLED_WINDOWS,
+    );
+    if installable {
+        row
+    } else {
+        row.manual([
+            "Install eSpeak NG from the espeak-ng project's releases on GitHub.",
+            "Press Check again.",
+        ])
+    }
+}
+
+/// What Windows' speech engine answered when asked for its voices (Story
+/// 3.13): how many it lists, or why it could not be reached, in words
+/// naming Windows speech. Injected into
+/// `DepsAdapter` by the composition root, which asks the System voice's
+/// own crate — `voice-me-deps` never calls a TTS adapter.
+pub type SystemVoiceProbe = dyn Fn() -> Result<usize, String> + Send + Sync;
+
+/// Windows' speech engine, as the user reads its name.
+pub const WINDOWS_SPEECH_LABEL: &str = "Windows speech";
+
+/// What the default probe answers when the composition root injected none:
+/// the Windows System voice row then says this rather than guessing.
+pub const NO_SYSTEM_VOICE_PROBE: &str = "voice-me could not ask Windows speech for its voices";
+
+/// Where a user adds a Windows voice, as the manual steps say it — the one
+/// place these steps are written (the app's Backend-tab note uses them too).
+pub const WINDOWS_ADD_VOICES_STEPS: [&str; 3] = [
+    "Open Windows Settings → Time & language → Speech.",
+    "Under Manage voices, choose Add voices and install a voice for your language.",
+    "Press Check again.",
+];
+
+/// The System voice's row on Windows (Story 3.13, decision 3): ready when
+/// Windows speech lists at least one voice, otherwise a manual,
+/// speech-blocking capability row — voice-me cannot install a Windows
+/// voice, so there is no Install. With no voice installed the row names
+/// Windows' own Add-voices steps; when Windows speech could not be asked
+/// at all (a WinRT failure, a timeout) it names the reason instead. Never
+/// [`DependencyKind::SystemVoiceEngine`]: that kind's Install downloads
+/// eSpeak NG on Windows.
+pub fn windows_system_voice_row(answer: Result<usize, String>) -> Dependency {
+    let selection = BackendSelection::SystemVoice;
+    match answer {
+        Ok(0) => {
+            let steps = WINDOWS_ADD_VOICES_STEPS.join(" ");
+            let mut row = cannot_run(
+                &selection,
+                &format!(
+                    "{WINDOWS_SPEECH_LABEL} lists no installed voices. To add a voice: {steps}"
+                ),
+            );
+            row.manual_steps = WINDOWS_ADD_VOICES_STEPS.map(String::from).to_vec();
+            row
+        }
+        Ok(count) => Dependency::ready(
+            DependencyKind::BackendCapability,
+            CAPABILITY_LABEL,
+            format!(
+                "{} can run here: {WINDOWS_SPEECH_LABEL} lists {count} installed voice{}.",
+                selection.label(),
+                if count == 1 { "" } else { "s" }
+            ),
+        ),
+        Err(error) => {
+            let error = error.trim().trim_end_matches('.');
+            // The probe's reason usually names Windows speech already.
+            let reason = if error.contains(WINDOWS_SPEECH_LABEL) {
+                format!("{error}.")
+            } else {
+                format!("{WINDOWS_SPEECH_LABEL} could not be reached: {error}.")
+            };
+            cannot_run(&selection, &reason)
+        }
+    }
+}
+
+/// What Edge TTS's capability row says off Linux (Story 3.17, E1).
+pub const EDGE_TTS_OTHER_OS: &str = "Edge TTS isn't available on this OS yet.";
+
+/// The `edge-tts` row's name.
+pub const EDGE_TTS_PROGRAM_LABEL: &str = "edge-tts";
+
+/// What the missing `edge-tts` row says.
+pub const EDGE_TTS_NOT_INSTALLED: &str =
+    "edge-tts is not installed. Please install it: pipx install edge-tts";
+
+/// Edge TTS's program row (Story 3.17): ready, naming where `edge-tts` was
+/// found, or missing and speech-blocking with manual steps only — voice-me
+/// never runs pip. `steps` are the distribution's pipx command (or the pip
+/// fallback) and "Press Check again.".
+pub fn edge_tts_program_row(found: Option<&Path>, steps: Vec<String>) -> Dependency {
+    match found {
+        Some(path) => Dependency::ready(
+            DependencyKind::EdgeTtsProgram,
+            EDGE_TTS_PROGRAM_LABEL,
+            format!("Found at {}.", path.display()),
+        ),
+        None => Dependency::missing(
+            DependencyKind::EdgeTtsProgram,
+            EDGE_TTS_PROGRAM_LABEL,
+            EDGE_TTS_NOT_INSTALLED,
+        )
+        .manual(steps),
     }
 }
 
@@ -539,6 +704,7 @@ mod tests {
             has_api_key: false,
             has_region: false,
             has_voice: false,
+            piper_voice: None,
         }
     }
 
@@ -549,6 +715,7 @@ mod tests {
             has_api_key,
             has_region: false,
             has_voice: false,
+            piper_voice: None,
         }
     }
 
@@ -587,7 +754,8 @@ mod tests {
 
         assert_blocks(&row, "can't run here: No NVIDIA driver found.");
         assert!(
-            row.detail.starts_with("CUDA (libonnxruntime.so)"),
+            row.detail
+                .starts_with("Chatterbox — your voice · CUDA — libonnxruntime.so"),
             "{}",
             row.detail
         );
@@ -701,7 +869,9 @@ mod tests {
         let row = system_voice_engine_row(
             None,
             "Install it from a terminal: sudo apt install espeak-ng",
+            "Piper reads text through it.",
         );
+        assert!(row.detail.contains("Piper"), "{}", row.detail);
 
         assert_eq!(row.kind, DependencyKind::SystemVoiceEngine);
         assert_eq!(row.status, DependencyStatus::Missing);
@@ -713,10 +883,70 @@ mod tests {
 
     #[test]
     fn a_found_espeak_ng_is_ready_and_names_its_path() {
-        let row = system_voice_engine_row(Some(Path::new("/usr/bin/espeak-ng")), "unused");
+        let row =
+            system_voice_engine_row(Some(Path::new("/usr/bin/espeak-ng")), "unused", "unused");
 
         assert_eq!(row.status, DependencyStatus::Ready);
         assert!(row.detail.contains("/usr/bin/espeak-ng"), "{}", row.detail);
+    }
+
+    /// Story 3.16: on Windows a missing eSpeak NG blocks speech and offers
+    /// Install, in the words the spec gives.
+    #[test]
+    fn a_missing_windows_espeak_ng_blocks_and_offers_install() {
+        let row = windows_espeak_row(None, true);
+
+        assert_eq!(row.kind, DependencyKind::SystemVoiceEngine);
+        assert_eq!(row.label, "eSpeak NG");
+        assert_eq!(row.status, DependencyStatus::Missing);
+        assert!(row.kind.blocks_speech());
+        assert!(row.automatable, "Install fetches the official MSI");
+        assert!(row.manual_steps.is_empty());
+        assert_eq!(
+            row.detail,
+            "eSpeak NG is not installed. Piper reads text through it. Install downloads eSpeak \
+             NG 1.52.0 (12.8 MB) from its official release."
+        );
+    }
+
+    /// The row's version and size are the pinned MSI's own.
+    #[test]
+    fn the_windows_espeak_ng_text_names_the_pinned_version_and_size() {
+        let size_mb = crate::sources::espeak_msi().size as f64 / 1_000_000.0;
+
+        assert!(
+            ESPEAK_NOT_INSTALLED_WINDOWS.contains(crate::sources::ESPEAK_VERSION),
+            "{ESPEAK_NOT_INSTALLED_WINDOWS}"
+        );
+        assert!(
+            ESPEAK_NOT_INSTALLED_WINDOWS.contains(&format!("({size_mb:.1} MB)")),
+            "{ESPEAK_NOT_INSTALLED_WINDOWS}"
+        );
+    }
+
+    /// With no pinned download for this target, the row has steps instead.
+    #[test]
+    fn a_windows_espeak_ng_with_no_download_is_manual() {
+        let row = windows_espeak_row(None, false);
+
+        assert_eq!(row.status, DependencyStatus::Missing);
+        assert!(!row.automatable);
+        assert!((2..=4).contains(&row.manual_steps.len()));
+    }
+
+    /// Found, it is ready in the System voice row's own form.
+    #[test]
+    fn a_found_windows_espeak_ng_is_ready_like_the_system_voice_row() {
+        let path = Path::new(r"C:\Program Files\eSpeak NG\espeak-ng.exe");
+
+        assert_eq!(
+            windows_espeak_row(Some(path), true),
+            system_voice_engine_row(Some(path), "", "")
+        );
+        assert_eq!(
+            windows_espeak_row(Some(path), true).status,
+            DependencyStatus::Ready
+        );
     }
 
     fn system_voice() -> CheckRequest {
@@ -726,6 +956,7 @@ mod tests {
             has_api_key: false,
             has_region: false,
             has_voice: false,
+            piper_voice: None,
         }
     }
 
@@ -739,12 +970,77 @@ mod tests {
         assert_eq!(probe.asked.load(Ordering::SeqCst), 0);
     }
 
+    /// On Windows (Story 3.13) its readiness is Windows speech's row,
+    /// reported with the engine rows, so there is no capability row here.
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn the_system_voice_on_windows_has_no_capability_row() {
+        let probe = good_gpu();
+        assert_eq!(capability_row(&system_voice(), &probe), None);
+        assert_eq!(probe.asked.load(Ordering::SeqCst), 0);
+    }
+
     /// Elsewhere it cannot run yet, and says so.
     #[test]
-    #[cfg(not(target_os = "linux"))]
-    fn the_system_voice_off_linux_cannot_run_yet() {
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    fn the_system_voice_elsewhere_cannot_run_yet() {
         let row = capability_row(&system_voice(), &good_gpu()).unwrap();
         assert_blocks(&row, "arrives in a later voice-me release");
+    }
+
+    /// Decision 3: Windows speech with voices is ready.
+    #[test]
+    fn windows_speech_with_voices_is_ready() {
+        let row = windows_system_voice_row(Ok(3));
+        assert_eq!(row.kind, DependencyKind::BackendCapability);
+        assert_eq!(row.status, DependencyStatus::Ready);
+        assert!(row.detail.contains("3 installed voices"), "{}", row.detail);
+        assert!(
+            windows_system_voice_row(Ok(1))
+                .detail
+                .contains("1 installed voice.")
+        );
+    }
+
+    /// Decision 3: no installed voice is a manual, speech-blocking
+    /// capability row naming Windows' Add-voices steps — no Install, and
+    /// never the eSpeak NG kind.
+    #[test]
+    fn windows_speech_with_no_voice_blocks_with_windows_steps() {
+        let row = windows_system_voice_row(Ok(0));
+        assert_blocks(&row, "Windows speech lists no installed voices.");
+        assert_ne!(row.kind, DependencyKind::SystemVoiceEngine);
+        assert!(
+            row.detail.contains("Settings → Time & language → Speech"),
+            "{}",
+            row.detail
+        );
+        assert!(row.detail.contains("Add voices"), "{}", row.detail);
+        assert_eq!(row.manual_steps, WINDOWS_ADD_VOICES_STEPS.map(String::from));
+    }
+
+    /// Decision 3: Windows speech that cannot be asked at all blocks with
+    /// the reason, naming Windows speech — and no Add-voices steps, which
+    /// would not help.
+    #[test]
+    fn windows_speech_that_cannot_be_reached_blocks_with_the_reason_only() {
+        for (answer, reason) in [
+            (
+                "Windows speech did not finish listing its voices within 15 seconds",
+                "Windows speech did not finish listing its voices within 15 seconds.",
+            ),
+            (
+                "Class not registered (0x80040154)",
+                "Windows speech could not be reached: Class not registered (0x80040154).",
+            ),
+            (NO_SYSTEM_VOICE_PROBE, NO_SYSTEM_VOICE_PROBE),
+        ] {
+            let row = windows_system_voice_row(Err(answer.to_string()));
+            assert_blocks(&row, reason);
+            assert_ne!(row.kind, DependencyKind::SystemVoiceEngine);
+            assert!(!row.detail.contains("Add voices"), "{}", row.detail);
+            assert!(row.manual_steps.is_empty(), "{:?}", row.manual_steps);
+        }
     }
 
     #[test]
@@ -753,7 +1049,7 @@ mod tests {
 
         assert_blocks(
             &row,
-            "DeepInfra has no API key — add one in Settings → Backend",
+            "DeepInfra has no API key — add one in Settings → Speech",
         );
     }
 
@@ -783,6 +1079,7 @@ mod tests {
             has_api_key,
             has_region,
             has_voice,
+            piper_voice: None,
         }
     }
 
@@ -792,19 +1089,76 @@ mod tests {
     fn azure_blocks_on_key_then_region_then_voice() {
         let probe = good_gpu();
         let row = capability_row(&azure(false, false, false), &probe).unwrap();
-        assert_blocks(
-            &row,
-            "Azure has no API key — add one in Settings → Backend.",
-        );
+        assert_blocks(&row, "Azure has no API key — add one in Settings → Speech.");
         let row = capability_row(&azure(true, false, false), &probe).unwrap();
-        assert_blocks(&row, "Azure has no region — add one in Settings → Backend.");
+        assert_blocks(&row, "Azure has no region — add one in Settings → Speech.");
         let row = capability_row(&azure(true, true, false), &probe).unwrap();
         assert_blocks(
             &row,
-            "Azure has no voice selected — pick one in Settings → Backend.",
+            "Azure has no voice selected — pick one in Settings → Speech.",
         );
         assert_eq!(capability_row(&azure(true, true, true), &probe), None);
         assert_eq!(probe.asked.load(Ordering::SeqCst), 0);
+    }
+
+    fn edge_tts() -> CheckRequest {
+        CheckRequest {
+            selection: BackendSelection::Remote(RemoteProvider::EdgeTts),
+            ..remote(false)
+        }
+    }
+
+    /// Story 3.17: Edge TTS has no key, so no key row — on Linux no
+    /// capability row at all, and nothing probed.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn edge_tts_on_linux_has_no_key_or_capability_row() {
+        let probe = good_gpu();
+        assert_eq!(capability_row(&edge_tts(), &probe), None);
+        assert_eq!(probe.asked.load(Ordering::SeqCst), 0);
+    }
+
+    /// Elsewhere it is listed but cannot run, and says so.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn edge_tts_off_linux_cannot_run_yet() {
+        let row = capability_row(&edge_tts(), &good_gpu()).unwrap();
+        assert_blocks(&row, "Edge TTS isn't available on this OS yet.");
+        assert!(!row.detail.contains("API key"), "{}", row.detail);
+    }
+
+    #[test]
+    fn a_missing_edge_tts_blocks_with_manual_steps_only() {
+        let row = edge_tts_program_row(
+            None,
+            vec![
+                "If you don't have pipx: sudo apt install pipx".to_string(),
+                "Press Check again.".to_string(),
+            ],
+        );
+
+        assert_eq!(row.kind, DependencyKind::EdgeTtsProgram);
+        assert_eq!(row.status, DependencyStatus::Missing);
+        assert!(row.kind.blocks_speech());
+        assert!(!row.automatable, "voice-me never runs pip: steps only");
+        assert_eq!(row.label, "edge-tts");
+        assert_eq!(
+            row.detail,
+            "edge-tts is not installed. Please install it: pipx install edge-tts"
+        );
+        assert!(row.manual_steps[0].contains("sudo apt install pipx"));
+        assert_eq!(row.manual_steps[1], "Press Check again.");
+    }
+
+    #[test]
+    fn a_found_edge_tts_is_ready_and_names_its_path() {
+        let row = edge_tts_program_row(
+            Some(Path::new("/home/erdem/.local/bin/edge-tts")),
+            Vec::new(),
+        );
+
+        assert_eq!(row.status, DependencyStatus::Ready);
+        assert_eq!(row.detail, "Found at /home/erdem/.local/bin/edge-tts.");
     }
 
     /// The deadline wrapper hands back what the probe returned.

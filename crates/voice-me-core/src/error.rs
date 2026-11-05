@@ -66,7 +66,7 @@ pub enum VoiceMeError {
     /// satisfy it. The user has to record or import a clip in Settings →
     /// Voice, and the message has to say that rather than naming a path
     /// they were never supposed to create by hand.
-    #[error("no Reference Voice Sample yet — record or import one in Settings → Voice")]
+    #[error("no Reference Voice Sample yet — record or import one in Settings")]
     NoReferenceVoiceSample,
 
     /// The Virtual Microphone could not be created, addressed, or written
