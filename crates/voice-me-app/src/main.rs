@@ -57,6 +57,11 @@
 //! confirm-first shape, whose answer is recorded here; Settings' **Delete
 //! from DeepInfra** is carried out here too.
 
+// A tray app owns no terminal: on Windows a release build is a GUI-subsystem
+// executable, so launching it does not leave a console window open beside
+// the tray. Debug builds keep the console for `eprintln!` diagnostics.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -2779,6 +2784,14 @@ fn main() {
                         return;
                     }
                 };
+
+                // On Windows, `focus: true` only shows the window: the
+                // foreground lock keeps a background process from taking
+                // focus that way, so the overlay would sit on top without the
+                // caret. `activate_window` is gpui's path that does acquire
+                // the foreground there.
+                #[cfg(target_os = "windows")]
+                let _ = handle.update(cx, |_, window, _| window.activate_window());
 
                 *overlay_slot.borrow_mut() = Some(handle);
             }
