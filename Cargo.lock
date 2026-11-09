@@ -8798,6 +8798,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "voice-me-recorder"
+version = "0.1.0"
+dependencies = [
+ "cpal 0.18.2",
+ "gpui-kit",
+ "hound",
+ "rodio",
+ "rubato",
+ "serde_json",
+ "tempfile",
+ "zip",
+]
+
+[[package]]
 name = "voice-me-tests"
 version = "0.1.0"
 dependencies = [

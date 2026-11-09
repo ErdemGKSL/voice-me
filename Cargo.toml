@@ -21,6 +21,7 @@ members = [
   "crates/voice-me-espeak",
   "crates/voice-me-tts-piper",
   "crates/voice-me-deps",
+  "crates/voice-me-recorder",
   "crates/voice-me-tests",
 ]
 default-members = ["crates/voice-me-app"]

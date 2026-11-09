@@ -1,0 +1,33 @@
+name: android-recorder
+
+# Builds the Android recorder (android-recorder/) and uploads a debug-signed
+# APK you can install by hand: Actions -> this run -> Artifacts.
+on:
+  push:
+    paths:
+      - "android-recorder/**"
+      - ".github/workflows/android-recorder.yml"
+  workflow_dispatch:
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android-recorder
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Android SDK platform 36
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0"
+      - name: Test and build
+        run: ./gradlew --no-daemon testDebugUnitTest assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-me-recorder-debug-apk
+          path: android-recorder/app/build/outputs/apk/debug/app-debug.apk

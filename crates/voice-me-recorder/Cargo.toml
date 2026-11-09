@@ -1,0 +1,28 @@
+[package]
+name = "voice-me-recorder"
+version = "0.1.0"
+edition.workspace = true
+description = "Records a Piper training dataset sentence by sentence and exports it as a zip the Colab notebook trains from."
+
+[lib]
+name = "voice_me_recorder"
+path = "src/lib.rs"
+
+[[bin]]
+name = "voice-me-recorder"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit = "0.6.4"
+# Same capture / playback / WAV stack as `voice-me-ui`'s Voice Setup.
+cpal = "0.18"
+hound = "3.5"
+rodio = { version = "0.22", default-features = false, features = ["playback", "wav"] }
+# Captured audio is converted to the training rate (22.05 kHz).
+rubato = "5.0.0"
+# The export: deflate only, like `voice-me-deps`.
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.14"
