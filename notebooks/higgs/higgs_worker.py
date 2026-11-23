@@ -188,7 +188,10 @@ def main():
     say(f"başladı: {manifest['counts']}, aynı anda {CONCURRENCY} satır")
     run = Run(manifest, config)
     heartbeat()
-    queue = iter([(i, item) for i, item in enumerate(manifest["items"]) if item["status"] == "pending"])
+    # The seed index comes from the line's id (1-based line number in the
+    # frozen list), not its position here, so a job resumed from a subset of
+    # the items still gives every line the seed it would have had.
+    queue = iter([(int(item["id"]) - 1, item) for item in manifest["items"] if item["status"] == "pending"])
     futures, stopping, last_snapshot = {}, False, time.time()
 
     def submit_more(pool):
