@@ -286,13 +286,15 @@ def write_metadata(job_dir, manifest):
 
 # ---- Server ----------------------------------------------------------------
 
-SERVER_SCRIPT = f"""#!/bin/bash
+def server_script(concurrency=1):
+    """The serve command. `concurrency` requests run at once on the GPU;
+    cuda_graph_max_bs must cover max_running_requests or the server refuses."""
+    return f"""#!/bin/bash
 # TORCHDYNAMO_DISABLE: without it startup spends 30+ minutes in torch.compile.
-# cuda_graph_max_bs must cover max_running_requests or the server refuses.
 export TORCHDYNAMO_DISABLE=1
 exec sgl-omni serve --model-path {MODEL} --port 8000 \\
-  --tts_engine.factory.cuda_graph_max_bs 1 \\
-  --tts_engine.factory.max_running_requests 1
+  --tts_engine.factory.cuda_graph_max_bs {concurrency} \\
+  --tts_engine.factory.max_running_requests {concurrency}
 """
 
 
@@ -337,15 +339,26 @@ def stop_server():
     time.sleep(3)
 
 
-def start_server(log_dir=None, wait_s=900, say=print):
-    """Start the server (stopping any old one) and wait until it is healthy."""
-    if healthy():
+def _running_concurrency():
+    try:
+        with open(os.path.join(LOCAL, "server.concurrency")) as f:
+            return int(f.read())
+    except (OSError, ValueError):
+        return 1  # servers started before this file existed ran one at a time
+
+
+def start_server(log_dir=None, wait_s=900, say=print, concurrency=1):
+    """Start the server (stopping any old one) and wait until it is healthy.
+    A healthy server started for a different concurrency is restarted."""
+    if healthy() and _running_concurrency() == concurrency:
         return True
     stop_server()
     os.makedirs(LOCAL, exist_ok=True)
     script = os.path.join(LOCAL, "server.sh")
     with open(script, "w") as f:
-        f.write(SERVER_SCRIPT)
+        f.write(server_script(concurrency))
+    with open(os.path.join(LOCAL, "server.concurrency"), "w") as f:
+        f.write(str(concurrency))
     log_path = os.path.join(LOCAL, "server.log")
     log = open(log_path, "ab")
     proc = subprocess.Popen(["bash", script], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)

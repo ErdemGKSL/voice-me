@@ -20,7 +20,8 @@ while True:
         left = counts.get("pending", 0) * rate
         print(f"satır başına ~{rate:.1f} sn, kalan ~{left / 3600:.1f} saat")
     if st.get("current"):
-        print(f"şimdi: {st['current']} (deneme {st.get('attempt')}): {st.get('text', '')}")
+        ids = st["current"].split(", ")
+        print(f"şimdi ({len(ids)} satır aynı anda): {ids[0]}…{ids[-1]}  ör. {st.get('text', '')}")
     print("\nson günlük satırları:")
     print(subprocess.run("tail -n 6 /content/higgs/worker.log", shell=True, capture_output=True, text=True).stdout)
     if PLAY_EACH and st.get("last_done") and st["last_done"] != last_played:

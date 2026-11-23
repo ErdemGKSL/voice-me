@@ -20,6 +20,6 @@ if os.path.exists("/content/higgs/STOP"):
 if subprocess.run("pgrep -f '[h]iggs_worker.py'", shell=True, capture_output=True).returncode == 0:
     print("çalışan bir üretim zaten var; 10. hücreden izle")
 else:
-    subprocess.Popen(["python3", "/content/higgs/higgs_worker.py", JOB_DIR],
+    subprocess.Popen(["python3", "/content/higgs/higgs_worker.py", JOB_DIR, str(CONCURRENCY)],
                      stdout=open("/content/higgs/worker.out", "ab"), stderr=subprocess.STDOUT, start_new_session=True)
     print("başladı. 10. hücreden izle; tarayıcıyı kapatsan da makine açık kaldıkça devam eder.")
