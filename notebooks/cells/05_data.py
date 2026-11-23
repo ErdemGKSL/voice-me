@@ -1,42 +1,66 @@
-#@title 5. Veri: voice-me-recorder zip'i
-#@markdown Boş bırakırsan yükleme penceresi açılır. Drive'daki zip için tam yolu yaz.
+#@title 5. Veri: voice-me-recorder ya da Higgs veri seti zip'i
+#@markdown Boş bırakırsan yükleme penceresi açılır. Drive'daki zip için tam yolu yaz; birden çok zip için virgülle ayır.
 ZIP_PATH = "" #@param {type:"string"}
 #@markdown Birden çok zip (ör. iki PC'den gelen yedekler) yüklenirse hepsi birleştirilir.
-import csv, json, shutil, wave, zipfile
+#@markdown Higgs veri setinin zip'i (`metadata.csv` + `wavs/*.flac`, 24 kHz) de olur: sesler eğitim hızına (22050 Hz) çevrilir.
+import csv, json, shutil, subprocess, wave, zipfile
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
-zips = [ZIP_PATH] if ZIP_PATH.strip() else []
+zips = [p.strip() for p in ZIP_PATH.split(",") if p.strip()]
 if not zips:
     from google.colab import files
     zips = [os.path.join("/content", z) for z in files.upload().keys()]
 
 shutil.rmtree("/content/dataset", ignore_errors=True)
 os.makedirs("/content/dataset/wavs")
-rows, manifest = {}, {}
+os.makedirs("/content/dataset/raw")
+rows, manifest, sources = {}, {}, {}
 for z in zips:
     with zipfile.ZipFile(z) as archive:
         names = set(archive.namelist())
-        assert "metadata.csv" in names and any(n.startswith("wavs/") for n in names), f"{z}: voice-me-recorder zip'i değil"
+        assert "metadata.csv" in names and any(n.startswith("wavs/") for n in names), f"{z}: veri seti zip'i değil"
         if "manifest.json" in names:
             manifest = json.loads(archive.read("manifest.json"))
         for line in archive.read("metadata.csv").decode("utf-8-sig").splitlines():
             if "|" in line:
                 name, text = line.split("|", 1)
-                rows.setdefault(name, text.strip())
+                # Recorder rows name the file ("x.wav"); Higgs rows give only the id.
+                key = os.path.splitext(name.strip())[0]
+                rows.setdefault(key, text.strip())
         for n in names:
-            if n.startswith("wavs/") and n.endswith(".wav") and ".." not in n:
-                target = os.path.join("/content/dataset/wavs", os.path.basename(n))
-                if not os.path.exists(target):
-                    with archive.open(n) as src, open(target, "wb") as dst:
-                        shutil.copyfileobj(src, dst)
+            stem, ext = os.path.splitext(os.path.basename(n))
+            if n.startswith("wavs/") and ext in (".wav", ".flac") and ".." not in n and stem not in sources:
+                target = os.path.join("/content/dataset/raw", os.path.basename(n))
+                with archive.open(n) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                sources[stem] = target
 
 model_name = "erdem-tr-dizge"
 if manifest.get("speaker"):
     model_name = "".join(c if c.isalnum() else "-" for c in manifest["speaker"].lower()).strip("-") + "-tr-dizge"
+# Piper's medium/high models train at 22050 Hz (x-low at 16000); anything else is converted.
 sample_rate = str(manifest.get("sample_rate", 22050))
-assert sample_rate in ("16000", "22050"), sample_rate
+if sample_rate not in ("16000", "22050"):
+    sample_rate = "22050"
 
-rows = {n: t for n, t in rows.items() if os.path.exists(f"/content/dataset/wavs/{n}")}
+def to_training_wav(stem):
+    """Copy as is if already mono/16-bit at the training rate, else convert with ffmpeg."""
+    src, dst = sources[stem], f"/content/dataset/wavs/{stem}.wav"
+    if src.endswith(".wav"):
+        with wave.open(src) as w:
+            if w.getnchannels() == 1 and w.getsampwidth() == 2 and w.getframerate() == int(sample_rate):
+                os.replace(src, dst)
+                return
+    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-ac", "1", "-ar", sample_rate,
+                    "-sample_fmt", "s16", dst], check=True)
+    os.remove(src)
+
+keep = [n for n in rows if n in sources]
+with ThreadPoolExecutor(os.cpu_count() or 4) as pool:
+    list(pool.map(to_training_wav, keep))
+shutil.rmtree("/content/dataset/raw", ignore_errors=True)
+rows = {f"{n}.wav": rows[n] for n in keep}
 with open("/content/dataset/metadata.csv", "w", encoding="utf-8") as f:
     f.writelines(f"{n}|{t}\n" for n, t in sorted(rows.items()))
 total = 0.0

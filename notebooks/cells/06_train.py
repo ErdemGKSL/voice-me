@@ -1,7 +1,8 @@
 #@title 6. Eğitim (otomatik: kontrol noktası varsa devam eder)
-#@markdown Boş: sıfırdan. Doluysa (URL veya yol) bu Piper kontrol noktasından finetune edilir.
+#@markdown Boş: sıfırdan (Higgs 20k ana modeli böyle eğitilir). Doluysa (URL veya yol) bu kontrol noktasından finetune edilir: kendi sesinle ince ayar için ana modelin Drive'daki `.ckpt` yolunu yaz.
 PRETRAINED_CHECKPOINT = "" #@param {type:"string"}
 QUALITY = "medium" #@param ["x-low", "medium", "high"]
+#@markdown T4 için 12, L4 için 24–32 (bellek hatası alırsan düşür).
 BATCH_SIZE = 12 #@param {type:"integer"}
 MAX_EPOCHS = 10000 #@param {type:"integer"}
 CHECKPOINT_EVERY_EPOCHS = 5 #@param {type:"integer"}
