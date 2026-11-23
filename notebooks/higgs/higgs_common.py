@@ -371,6 +371,20 @@ def start_server(log_dir=None, wait_s=900, say=print):
 
 # ---- Synthesis and validation ------------------------------------------------
 
+# The server's `language` field accepts only these names (sglang-omni 0.2.0
+# rejects anything else with HTTP 400, Turkish included). The model itself
+# speaks 100+ languages from the text, so every other choice — "tr" too —
+# sends no `language` at all and lets the model read the text as it is.
+SERVER_LANGUAGES = {
+    "en": "English", "zh": "Chinese", "fr": "French", "de": "German", "it": "Italian",
+    "ja": "Japanese", "ko": "Korean", "pt": "Portuguese", "ru": "Russian", "es": "Spanish",
+}
+
+
+class RequestRejected(RuntimeError):
+    """The server refused the request itself (HTTP 4xx): retrying cannot help."""
+
+
 def synth(text, config, seed, ref_path=None, ref_text=None, timeout=600):
     """POST one line; returns WAV bytes or raises RuntimeError."""
     body = {
@@ -384,11 +398,14 @@ def synth(text, config, seed, ref_path=None, ref_text=None, timeout=600):
         body["top_p"] = config["top_p"]
     if config.get("repetition_penalty"):
         body["repetition_penalty"] = config["repetition_penalty"]
-    if config.get("language") and config["language"] != "auto":
-        body["language"] = config["language"]
+    language = SERVER_LANGUAGES.get(config.get("language") or "auto")
+    if language:
+        body["language"] = language
     if ref_path:
         body["references"] = [{"audio_path": ref_path, "text": ref_text}]
     response = requests.post(SERVER_URL + "/v1/audio/speech", json=body, timeout=(10, timeout))
+    if 400 <= response.status_code < 500:
+        raise RequestRejected(f"HTTP {response.status_code}: {response.text[:300]}")
     if not response.ok:
         raise RuntimeError(f"HTTP {response.status_code}: {response.text[:300]}")
     if response.content[:4] != b"RIFF":

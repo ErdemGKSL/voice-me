@@ -115,6 +115,11 @@ def main():
                 done_this_run += 1
                 status(manifest, last_done=item["id"], last_file=tmp, done_this_run=done_this_run,
                        rate=(time.time() - started) / max(1, done_this_run))
+            except hc.RequestRejected as rejected:  # a settings problem, the same for every line
+                # Not the line's fault: no event, so the next run keeps its seed.
+                item["attempts"] -= 1
+                hc.save_manifest(JOB, manifest, state="halted")
+                raise SystemExit(f"sunucu isteği reddetti, ayarları kontrol et: {rejected}")
             except ValueError as invalid:  # the clip came back but looks wrong: new seed
                 error = str(invalid)
                 say(f"{item['id']} deneme {item['attempts']}: {error}")

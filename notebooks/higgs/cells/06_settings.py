@@ -1,6 +1,6 @@
 #@title 6. Model ayarları (yalnızca yeni işte)
-#@markdown Dil: `auto` çoğu durumda yeterli (model dili metinden anlar). Seçersen istekle birlikte gönderilir.
-LANGUAGE = "auto" #@param ["auto", "tr", "en", "de", "fr", "es", "it", "ru", "ar", "ja", "zh"]
+#@markdown Dil: model dili metinden anlar; Türkçe için `auto` ya da `tr` aynıdır. Yalnızca en, zh, fr, de, it, ja, ko, pt, ru, es sunucuya ayrıca bildirilir (sunucu başka dil adı kabul etmiyor).
+LANGUAGE = "auto" #@param ["auto", "tr", "en", "de", "fr", "es", "it", "pt", "ru", "ja", "ko", "zh"]
 TEMPERATURE = 0.8 #@param {type:"slider", min:0.1, max:1.5, step:0.05}
 TOP_K = 50 #@param {type:"integer"}
 #@markdown 0 = kullanma:
