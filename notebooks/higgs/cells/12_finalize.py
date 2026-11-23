@@ -2,6 +2,9 @@
 #@markdown Piper eğitimi için 22050 Hz kopyası da çıkar:
 EXPORT_22050 = True #@param {type:"boolean"}
 import shutil, subprocess, zipfile
+if subprocess.run("pgrep -f '[h]iggs_worker.py'", shell=True, capture_output=True).returncode == 0:
+    raise SystemExit("Üretim hâlâ çalışıyor; bitmesini bekle ya da önce 11. hücreyle durdur. "
+                     "(\"Run all\" ile buraya geldiysen sorun yok, üretim devam ediyor.)")
 manifest = hc.load_manifest(JOB_DIR)
 hc.reconcile(JOB_DIR, manifest)
 hc.save_manifest(JOB_DIR, manifest)
