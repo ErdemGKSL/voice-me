@@ -87,7 +87,7 @@ class Run:
             hc.count(self.manifest)
             rate = (time.time() - self.started) / max(1, self.done)
             current = sorted(self.in_flight)
-            text = self.manifest["items"][self.in_flight[current[0]]]["text"][:120] if current else ""
+            text = self.in_flight[current[0]]["text"][:120] if current else ""
             status(self.manifest, current=", ".join(current), text=text, rate=rate,
                    done_this_run=self.done, concurrency=CONCURRENCY, **extra)
 
@@ -201,7 +201,7 @@ def main():
                 return
             index, item = nxt
             with run.lock:
-                run.in_flight[item["id"]] = index
+                run.in_flight[item["id"]] = item
             futures[pool.submit(process, run, index, item, ref_local, ref_text)] = item["id"]
 
     with concurrent.futures.ThreadPoolExecutor(CONCURRENCY) as pool:
