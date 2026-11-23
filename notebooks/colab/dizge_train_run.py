@@ -21,7 +21,7 @@ import sys
 
 notebook, zips = sys.argv[1], sys.argv[2]
 batch = sys.argv[3] if len(sys.argv) > 3 else "32"
-every = sys.argv[4] if len(sys.argv) > 4 else "2"
+every = sys.argv[4] if len(sys.argv) > 4 else "50"
 RUN = "/content/piper-run"
 os.makedirs(RUN, exist_ok=True)
 

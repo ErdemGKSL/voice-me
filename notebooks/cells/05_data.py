@@ -3,7 +3,10 @@
 ZIP_PATH = "" #@param {type:"string"}
 #@markdown Birden çok zip (ör. iki PC'den gelen yedekler) yüklenirse hepsi birleştirilir.
 #@markdown Higgs veri setinin zip'i (`metadata.csv` + `wavs/*.flac`, 24 kHz) de olur: sesler eğitim hızına (22050 Hz) çevrilir.
+#@markdown Her klibin tepe seviyesi buna getirilir (voice-me-recorder da 0.89 kullanır); Higgs sesleri ~10 dB kısık geldiği için ana model ve ince ayar verisi aynı seviyede olur. 0 = dokunma.
+NORMALIZE_PEAK = 0.89 #@param {type:"number"}
 import csv, json, shutil, subprocess, wave, zipfile
+import numpy as np
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
@@ -44,17 +47,35 @@ sample_rate = str(manifest.get("sample_rate", 22050))
 if sample_rate not in ("16000", "22050"):
     sample_rate = "22050"
 
+def normalize_peak(path):
+    """Scale the clip so its loudest sample sits at NORMALIZE_PEAK."""
+    if NORMALIZE_PEAK <= 0:
+        return
+    with wave.open(path) as w:
+        params, audio = w.getparams(), np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+    peak = int(np.abs(audio.astype(np.int32)).max()) if audio.size else 0
+    if peak == 0:
+        return
+    scaled = np.clip(np.round(audio.astype(np.float64) * (NORMALIZE_PEAK * 32767 / peak)), -32768, 32767)
+    with wave.open(path, "wb") as w:
+        w.setparams(params)
+        w.writeframes(scaled.astype(np.int16).tobytes())
+
 def to_training_wav(stem):
-    """Copy as is if already mono/16-bit at the training rate, else convert with ffmpeg."""
+    """Copy as is if already mono/16-bit at the training rate, else convert with ffmpeg;
+    then bring the peak level to NORMALIZE_PEAK."""
     src, dst = sources[stem], f"/content/dataset/wavs/{stem}.wav"
+    same = False
     if src.endswith(".wav"):
         with wave.open(src) as w:
-            if w.getnchannels() == 1 and w.getsampwidth() == 2 and w.getframerate() == int(sample_rate):
-                os.replace(src, dst)
-                return
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-ac", "1", "-ar", sample_rate,
-                    "-sample_fmt", "s16", dst], check=True)
-    os.remove(src)
+            same = w.getnchannels() == 1 and w.getsampwidth() == 2 and w.getframerate() == int(sample_rate)
+    if same:
+        os.replace(src, dst)
+    else:
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src, "-ac", "1", "-ar", sample_rate,
+                        "-sample_fmt", "s16", dst], check=True)
+        os.remove(src)
+    normalize_peak(dst)
 
 keep = [n for n in rows if n in sources]
 with ThreadPoolExecutor(os.cpu_count() or 4) as pool:

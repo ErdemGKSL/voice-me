@@ -4,8 +4,14 @@ PRETRAINED_CHECKPOINT = "" #@param {type:"string"}
 QUALITY = "medium" #@param ["x-low", "medium", "high"]
 #@markdown T4 için 12, L4 için 24–32 (bellek hatası alırsan düşür).
 BATCH_SIZE = 12 #@param {type:"integer"}
-MAX_EPOCHS = 10000 #@param {type:"integer"}
-CHECKPOINT_EVERY_EPOCHS = 5 #@param {type:"integer"}
+MAX_EPOCHS = 2000 #@param {type:"integer"}
+#@markdown Numaralı kontrol noktası seyrek (her biri yüzlerce MB, disk dolmasın); `last.ckpt` sık yazılır.
+CHECKPOINT_EVERY_EPOCHS = 50 #@param {type:"integer"}
+LAST_CHECKPOINT_EVERY_EPOCHS = 2 #@param {type:"integer"}
+#@markdown Öğrenme hızı her epoch bu oranla çarpılır: 0.9985 ile 1000. epoch'ta %22'sine, 1800'de %7'sine iner.
+LR_DECAY = 0.9985 #@param {type:"number"}
+#@markdown Kendi sesinle ince ayarda 32 daha kararlıdır; sıfırdan eğitimde 16-mixed hızlıdır.
+PRECISION = "16-mixed" #@param ["16-mixed", "32"]
 VALIDATION_FRACTION = 0.01 #@param {type:"number"}
 
 import glob, re
@@ -52,10 +58,12 @@ cmd = (
     f'--trainer.default_root_dir "{output_dir}" '
     "--trainer.accelerator gpu --trainer.devices 1 "
     f"--trainer.max_epochs {MAX_EPOCHS} --trainer.log_every_n_steps 1000 "
-    "--trainer.precision 16-mixed " + val +
+    f"--trainer.precision {PRECISION} " + val +
+    f"--model.lr_decay {LR_DECAY} --model.lr_decay_d {LR_DECAY} "
+    "--data.num_workers 4 --seed_everything 1234 "
     f"--checkpoint.every_n_epochs {CHECKPOINT_EVERY_EPOCHS} --checkpoint.save_top_k -1 "
     "--checkpoint.monitor null "
-    f"--last_checkpoint.every_n_epochs {CHECKPOINT_EVERY_EPOCHS} " + extra
+    f"--last_checkpoint.every_n_epochs {LAST_CHECKPOINT_EVERY_EPOCHS} " + extra
 )
 print(cmd)
 get_ipython().system(cmd)
