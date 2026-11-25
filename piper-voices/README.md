@@ -60,7 +60,7 @@ commit.
 `custom/tr_TR-seksi-huseyin/` is a Turkish male voice (medium quality) trained
 from scratch on about 25,000 synthetic Higgs TTS clips (Whisper-filtered), with
 `"phoneme_type": "dizge"`: it needs the Turkish G2P model below. It is still in
-training: the files are exported from an intermediate checkpoint (epoch ~250 of
+training: the files are exported from an intermediate checkpoint (epoch 300 of
 ~2500) and are replaced at the same path as training goes on (update
 `SHA256SUMS` and the catalog's sizes and SHA-256 values in the same commit).
 Known at this stage: a steady background hiss that is also in the training clips.
