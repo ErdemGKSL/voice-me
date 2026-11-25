@@ -55,6 +55,16 @@ catalog serves both files straight from `main` through
 `SHA256SUMS` and the catalog's byte sizes and SHA-256 values in the same
 commit.
 
+## Seksi Hüseyin voice in this repository
+
+`custom/tr_TR-seksi-huseyin/` is a Turkish male voice (medium quality) trained
+from scratch on about 25,000 synthetic Higgs TTS clips (Whisper-filtered), with
+`"phoneme_type": "dizge"`: it needs the Turkish G2P model below. It is still in
+training: the files are exported from an intermediate checkpoint (epoch ~250 of
+~2500) and are replaced at the same path as training goes on (update
+`SHA256SUMS` and the catalog's sizes and SHA-256 values in the same commit).
+Known at this stage: a steady background hiss that is also in the training clips.
+
 ## Updates
 
 An installed voice from this catalog follows its entry. voice-me reads this

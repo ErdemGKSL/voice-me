@@ -19,6 +19,23 @@
       }
     },
     {
+      "key": "tr_TR-seksi-huseyin",
+      "name": "seksi hüseyin",
+      "locale": "tr_TR",
+      "language": "Turkish (Turkey)",
+      "quality": "medium",
+      "model": {
+        "url": "https://raw.githubusercontent.com/ErdemGKSL/voice-me/main/piper-voices/custom/tr_TR-seksi-huseyin/model.onnx",
+        "size": 63517346,
+        "sha256": "a3bace8aa189cdff0467a5f14563a57f9025c96f7f36531ab567f948788036b7"
+      },
+      "config": {
+        "url": "https://raw.githubusercontent.com/ErdemGKSL/voice-me/main/piper-voices/custom/tr_TR-seksi-huseyin/config.json",
+        "size": 4854,
+        "sha256": "6a8718c832f1e2a7242054f456233e197c826f82064069e8a63b3e79e1b88407"
+      }
+    },
+    {
       "key": "tr_TR-fahrettin-medium",
       "name": "fahrettin",
       "locale": "tr_TR",
