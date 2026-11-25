@@ -16,7 +16,8 @@ use crate::error::VoiceMeError;
 use crate::ports::SettingsStore;
 use crate::state::{
     ActiveBackend, ApiKeys, AppState, BackendSelection, DEFAULT_AZURE_LOCALE,
-    DEFAULT_EDGE_TTS_LOCALE, DEFAULT_OVERLAY_POSITION, DEFAULT_PIPER_LOCALE,
+    DEFAULT_EDGE_TTS_LOCALE, DEFAULT_OVERLAY_POSITION, DEFAULT_SPEECH_RATE, MAX_SPEECH_RATE,
+    MIN_SPEECH_RATE, DEFAULT_PIPER_LOCALE,
     DEFAULT_SPEECH_LANGUAGE, DependencyOutcome, LanguageBackend, LocalRuntime, RemoteProvider,
     RemoteSample, SpeechBackend, SpeechExecutionTarget, SpeechLanguages, SpeechVoices,
     parse_azure_region,
@@ -108,6 +109,14 @@ struct SettingsFile {
         skip_serializing_if = "Option::is_none"
     )]
     overlay_position: Option<u8>,
+    /// Speaking speed of Piper voices, in percent. Lenient: an unreadable
+    /// value is the default; one outside 50–200 is clamped on load.
+    #[serde(
+        default,
+        deserialize_with = "lenient_rate",
+        skip_serializing_if = "Option::is_none"
+    )]
+    speech_rate: Option<u16>,
 }
 
 /// How [`SpeechLanguages`] is written to TOML, keyed by backend slug:
@@ -348,6 +357,17 @@ where
     Ok(lenient::<_, i64>(deserializer)?.map(|percent| percent.clamp(0, 100) as u8))
 }
 
+/// Speaking speed: an unreadable value is the default, and one outside
+/// 50–200 is clamped.
+fn lenient_rate<'de, D>(deserializer: D) -> Result<Option<u16>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(lenient::<_, i64>(deserializer)?.map(|rate| {
+        rate.clamp(i64::from(MIN_SPEECH_RATE), i64::from(MAX_SPEECH_RATE)) as u16
+    }))
+}
+
 /// The same leniency for the API keys: an unreadable table reads as no keys.
 fn lenient_keys<'de, D>(deserializer: D) -> Result<ApiKeys, D::Error>
 where
@@ -418,6 +438,7 @@ impl Default for SettingsFile {
             confirmed_disclosures: Vec::new(),
             remote_samples: Vec::new(),
             overlay_position: None,
+            speech_rate: None,
         }
     }
 }
@@ -581,6 +602,11 @@ impl FileSettingsStore {
             overlay_position: settings
                 .overlay_position
                 .unwrap_or(DEFAULT_OVERLAY_POSITION),
+            speech_rate: {
+                let rate = settings.speech_rate.unwrap_or(DEFAULT_SPEECH_RATE);
+                crate::state::set_speech_rate_percent(rate);
+                rate
+            },
         }
     }
 }
@@ -725,6 +751,13 @@ impl SettingsStore for FileSettingsStore {
     fn save_overlay_position(&self, percent: u8) -> Result<AppState, VoiceMeError> {
         let mut settings = self.read_settings_file()?;
         settings.overlay_position = Some(percent.min(100));
+        self.write_settings_file(&settings)?;
+        Ok(self.build_state(settings))
+    }
+
+    fn save_speech_rate(&self, percent: u16) -> Result<AppState, VoiceMeError> {
+        let mut settings = self.read_settings_file()?;
+        settings.speech_rate = Some(percent.clamp(MIN_SPEECH_RATE, MAX_SPEECH_RATE));
         self.write_settings_file(&settings)?;
         Ok(self.build_state(settings))
     }
@@ -1410,6 +1443,24 @@ mod tests {
             store.save_overlay_position(200).unwrap().overlay_position,
             100
         );
+    }
+
+    #[test]
+    fn speech_rate_defaults_to_100_and_round_trips_clamped() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let store = store_in(config_dir.path(), data_dir.path());
+        store.save_hotkey(Some("Ctrl+Alt+KeyV")).unwrap();
+        assert_eq!(store.load().unwrap().speech_rate, 100);
+
+        let state = store.save_speech_rate(80).unwrap();
+        assert_eq!(state.speech_rate, 80);
+        assert_eq!(crate::state::speech_rate_percent(), 80);
+        assert_eq!(store.load().unwrap().speech_rate, 80);
+
+        assert_eq!(store.save_speech_rate(10).unwrap().speech_rate, 50);
+        assert_eq!(store.save_speech_rate(900).unwrap().speech_rate, 200);
+        store.save_speech_rate(100).unwrap();
     }
 
     #[test]

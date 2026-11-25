@@ -488,8 +488,12 @@ impl TtsPort for PiperTts {
         let LoadedVoice {
             session, config, ..
         } = loaded;
+        // The user's speaking speed: a longer `length_scale` is slower speech.
+        let rate = f32::from(voice_me_core::speech_rate_percent()) / 100.0;
         synthesize(text, config, self.phonemizer.as_ref(), |inputs| {
-            run_graph(session, inputs)
+            let mut inputs = inputs.clone();
+            inputs.scales[1] /= rate;
+            run_graph(session, &inputs)
         })
     }
 }

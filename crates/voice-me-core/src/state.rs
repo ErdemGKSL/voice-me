@@ -10,6 +10,30 @@ pub const DEFAULT_UI_LANGUAGE: &str = "en";
 /// area (taskbar and panels excluded).
 pub const DEFAULT_OVERLAY_POSITION: u8 = 50;
 
+/// Speaking speed, in percent of the voice's own pace (100 = unchanged).
+pub const DEFAULT_SPEECH_RATE: u16 = 100;
+/// The slowest and fastest speaking speed the settings allow.
+pub const MIN_SPEECH_RATE: u16 = 50;
+pub const MAX_SPEECH_RATE: u16 = 200;
+
+static SPEECH_RATE: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(DEFAULT_SPEECH_RATE);
+
+/// The speaking speed the Piper adapter applies, in percent. Kept current by
+/// the settings store whenever it loads or saves the setting, so a change
+/// takes effect on the next sentence without rebuilding any session.
+pub fn speech_rate_percent() -> u16 {
+    SPEECH_RATE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set the speaking speed, clamped to the allowed range.
+pub fn set_speech_rate_percent(percent: u16) {
+    SPEECH_RATE.store(
+        percent.clamp(MIN_SPEECH_RATE, MAX_SPEECH_RATE),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 /// The top edge of a window placed `pct` percent of the way down the free
 /// vertical space of a visible area: `0` puts the window's top on the
 /// area's top, `100` its bottom on the area's bottom, `50` centres it.
@@ -1495,6 +1519,9 @@ pub struct AppState {
     /// percent of the free space in the primary display's visible area.
     /// Persisted; set from Settings → Hotkey. Always `0..=100`.
     pub overlay_position: u8,
+    /// Speaking speed in percent of the voice's own pace (Piper voices).
+    /// Persisted; set from Settings → Voice. Always `50..=200`.
+    pub speech_rate: u16,
 }
 
 /// Hand-written rather than derived so the two language fields default to
@@ -1523,6 +1550,7 @@ impl Default for AppState {
             edge_tts_voices: Vec::new(),
             piper_voices: Vec::new(),
             overlay_position: DEFAULT_OVERLAY_POSITION,
+            speech_rate: DEFAULT_SPEECH_RATE,
         }
     }
 }

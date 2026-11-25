@@ -457,6 +457,15 @@ pub trait SettingsStore {
     /// the resulting `AppState`.
     fn save_overlay_position(&self, percent: u8) -> Result<AppState, VoiceMeError>;
 
+    /// Persist the speaking speed of Piper voices, in percent of the voice's
+    /// own pace (100 unchanged), clamped to 50–200. Returns the resulting
+    /// `AppState`. Stores that keep no settings refuse.
+    fn save_speech_rate(&self, _percent: u16) -> Result<AppState, VoiceMeError> {
+        Err(VoiceMeError::Other(
+            "this settings store cannot save the speaking speed".to_string(),
+        ))
+    }
+
     /// Record that the user confirmed `provider`'s disclosure — what is
     /// sent, and to whom (Story 3.6). Idempotent. Returns the resulting
     /// `AppState`.

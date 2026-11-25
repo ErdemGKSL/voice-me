@@ -26,7 +26,8 @@ pub use speak::{
 };
 pub use state::{
     AZURE_REGION_INVALID, ActiveBackend, ApiKeys, AppState, BackendSelection, DEFAULT_AZURE_LOCALE,
-    DEFAULT_EDGE_TTS_LOCALE, DEFAULT_OVERLAY_POSITION, DEFAULT_PIPER_LOCALE,
+    DEFAULT_EDGE_TTS_LOCALE, DEFAULT_OVERLAY_POSITION, DEFAULT_SPEECH_RATE, MAX_SPEECH_RATE, MIN_SPEECH_RATE,
+    set_speech_rate_percent, speech_rate_percent, DEFAULT_PIPER_LOCALE,
     DEFAULT_SPEECH_LANGUAGE, DEFAULT_UI_LANGUAGE, Dependency, DependencyKind, DependencyOutcome,
     DependencyReport, DependencyStatus, LanguageBackend, LanguageOption, LocalEngine, LocalRuntime,
     RemoteProvider, RemoteSample, SpeechBackend, SpeechExecutionTarget, SpeechLanguage,

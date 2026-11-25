@@ -16,6 +16,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     select::{Select, SelectEvent, SelectState},
+    slider::{Slider, SliderEvent, SliderState},
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -220,6 +221,12 @@ pub struct VoiceSetupView {
     /// this view only reacts to its `SelectEvent::Confirm` to persist the
     /// pick via `SettingsStore`.
     mic_device_select: Option<Entity<SelectState<Vec<String>>>>,
+    /// The speaking-speed slider (Piper voices), 50–200 percent.
+    rate_slider: Entity<SliderState>,
+    rate_percent: u16,
+    saved_rate_percent: u16,
+    rate_dragging: bool,
+    rate_error: Option<SharedString>,
     _duration_watch: Option<Task<()>>,
     _playback: Option<MixerDeviceSink>,
 }
@@ -340,7 +347,42 @@ impl VoiceSetupView {
             Some(select_state)
         };
 
+        // Read once here, never at render time.
+        let rate_percent = settings_store
+            .load()
+            .map(|state| state.speech_rate)
+            .unwrap_or(voice_me_core::DEFAULT_SPEECH_RATE)
+            .clamp(voice_me_core::MIN_SPEECH_RATE, voice_me_core::MAX_SPEECH_RATE);
+        let rate_slider = cx.new(|_| {
+            SliderState::new()
+                .min(f32::from(voice_me_core::MIN_SPEECH_RATE))
+                .max(f32::from(voice_me_core::MAX_SPEECH_RATE))
+                .step(5.)
+                .default_value(f32::from(rate_percent))
+        });
+        cx.subscribe_in(
+            &rate_slider,
+            window,
+            |this, _, event: &SliderEvent, _window, cx| match event {
+                SliderEvent::Change(value) => {
+                    this.rate_dragging = true;
+                    this.rate_percent = rate_from_slider(value.end());
+                    cx.notify();
+                }
+                SliderEvent::Release(value) => {
+                    this.rate_dragging = false;
+                    this.save_rate(rate_from_slider(value.end()), cx);
+                }
+            },
+        )
+        .detach();
+
         Self {
+            rate_slider,
+            rate_percent,
+            saved_rate_percent: rate_percent,
+            rate_dragging: false,
+            rate_error: None,
             settings_store,
             capture_source,
             import_source,
@@ -354,6 +396,23 @@ impl VoiceSetupView {
             _duration_watch: None,
             _playback: None,
         }
+    }
+
+    /// Persist the speaking speed. A failed save puts the label back on the
+    /// saved value, so it never shows a speed that will not be used.
+    fn save_rate(&mut self, percent: u16, cx: &mut Context<Self>) {
+        match self.settings_store.save_speech_rate(percent) {
+            Ok(_) => {
+                self.saved_rate_percent = percent;
+                self.rate_percent = percent;
+                self.rate_error = None;
+            }
+            Err(error) => {
+                self.rate_percent = self.saved_rate_percent;
+                self.rate_error = Some(format!("Couldn't save the speaking speed: {error}").into());
+            }
+        }
+        cx.notify();
     }
 
     fn start_recording(&mut self, cx: &mut Context<Self>) {
@@ -692,7 +751,61 @@ impl Render for VoiceSetupView {
                             .on_click(cx.listener(|this, _, _, cx| this.accept(cx))),
                     ),
             )
+            .child(
+                v_flex()
+                    .id("voice-setup-speech-rate")
+                    .test_support()
+                    .flex_none()
+                    .mt_2()
+                    .gap_2()
+                    .child(div().text_lg().child("Speaking speed"))
+                    .child(div().text_color(cx.theme().muted_foreground).child(
+                        "How fast Piper voices speak: 100% is the voice's own pace, \
+                         lower is slower, higher is faster.",
+                    ))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .id("voice-setup-speech-rate-slider")
+                                    .test_support()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(Slider::new(&self.rate_slider).horizontal()),
+                            )
+                            .child(
+                                div()
+                                    .id("voice-setup-speech-rate-value")
+                                    .test_support()
+                                    .w(px(48.))
+                                    .flex_none()
+                                    .text_right()
+                                    .font_family("monospace")
+                                    .child(format!("{}%", self.rate_percent)),
+                            ),
+                    )
+                    .when_some(self.rate_error.clone(), |el, message| {
+                        el.child(
+                            div()
+                                .id("voice-setup-speech-rate-error")
+                                .test_support()
+                                .text_size(px(12.))
+                                .text_color(cx.theme().danger)
+                                .child(message),
+                        )
+                    }),
+            )
     }
+}
+
+/// The slider's reading as a whole speaking-speed percentage, 50–200.
+fn rate_from_slider(value: f32) -> u16 {
+    (value.round() as i64).clamp(
+        i64::from(voice_me_core::MIN_SPEECH_RATE),
+        i64::from(voice_me_core::MAX_SPEECH_RATE),
+    ) as u16
 }
 
 /// Start capturing from `device` (matched by name against `cpal`'s
