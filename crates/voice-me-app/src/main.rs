@@ -3729,6 +3729,7 @@ fn main() {
                     azure_voices: azure_voices.borrow().clone(),
                     edge_tts_voices: edge_tts_voices.borrow().clone(),
                     piper_voices: state.piper_voices,
+                    speech_rate: state.speech_rate,
                 }
             }
         });
@@ -4368,6 +4369,24 @@ fn main() {
                         }
                     }
                     (*run_check)(cx);
+                    (*push_panel)(cx);
+                }
+                // The Piper speaking speed: read by the engine on every
+                // sentence, so there is nothing to rebuild.
+                BackendAction::SetSpeechRate(percent) => {
+                    match settings_store.save_speech_rate(percent) {
+                        Ok(_) => {
+                            backend_errors
+                                .borrow_mut()
+                                .remove(&BackendArea::SpeechRate);
+                        }
+                        Err(error) => {
+                            backend_errors.borrow_mut().insert(
+                                BackendArea::SpeechRate,
+                                format!("Couldn't save the speaking speed: {error}"),
+                            );
+                        }
+                    }
                     (*push_panel)(cx);
                 }
                 BackendAction::Restart => match relaunch() {

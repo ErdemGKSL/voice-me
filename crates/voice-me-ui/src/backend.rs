@@ -36,6 +36,7 @@ use gpui_kit::component::{
     input::{Input, InputState},
     radio::{Radio, RadioGroup},
     select::{Select, SelectEvent, SelectState},
+    slider::{Slider, SliderEvent, SliderState},
     tag::Tag,
     v_flex,
 };
@@ -81,6 +82,9 @@ pub enum BackendAction {
     /// Save (`Some`, already `[a-z0-9]+`) or remove (`None`) the Azure
     /// region (Story 3.14).
     SaveAzureRegion(Option<String>),
+    /// Save the speaking speed of Piper voices, in percent (100 = the
+    /// voice's own pace).
+    SetSpeechRate(u16),
 }
 
 /// Written by hand so a key typed into a key field can never reach a log
@@ -117,6 +121,9 @@ impl std::fmt::Debug for BackendAction {
             BackendAction::SaveAzureRegion(region) => {
                 f.debug_tuple("SaveAzureRegion").field(region).finish()
             }
+            BackendAction::SetSpeechRate(percent) => {
+                f.debug_tuple("SetSpeechRate").field(percent).finish()
+            }
         }
     }
 }
@@ -141,6 +148,8 @@ pub enum BackendArea {
     SpeechVoice,
     /// The Azure region (Story 3.14).
     AzureRegion,
+    /// The Piper speaking speed.
+    SpeechRate,
 }
 
 /// Everything the Backend and Dependencies tabs show about the backend, as
@@ -186,6 +195,8 @@ pub struct BackendPanel {
     /// The Piper voices installed in the cache (Story 3.15): Piper's
     /// language and voice pickers list only these.
     pub piper_voices: Vec<StockVoice>,
+    /// The saved speaking speed of Piper voices, 50-200 percent.
+    pub speech_rate: u16,
 }
 
 impl BackendPanel {
@@ -224,6 +235,7 @@ impl Default for BackendPanel {
             azure_voices: Vec::new(),
             edge_tts_voices: Vec::new(),
             piper_voices: Vec::new(),
+            speech_rate: voice_me_core::DEFAULT_SPEECH_RATE,
         }
     }
 }
@@ -530,6 +542,10 @@ pub struct BackendView {
     /// several voices, and Azure's (Story 3.14).
     voice_select: Entity<SelectState<Vec<VoiceChoice>>>,
     key_inputs: Vec<(RemoteProvider, Entity<InputState>)>,
+    /// The Piper speaking-speed slider (50-200 percent).
+    rate_slider: Entity<SliderState>,
+    rate_percent: u16,
+    rate_dragging: bool,
     /// The Azure region field (Story 3.14).
     region_input: Entity<InputState>,
     /// A panel (or kind) change since the last render that still has to
@@ -604,6 +620,33 @@ impl BackendView {
                 && selection.engine() == this.panel.selection.engine()
             {
                 this.act(BackendAction::Select(selection.clone()), cx);
+            }
+        });
+
+        let rate_percent = panel.speech_rate.clamp(
+            voice_me_core::MIN_SPEECH_RATE,
+            voice_me_core::MAX_SPEECH_RATE,
+        );
+        let rate_slider = cx.new(|_| {
+            SliderState::new()
+                .min(f32::from(voice_me_core::MIN_SPEECH_RATE))
+                .max(f32::from(voice_me_core::MAX_SPEECH_RATE))
+                .step(5.)
+                .default_value(f32::from(rate_percent))
+        });
+        let rate_subscription = cx.subscribe(&rate_slider, |this, _slider, event: &SliderEvent, cx| {
+            match event {
+                SliderEvent::Change(value) => {
+                    this.rate_dragging = true;
+                    this.rate_percent = rate_from_slider(value.end());
+                    cx.notify();
+                }
+                SliderEvent::Release(value) => {
+                    this.rate_dragging = false;
+                    let percent = rate_from_slider(value.end());
+                    this.rate_percent = percent;
+                    this.act(BackendAction::SetSpeechRate(percent), cx);
+                }
             }
         });
 
@@ -697,6 +740,9 @@ impl BackendView {
             language_backend,
             voice_select,
             key_inputs,
+            rate_slider,
+            rate_percent,
+            rate_dragging: false,
             region_input,
             panel_stale: false,
             keys_stale: false,
@@ -710,6 +756,7 @@ impl BackendView {
                 device_subscription,
                 language_subscription,
                 voice_subscription,
+                rate_subscription,
             ],
         }
     }
@@ -733,6 +780,10 @@ impl BackendView {
             || panel.azure_voices != self.panel.azure_voices
             || panel.edge_tts_voices != self.panel.edge_tts_voices
             || panel.piper_voices != self.panel.piper_voices;
+        if !self.rate_dragging {
+            // A failed save puts the label back on the saved speed.
+            self.rate_percent = panel.speech_rate;
+        }
         let region_changed = panel.azure_region != self.panel.azure_region;
         self.language_items_stale |= voices_changed;
         self.language_stale |= panel.speech_languages != self.panel.speech_languages
@@ -978,6 +1029,55 @@ impl BackendView {
                 .is_some_and(LocalEngine::has_device)
     }
 
+    /// The speaking-speed slider is Piper's: shown with Piper saved.
+    fn shows_speech_rate(&self) -> bool {
+        self.kind == BackendKind::Local && self.panel.selection.is_piper()
+    }
+
+    fn speech_rate_section(&self, cx: &mut Context<Self>) -> AnyElement {
+        v_flex()
+            .id("backend-speech-rate")
+            .test_support()
+            .gap_1()
+            .child(div().font_weight(FontWeight::MEDIUM).child("Speaking speed"))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "100% is the voice's own pace; lower is slower, higher is faster.",
+                    ),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .id("backend-speech-rate-slider")
+                            .test_support()
+                            .w(px(360.))
+                            .child(Slider::new(&self.rate_slider).horizontal()),
+                    )
+                    .child(
+                        div()
+                            .id("backend-speech-rate-value")
+                            .test_support()
+                            .w(px(48.))
+                            .font_family("monospace")
+                            .child(format!("{}%", self.rate_percent)),
+                    ),
+            )
+            .children(
+                self.panel
+                    .errors
+                    .get(&BackendArea::SpeechRate)
+                    .cloned()
+                    .map(|error| error_line("backend-error-speech-rate", error, cx)),
+            )
+            .into_any_element()
+    }
+
     /// Step one and two: the kind, then a backend of that kind — and, for
     /// an ONNX engine, the device it runs on.
     fn choice_section(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1054,6 +1154,9 @@ impl BackendView {
                         )
                         .children(error_line_for_selection(cx)),
                 )
+            })
+            .when(self.shows_speech_rate(), |el| {
+                el.child(self.speech_rate_section(cx))
             })
             .into_any_element()
     }
@@ -1778,6 +1881,14 @@ pub(crate) fn error_line(id: impl Into<SharedString>, error: String, cx: &App) -
         .text_color(cx.theme().danger)
         .child(error)
         .into_any_element()
+}
+
+/// The slider's reading as a whole speaking-speed percentage, 50-200.
+fn rate_from_slider(value: f32) -> u16 {
+    (value.round() as i64).clamp(
+        i64::from(voice_me_core::MIN_SPEECH_RATE),
+        i64::from(voice_me_core::MAX_SPEECH_RATE),
+    ) as u16
 }
 
 fn provider_slug(provider: RemoteProvider) -> &'static str {
