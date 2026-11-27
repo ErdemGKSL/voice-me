@@ -55,7 +55,7 @@ catalog serves both files straight from `main` through
 `SHA256SUMS` and the catalog's byte sizes and SHA-256 values in the same
 commit.
 
-## Seksi Hüseyin voice in this repository
+## Yakışıklı Hüseyin voice in this repository
 
 `custom/tr_TR-seksi-huseyin/` is a Turkish male voice (medium quality) trained
 from scratch on about 25,000 synthetic Higgs TTS clips (Whisper-filtered), with
