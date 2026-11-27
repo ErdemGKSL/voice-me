@@ -27,7 +27,7 @@
       "model": {
         "url": "https://raw.githubusercontent.com/ErdemGKSL/voice-me/main/piper-voices/custom/tr_TR-seksi-huseyin/model.onnx",
         "size": 63517346,
-        "sha256": "8ecf9b29f0c392c5a67bb2251ddc2fe4160db3182964cf2ee69a6b0a2a5d3acc"
+        "sha256": "15b42d30ceb96aef6ace6963cb128e343ae00b49f55cfab7ca25c664fa44ae8f"
       },
       "config": {
         "url": "https://raw.githubusercontent.com/ErdemGKSL/voice-me/main/piper-voices/custom/tr_TR-seksi-huseyin/config.json",
